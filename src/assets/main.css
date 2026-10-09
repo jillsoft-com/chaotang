@@ -1,0 +1,135 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ========================================
+   Element Plus 主题变量覆盖 - 金色主题
+   ======================================== */
+
+/* 浅色主题（默认） */
+:root {
+  --el-color-primary: #d4af37;
+  --el-color-primary-light-3: #e5c158;
+  --el-color-primary-light-5: #e9cc73;
+  --el-color-primary-light-7: #f0dda0;
+  --el-color-primary-light-8: #f5e6b8;
+  --el-color-primary-light-9: #faf0d5;
+  --el-color-primary-dark-2: #b8971f;
+  --el-border-radius-base: 8px;
+  --el-font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
+
+  /* 项目自定义变量 - 浅色 */
+  --ct-bg: #f5f5f5;
+  --ct-bg-secondary: #ffffff;
+  --ct-bg-tertiary: #f0f0f0;
+  --ct-text-primary: #1a1a1a;
+  --ct-text-secondary: #666;
+  --ct-text-muted: #999;
+  --ct-border: #e0e0e0;
+  --ct-border-light: #eee;
+  --ct-accent: #d4af37;
+  --ct-accent-hover: #b8971f;
+  --ct-card-shadow: rgba(0, 0, 0, 0.08);
+}
+
+/* 深色主题 */
+html.dark {
+  --el-bg-color: #0f0f0f;
+  --el-bg-color-overlay: #1a1a1a;
+  --el-bg-color-page: #0a0a0a;
+  --el-border-color: #2a2a2a;
+  --el-border-color-light: #2a2a2a;
+  --el-border-color-lighter: #333;
+  --el-text-color-primary: #e0e0e0;
+  --el-text-color-regular: #ccc;
+  --el-text-color-secondary: #888;
+  --el-text-color-placeholder: #666;
+  --el-fill-color: #1a1a1a;
+  --el-fill-color-light: #222;
+  --el-fill-color-lighter: #2a2a2a;
+  --el-fill-color-blank: #0f0f0f;
+  --el-mask-color: rgba(0, 0, 0, 0.8);
+
+  /* 项目自定义变量 - 深色 */
+  --ct-bg: #0f0f0f;
+  --ct-bg-secondary: #1a1a1a;
+  --ct-bg-tertiary: #222;
+  --ct-text-primary: #e0e0e0;
+  --ct-text-secondary: #888;
+  --ct-text-muted: #666;
+  --ct-border: #2a2a2a;
+  --ct-border-light: #333;
+  --ct-accent: #d4af37;
+  --ct-accent-hover: #e5c158;
+  --ct-card-shadow: rgba(0, 0, 0, 0.3);
+}
+
+/* ========================================
+   Base Styles
+   ======================================== */
+@layer base {
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    background-color: var(--ct-bg);
+    color: var(--ct-text-primary);
+    font-family: var(--el-font-family);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    transition: background-color 0.3s, color 0.3s;
+  }
+
+  #app {
+    min-height: 100vh;
+  }
+}
+
+/* ========================================
+   Components
+   ======================================== */
+@layer components {
+  /* Custom scrollbar */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--ct-border);
+    border-radius: 4px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--ct-text-muted);
+  }
+}
+
+/* ========================================
+   Utilities
+   ======================================== */
+@layer utilities {
+  .text-imperial-gold {
+    color: #d4af37;
+  }
+
+  .bg-imperial-gold {
+    background-color: #d4af37;
+  }
+
+  .border-imperial-gold {
+    border-color: #d4af37;
+  }
+}
