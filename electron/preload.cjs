@@ -3,6 +3,8 @@ const { contextBridge, ipcRenderer } = require('electron')
 contextBridge.exposeInMainWorld('electronAPI', {
   platform: process.platform,
   version: process.versions.electron,
+  loadApiKeys: () => ipcRenderer.invoke('load-api-keys'),
+  saveApiKeys: (keys) => ipcRenderer.invoke('save-api-keys', keys),
   // 文件操作通道
   readFile: (filePath) => ipcRenderer.invoke('read-file', filePath),
   writeFile: (filePath, content) => ipcRenderer.invoke('write-file', filePath, content),

@@ -5,19 +5,13 @@ import { createProvider } from '@/services/llm'
 import { llmService } from '@/services/llm-config'
 import { Promotion, User, FolderOpened } from '@element-plus/icons-vue'
 import { ElMessageBox } from 'element-plus'
-import { marked } from 'marked'
+import { renderSafeMarkdown } from '@/utils/sanitize-markdown'
 import type { Speech, LLMConfig, ToolCall } from '@/types'
 import { CoordinatorAgent } from '@/services/agent'
 import { compressContext, getCompressThreshold, countMessageChars } from '@/services/agent/context-compressor'
 import { memoryStore } from '@/services/memory'
 import { skillRegistry } from '@/services/skills'
 import { toolExecutor } from '@/services/tools/executor'
-
-// 配置 marked
-marked.setOptions({
-  breaks: true,
-  gfm: true
-})
 
 // ============ 危险命令审批 (Approval Mode) ============
 
@@ -1156,8 +1150,7 @@ function getMinisterModel(ministerId: string): string {
 }
 
 function renderMarkdown(content: string): string {
-  if (!content) return ''
-  return marked.parse(content) as string
+  return renderSafeMarkdown(content)
 }
 </script>
 

@@ -18,6 +18,7 @@ pnpm-debug.log*
 
 # Build output
 release/
+.release-verify/
 
 # Temp files
 tmp_*

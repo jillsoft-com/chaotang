@@ -3,15 +3,20 @@ import { ref } from 'vue'
 
 class LLMService {
   private configs = ref<LLMConfig[]>([])
+  readonly ready: Promise<void>
 
   constructor() {
-    this.loadConfigs()
+    this.ready = this.loadConfigs()
   }
 
-  private loadConfigs() {
+  private async loadConfigs(): Promise<void> {
     const saved = localStorage.getItem('llm_configs')
     if (saved) {
-      this.configs.value = JSON.parse(saved)
+      try {
+        this.configs.value = JSON.parse(saved)
+      } catch {
+        this.configs.value = []
+      }
     } else {
       this.configs.value = [
         {
@@ -22,12 +27,32 @@ class LLMService {
           isDefault: true
         }
       ]
-      this.saveConfigs()
+    }
+    if (window.electronAPI) {
+      const storedKeys = await window.electronAPI.loadApiKeys()
+      let needsMigration = false
+      for (const config of this.configs.value) {
+        if (config.apiKey) needsMigration = true
+        config.apiKey = config.apiKey || storedKeys[config.id]
+      }
+      if (needsMigration) await this.persistKeys(this.configs.value)
+      this.saveMetadata()
+    } else if (!saved) {
+      this.saveMetadata()
     }
   }
 
-  private saveConfigs() {
-    localStorage.setItem('llm_configs', JSON.stringify(this.configs.value))
+  private saveMetadata(): void {
+    const configs = window.electronAPI
+      ? this.configs.value.map(({ apiKey, ...config }) => config)
+      : this.configs.value
+    localStorage.setItem('llm_configs', JSON.stringify(configs))
+  }
+
+  private async persistKeys(configs: LLMConfig[]): Promise<void> {
+    if (!window.electronAPI) return
+    const keys = Object.fromEntries(configs.filter(c => c.apiKey).map(c => [c.id, c.apiKey!]))
+    await window.electronAPI.saveApiKeys(keys)
   }
 
   getAll(): LLMConfig[] {
@@ -38,34 +63,41 @@ class LLMService {
     return this.configs.value.find(c => c.id === id)
   }
 
-  add(config: Omit<LLMConfig, 'id'>): LLMConfig {
+  async add(config: Omit<LLMConfig, 'id'>): Promise<LLMConfig> {
     const newConfig: LLMConfig = {
       ...config,
       id: `llm-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
     }
-    this.configs.value.push(newConfig)
-    this.saveConfigs()
+    const next = [...this.configs.value, newConfig]
+    await this.persistKeys(next)
+    this.configs.value = next
+    this.saveMetadata()
     return newConfig
   }
 
-  update(id: string, config: Partial<LLMConfig>): void {
+  async update(id: string, config: Partial<LLMConfig>): Promise<void> {
     const index = this.configs.value.findIndex(c => c.id === id)
     if (index !== -1) {
-      this.configs.value[index] = { ...this.configs.value[index], ...config }
-      this.saveConfigs()
+      const next = [...this.configs.value]
+      next[index] = { ...next[index], ...config }
+      await this.persistKeys(next)
+      this.configs.value = next
+      this.saveMetadata()
     }
   }
 
-  delete(id: string): void {
-    this.configs.value = this.configs.value.filter(c => c.id !== id)
-    this.saveConfigs()
+  async delete(id: string): Promise<void> {
+    const next = this.configs.value.filter(c => c.id !== id)
+    await this.persistKeys(next)
+    this.configs.value = next
+    this.saveMetadata()
   }
 
   setDefault(id: string): void {
     this.configs.value.forEach(c => {
       c.isDefault = c.id === id
     })
-    this.saveConfigs()
+    this.saveMetadata()
   }
 
   async fetchModels(config: Pick<LLMConfig, 'provider' | 'apiKey' | 'baseURL'>): Promise<{ success: boolean; models: string[]; message: string }> {

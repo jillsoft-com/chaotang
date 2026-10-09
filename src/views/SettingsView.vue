@@ -418,14 +418,17 @@ async function saveLLMConfig() {
     maxTokens: llmForm.value.maxTokens
   }
 
-  if (editingLLM.value) {
-    llmService.update(editingLLM.value.id, config)
-  } else {
-    llmService.add(config)
+  try {
+    if (editingLLM.value) {
+      await llmService.update(editingLLM.value.id, config)
+    } else {
+      await llmService.add(config)
+    }
+    closeLLMDialog()
+    ElMessage.success('LLM 配置已保存')
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '保存失败')
   }
-
-  closeLLMDialog()
-  ElMessage.success('LLM 配置已保存')
 }
 
 async function testLLMConfig() {
@@ -452,10 +455,10 @@ async function testLLMConfig() {
 async function deleteLLMConfig(id: string) {
   try {
     await ElMessageBox.confirm('确定要删除此 LLM 配置吗？', '确认删除', { type: 'warning' })
-    llmService.delete(id)
+    await llmService.delete(id)
     ElMessage.success('已删除')
-  } catch {
-    // cancelled
+  } catch (error) {
+    if (error instanceof Error) ElMessage.error(error.message)
   }
 }
 

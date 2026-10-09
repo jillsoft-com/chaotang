@@ -1,10 +1,59 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron')
+const { app, BrowserWindow, ipcMain, dialog, safeStorage, shell } = require('electron')
 const path = require('path')
+const { pathToFileURL } = require('url')
 const fs = require('fs')
 const { exec } = require('child_process')
+const { resolveWithinRoot } = require('./workspace-access.cjs')
 const isDev = process.env.NODE_ENV === 'development'
 
 let mainWindow = null
+const authorizedRoots = new Map()
+
+function getAuthorizedRoot(event) {
+  const root = authorizedRoots.get(event.sender.id)
+  if (!root) throw new Error('请先在首页选择工作目录')
+  return root
+}
+
+function resolveAuthorizedPath(event, input) {
+  return resolveWithinRoot(getAuthorizedRoot(event), input)
+}
+
+async function approveCommand(event, command, cwd) {
+  if (typeof command !== 'string' || !command.trim() || command.length > 4000) {
+    throw new Error('命令为空或过长')
+  }
+  const workDir = resolveAuthorizedPath(event, cwd || '.')
+  if (!fs.existsSync(workDir) || !fs.statSync(workDir).isDirectory()) {
+    throw new Error('工作目录不存在')
+  }
+  const { response } = await dialog.showMessageBox(mainWindow, {
+    type: 'warning',
+    title: '确认执行命令',
+    message: '朝堂请求执行本地命令',
+    detail: `工作目录：${workDir}\n\n命令：${command}\n\n命令仍可能访问工作目录以外的文件。仅在信任此命令时批准。`,
+    buttons: ['拒绝', '批准执行'],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true
+  })
+  if (response !== 1) throw new Error('用户拒绝执行命令')
+  return workDir
+}
+
+async function approveWrite(target, description) {
+  const { response } = await dialog.showMessageBox(mainWindow, {
+    type: 'warning',
+    title: '确认更改本地文件',
+    message: description,
+    detail: `目标：${target}`,
+    buttons: ['拒绝', '批准更改'],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true
+  })
+  if (response !== 1) throw new Error('用户拒绝更改文件')
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -16,6 +65,7 @@ function createWindow() {
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
+      sandbox: true,
       preload: path.join(__dirname, 'preload.cjs')
     },
     frame: true,
@@ -34,14 +84,49 @@ function createWindow() {
   mainWindow.on('closed', () => {
     mainWindow = null
   })
+  const contentsId = mainWindow.webContents.id
+  mainWindow.webContents.on('destroyed', () => {
+    authorizedRoots.delete(contentsId)
+  })
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^(https:|mailto:)/i.test(url)) shell.openExternal(url)
+    return { action: 'deny' }
+  })
 }
 
 app.whenReady().then(() => {
   createWindow()
 
-  // IPC: 读取本地文件（安全沙箱）
+  const secretsFile = path.join(app.getPath('userData'), 'api-keys.enc')
+  function requireSecureStorage() {
+    if (!safeStorage.isEncryptionAvailable() ||
+        (process.platform === 'linux' && safeStorage.getSelectedStorageBackend() === 'basic_text')) {
+      throw new Error('系统安全存储不可用，无法保存 API Key')
+    }
+  }
+  ipcMain.handle('load-api-keys', () => {
+    if (!fs.existsSync(secretsFile)) return {}
+    requireSecureStorage()
+    return JSON.parse(safeStorage.decryptString(fs.readFileSync(secretsFile)))
+  })
+  ipcMain.handle('save-api-keys', (_event, keys) => {
+    requireSecureStorage()
+    if (!keys || typeof keys !== 'object' || Array.isArray(keys) ||
+        Object.entries(keys).some(([id, key]) => id.length > 150 || typeof key !== 'string' || key.length > 20000)) {
+      throw new Error('API Key 数据无效')
+    }
+    const encrypted = safeStorage.encryptString(JSON.stringify(keys))
+    const tempFile = `${secretsFile}.tmp`
+    fs.mkdirSync(path.dirname(secretsFile), { recursive: true })
+    fs.writeFileSync(tempFile, encrypted, { mode: 0o600 })
+    fs.renameSync(tempFile, secretsFile)
+    return true
+  })
+
+  // IPC: 只访问用户明确选择的工作目录
   ipcMain.handle('read-file', async (event, filePath) => {
     try {
+      filePath = resolveAuthorizedPath(event, filePath)
       // 安全检查：屏蔽二进制/媒体文件
       const blockedExts = [
         // 图片
@@ -75,9 +160,10 @@ app.whenReady().then(() => {
     }
   })
 
-  // IPC: 写入文件（安全沙箱）
+  // IPC: 写入已授权的工作目录
   ipcMain.handle('write-file', async (event, filePath, content) => {
     try {
+      filePath = resolveAuthorizedPath(event, filePath)
       // 安全检查：屏蔽二进制/媒体文件
       const blockedExts = [
         '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.svg', '.tiff', '.psd',
@@ -96,6 +182,8 @@ app.whenReady().then(() => {
       if (typeof content === 'string' && content.length > 10 * 1024 * 1024) {
         throw new Error('文件内容过大，最大支持 10MB')
       }
+      if (typeof content !== 'string') throw new Error('文件内容必须为文本')
+      await approveWrite(filePath, fs.existsSync(filePath) ? '朝堂请求覆盖文件' : '朝堂请求创建文件')
       // 自动创建父目录
       const dir = path.dirname(filePath)
       if (!fs.existsSync(dir)) {
@@ -111,12 +199,8 @@ app.whenReady().then(() => {
   // IPC: 创建目录
   ipcMain.handle('create-directory', async (event, dirPath) => {
     try {
-      // 安全检查：禁止创建系统目录
-      const blocked = ['C:\\Windows', 'C:\\Program Files', '/usr', '/bin', '/etc']
-      const normalized = path.resolve(dirPath)
-      if (blocked.some(b => normalized.startsWith(b))) {
-        throw new Error(`禁止在系统目录创建文件夹: ${dirPath}`)
-      }
+      dirPath = resolveAuthorizedPath(event, dirPath)
+      await approveWrite(dirPath, '朝堂请求创建目录')
       fs.mkdirSync(dirPath, { recursive: true })
       return { success: true, path: dirPath }
     } catch (error) {
@@ -125,9 +209,15 @@ app.whenReady().then(() => {
   })
 
   // IPC: 打开目录选择对话框
-  ipcMain.handle('show-open-dialog', async (event, options) => {
+  ipcMain.handle('show-open-dialog', async (event) => {
     try {
-      const result = await dialog.showOpenDialog(mainWindow, options)
+      const result = await dialog.showOpenDialog(mainWindow, {
+        title: '选择朝堂工作目录',
+        properties: ['openDirectory']
+      })
+      if (!result.canceled && result.filePaths.length === 1) {
+        authorizedRoots.set(event.sender.id, fs.realpathSync(result.filePaths[0]))
+      }
       return result
     } catch (error) {
       return { canceled: true, filePaths: [], error: error.message }
@@ -137,6 +227,7 @@ app.whenReady().then(() => {
   // IPC: 读取文档文件（doc/docx/pdf/xls/xlsx）
   ipcMain.handle('read-document', async (event, filePath) => {
     try {
+      filePath = resolveAuthorizedPath(event, filePath)
       if (!fs.existsSync(filePath)) {
         throw new Error(`文件不存在: ${filePath}`)
       }
@@ -198,6 +289,7 @@ app.whenReady().then(() => {
   // IPC: 读取目录
   ipcMain.handle('read-directory', async (event, dirPath) => {
     try {
+      dirPath = resolveAuthorizedPath(event, dirPath)
       if (!fs.existsSync(dirPath)) {
         throw new Error(`目录不存在: ${dirPath}`)
       }
@@ -240,6 +332,7 @@ app.whenReady().then(() => {
   // IPC: 搜索代码内容（grep/regex 跨文件搜索）
   ipcMain.handle('search-code', async (event, { pattern, directory, filePattern, maxResults, isRegex }) => {
     try {
+      directory = resolveAuthorizedPath(event, directory)
       if (!fs.existsSync(directory)) {
         throw new Error(`目录不存在: ${directory}`)
       }
@@ -355,8 +448,9 @@ app.whenReady().then(() => {
   })
 
   // IPC: 执行命令行命令
-  ipcMain.handle('execute-command', async (event, { command, cwd, shell, timeout }) => {
+  ipcMain.handle('execute-command', async (event, { command, cwd, timeout }) => {
     try {
+      const execCwd = await approveCommand(event, command, cwd)
       // 安全检查：屏蔽危险命令
       const dangerous = [
         /\bformat\b/i, /\bfdisk\b/i, /\bdiskpart\b/i,
@@ -372,8 +466,7 @@ app.whenReady().then(() => {
         }
       }
 
-      const execCwd = cwd || process.cwd()
-      const execShell = shell || (process.platform === 'win32' ? 'powershell.exe' : '/bin/bash')
+      const execShell = process.platform === 'win32' ? 'powershell.exe' : '/bin/bash'
       const execTimeout = Math.min(timeout || 30000, 120000)
 
       return new Promise((resolve) => {
@@ -426,7 +519,7 @@ app.whenReady().then(() => {
   // IPC: 检测并运行测试（自动检测测试框架）
   ipcMain.handle('run-tests', async (event, { cwd, testCommand, framework }) => {
     try {
-      const workDir = cwd || process.cwd()
+      const workDir = resolveAuthorizedPath(event, cwd || '.')
       let cmd = testCommand
 
       // 自动检测测试框架
@@ -447,7 +540,7 @@ app.whenReady().then(() => {
             else if (deps.mocha) cmd = 'npx mocha'
           }
         }
-        if (!cmd && fs.existsSync(path.join(workDir, 'pytest.ini')) || fs.existsSync(path.join(workDir, 'pyproject.toml'))) {
+        if (!cmd && (fs.existsSync(path.join(workDir, 'pytest.ini')) || fs.existsSync(path.join(workDir, 'pyproject.toml')))) {
           cmd = 'python -m pytest'
         }
         if (!cmd && fs.existsSync(path.join(workDir, 'Cargo.toml'))) {
@@ -461,6 +554,7 @@ app.whenReady().then(() => {
         }
       }
 
+      await approveCommand(event, cmd, workDir)
       const execShell = process.platform === 'win32' ? 'powershell.exe' : '/bin/bash'
 
       return new Promise((resolve) => {
@@ -528,8 +622,18 @@ app.on('activate', () => {
 
 app.on('web-contents-created', (event, contents) => {
   contents.on('will-navigate', (event, navigationUrl) => {
-    const parsedUrl = new URL(navigationUrl)
-    if (parsedUrl.origin !== 'http://localhost:3000' && parsedUrl.protocol !== 'file:') {
+    let allowed = false
+    try {
+      const destination = new URL(navigationUrl)
+      allowed = isDev
+        ? destination.origin === 'http://localhost:3000'
+        : destination.protocol === 'file:' &&
+          destination.pathname === new URL(pathToFileURL(path.join(__dirname, '../dist/index.html')).href).pathname
+      if (!allowed && (destination.protocol === 'https:' || destination.protocol === 'mailto:')) {
+        shell.openExternal(navigationUrl)
+      }
+    } catch { /* 无效地址一律禁止 */ }
+    if (!allowed) {
       event.preventDefault()
     }
   })

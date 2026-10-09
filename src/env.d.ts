@@ -9,6 +9,8 @@ declare module '*.vue' {
 interface ElectronAPI {
   platform: string
   version: string
+  loadApiKeys: () => Promise<Record<string, string>>
+  saveApiKeys: (keys: Record<string, string>) => Promise<boolean>
   readFile: (filePath: string) => Promise<{ success: boolean; content?: string; error?: string }>
   writeFile: (filePath: string, content: string) => Promise<{ success: boolean; path?: string; size?: number; error?: string }>
   createDirectory: (dirPath: string) => Promise<{ success: boolean; path?: string; error?: string }>
