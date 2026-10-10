@@ -19,5 +19,24 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 测试执行通道
   runTests: (params) => ipcRenderer.invoke('run-tests', params),
   // 对话框通道
-  showOpenDialog: (options) => ipcRenderer.invoke('show-open-dialog', options)
+  showOpenDialog: (options) => ipcRenderer.invoke('show-open-dialog', options),
+  // 沙箱配置通道
+  getSandboxConfig: () => ipcRenderer.invoke('get-sandbox-config'),
+  saveSandboxConfig: (config) => ipcRenderer.invoke('save-sandbox-config', config),
+  // 插件系统通道
+  scanPlugins: () => ipcRenderer.invoke('scan-plugins'),
+  readPlugin: (filePath) => ipcRenderer.invoke('read-plugin', filePath),
+  getPluginDir: () => ipcRenderer.invoke('get-plugin-dir'),
+  openPluginDir: () => ipcRenderer.invoke('open-plugin-dir'),
+  // 浏览器自动化通道
+  browserAction: (params) => ipcRenderer.invoke('browser-action', params),
+  // 企业微信 Webhook 通道
+  sendWebhook: (params) => ipcRenderer.invoke('send-webhook', params),
+  startWebhookServer: (params) => ipcRenderer.invoke('start-webhook-server', params),
+  stopWebhookServer: () => ipcRenderer.invoke('stop-webhook-server'),
+  onWebhookMessage: (callback) => {
+    const handler = (_event, data) => callback(data)
+    ipcRenderer.on('webhook-message', handler)
+    return () => ipcRenderer.removeListener('webhook-message', handler)
+  }
 })

@@ -4,6 +4,7 @@ const { pathToFileURL } = require('url')
 const fs = require('fs')
 const { exec } = require('child_process')
 const { resolveWithinRoot } = require('./workspace-access.cjs')
+const { executeInSandbox, runTestsInSandbox, checkCommandSafety } = require('./sandbox.cjs')
 const isDev = process.env.NODE_ENV === 'development'
 
 let mainWindow = null
@@ -447,23 +448,54 @@ app.whenReady().then(() => {
     }
   })
 
-  // IPC: 执行命令行命令
+  // IPC: 获取沙箱配置
+  ipcMain.handle('get-sandbox-config', () => {
+    try {
+      const saved = fs.readFileSync(path.join(app.getPath('userData'), 'sandbox-config.json'), 'utf-8')
+      return JSON.parse(saved)
+    } catch {
+      return { enabled: true, blockNetwork: false, maxMemoryMB: 512, maxTimeout: 120000 }
+    }
+  })
+
+  // IPC: 保存沙箱配置
+  ipcMain.handle('save-sandbox-config', (_event, config) => {
+    const file = path.join(app.getPath('userData'), 'sandbox-config.json')
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, JSON.stringify(config), { mode: 0o600 })
+    return true
+  })
+
+  // 内部：获取沙箱配置
+  function getSandboxConfig() {
+    try {
+      const saved = fs.readFileSync(path.join(app.getPath('userData'), 'sandbox-config.json'), 'utf-8')
+      return JSON.parse(saved)
+    } catch {
+      return { enabled: true, blockNetwork: false, maxMemoryMB: 512, maxTimeout: 120000 }
+    }
+  }
+
+  // IPC: 执行命令行命令（沙箱隔离）
   ipcMain.handle('execute-command', async (event, { command, cwd, timeout }) => {
     try {
       const execCwd = await approveCommand(event, command, cwd)
-      // 安全检查：屏蔽危险命令
-      const dangerous = [
-        /\bformat\b/i, /\bfdisk\b/i, /\bdiskpart\b/i,
-        /\brm\s+(-[a-z]*f[a-z]*\s+)?\//, /\bmkfs\b/i,
-        /\bdd\s+if=/, /\b:\(\)\s*\{/,
-        /\bshutdown\b/i, /\breboot\b/i, /\bhalt\b/i,
-        /\brmdir\s+\/s\s+\/q\s+[a-zA-Z]:\\?$/i,
-        /\breg\s+delete\b/i
-      ]
-      for (const pattern of dangerous) {
-        if (pattern.test(command)) {
-          throw new Error('安全限制：禁止执行危险命令')
-        }
+      const sandboxConfig = getSandboxConfig()
+
+      // 如果沙箱启用，使用沙箱执行引擎
+      if (sandboxConfig.enabled) {
+        return await executeInSandbox({
+          command,
+          cwd: execCwd,
+          timeout: timeout || 30000,
+          sandboxConfig
+        })
+      }
+
+      // 沙箱禁用时降级为原有逻辑（保留基本安全检查）
+      const safetyCheck = checkCommandSafety(command)
+      if (!safetyCheck.safe) {
+        return { success: false, exitCode: -1, stdout: '', stderr: safetyCheck.reason }
       }
 
       const execShell = process.platform === 'win32' ? 'powershell.exe' : '/bin/bash'
@@ -516,23 +548,32 @@ app.whenReady().then(() => {
     }
   })
 
-  // IPC: 检测并运行测试（自动检测测试框架）
-  ipcMain.handle('run-tests', async (event, { cwd, testCommand, framework }) => {
+  // IPC: 检测并运行测试（沙箱隔离）
+  ipcMain.handle('run-tests', async (event, { cwd, testCommand }) => {
     try {
       const workDir = resolveAuthorizedPath(event, cwd || '.')
-      let cmd = testCommand
+      // 测试命令也需要审批
+      if (testCommand) {
+        await approveCommand(event, testCommand, workDir)
+      }
+      const sandboxConfig = getSandboxConfig()
 
-      // 自动检测测试框架
+      if (sandboxConfig.enabled) {
+        return await runTestsInSandbox({
+          cwd: workDir,
+          testCommand,
+          sandboxConfig
+        })
+      }
+
+      // 降级：无沙箱时的原有逻辑
+      let cmd = testCommand
       if (!cmd) {
         if (fs.existsSync(path.join(workDir, 'package.json'))) {
           const pkg = JSON.parse(fs.readFileSync(path.join(workDir, 'package.json'), 'utf-8'))
           const scripts = pkg.scripts || {}
-          if (scripts.test) {
-            cmd = 'npm test'
-          } else if (scripts['test:unit']) {
-            cmd = 'npm run test:unit'
-          }
-          // 检测常见测试框架
+          if (scripts.test) cmd = 'npm test'
+          else if (scripts['test:unit']) cmd = 'npm run test:unit'
           const deps = { ...pkg.dependencies, ...pkg.devDependencies }
           if (!cmd) {
             if (deps.vitest) cmd = 'npx vitest run'
@@ -543,18 +584,12 @@ app.whenReady().then(() => {
         if (!cmd && (fs.existsSync(path.join(workDir, 'pytest.ini')) || fs.existsSync(path.join(workDir, 'pyproject.toml')))) {
           cmd = 'python -m pytest'
         }
-        if (!cmd && fs.existsSync(path.join(workDir, 'Cargo.toml'))) {
-          cmd = 'cargo test'
-        }
-        if (!cmd && fs.existsSync(path.join(workDir, 'go.mod'))) {
-          cmd = 'go test ./...'
-        }
-        if (!cmd) {
-          cmd = process.platform === 'win32' ? 'npm test' : 'npm test'
-        }
+        if (!cmd && fs.existsSync(path.join(workDir, 'Cargo.toml'))) cmd = 'cargo test'
+        if (!cmd && fs.existsSync(path.join(workDir, 'go.mod'))) cmd = 'go test ./...'
+        if (!cmd) cmd = 'npm test'
       }
 
-      await approveCommand(event, cmd, workDir)
+      if (!testCommand) await approveCommand(event, cmd, workDir)
       const execShell = process.platform === 'win32' ? 'powershell.exe' : '/bin/bash'
 
       return new Promise((resolve) => {
@@ -567,20 +602,15 @@ app.whenReady().then(() => {
         }, (error, stdout, stderr) => {
           const output = stdout?.toString() || ''
           const errOutput = stderr?.toString() || ''
-
-          // 截断输出
           const truncOut = output.length > 30000
             ? output.slice(0, 15000) + '\n... (中间省略) ...\n' + output.slice(-10000)
             : output
           const truncErr = errOutput.length > 10000
             ? errOutput.slice(0, 5000) + '\n... (中间省略) ...\n' + errOutput.slice(-3000)
             : errOutput
-
-          // 尝试提取测试结果摘要
           let summary = ''
           const lines = (output + '\n' + errOutput).split('\n')
           for (const line of lines) {
-            // 匹配常见的测试结果摘要行
             if (/tests?\s+(passed|failed|skipped|error)/i.test(line) ||
                 /Tests:\s+\d+\s+(passed|failed)/i.test(line) ||
                 /test result:/i.test(line) ||
@@ -590,7 +620,6 @@ app.whenReady().then(() => {
               summary += line.trim() + '\n'
             }
           }
-
           resolve({
             success: !error,
             exitCode: error ? (error.code || 1) : 0,
@@ -605,6 +634,297 @@ app.whenReady().then(() => {
     } catch (error) {
       return { success: false, exitCode: -1, command: testCommand || '', stdout: '', stderr: error.message, summary: error.message }
     }
+  })
+
+  // ============ 插件系统 IPC ============
+
+  // IPC: 扫描插件目录，返回所有 SKILL.md 文件路径
+  ipcMain.handle('scan-plugins', () => {
+    const pluginDir = path.join(app.getPath('userData'), 'plugins')
+    // 确保插件目录存在
+    if (!fs.existsSync(pluginDir)) {
+      fs.mkdirSync(pluginDir, { recursive: true })
+      return []
+    }
+
+    const results = []
+    try {
+      const entries = fs.readdirSync(pluginDir, { withFileTypes: true })
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          const skillMd = path.join(pluginDir, entry.name, 'SKILL.md')
+          if (fs.existsSync(skillMd)) {
+            results.push(skillMd)
+          }
+        } else if (entry.isFile() && entry.name.toLowerCase() === 'skill.md') {
+          results.push(path.join(pluginDir, entry.name))
+        }
+      }
+    } catch {
+      // 目录读取失败，返回空数组
+    }
+    return results
+  })
+
+  // IPC: 读取插件文件内容
+  ipcMain.handle('read-plugin', (_event, filePath) => {
+    try {
+      const pluginDir = path.join(app.getPath('userData'), 'plugins')
+      // 安全检查：只允许读取插件目录内的文件
+      const resolved = path.resolve(filePath)
+      const pluginDirResolved = path.resolve(pluginDir)
+      if (!resolved.startsWith(pluginDirResolved)) {
+        return { success: false, error: '只允许读取插件目录内的文件' }
+      }
+      if (!fs.existsSync(resolved)) {
+        return { success: false, error: '文件不存在' }
+      }
+      const content = fs.readFileSync(resolved, 'utf-8')
+      return { success: true, content }
+    } catch (error) {
+      return { success: false, error: error.message }
+    }
+  })
+
+  // IPC: 获取插件目录路径
+  ipcMain.handle('get-plugin-dir', () => {
+    return path.join(app.getPath('userData'), 'plugins')
+  })
+
+  // IPC: 打开插件目录
+  ipcMain.handle('open-plugin-dir', () => {
+    const pluginDir = path.join(app.getPath('userData'), 'plugins')
+    if (!fs.existsSync(pluginDir)) {
+      fs.mkdirSync(pluginDir, { recursive: true })
+    }
+    shell.openPath(pluginDir)
+    return true
+  })
+
+  // ============ 浏览器自动化 IPC ============
+
+  let browserInstance = null
+  let browserPage = null
+
+  // IPC: 执行浏览器操作
+  ipcMain.handle('browser-action', async (_event, { action, params = {} }) => {
+    try {
+      // 延迟加载 playwright
+      let chromium
+      try {
+        chromium = require('playwright').chromium
+      } catch {
+        return { success: false, error: 'Playwright 未安装，请运行 npm install playwright' }
+      }
+
+      // 启动浏览器（按需）
+      if (!browserInstance) {
+        browserInstance = await chromium.launch({ headless: true })
+        browserPage = await browserInstance.newPage()
+        // 设置默认超时
+        browserPage.setDefaultTimeout(15000)
+      }
+
+      switch (action) {
+        case 'navigate': {
+          const url = params.url
+          if (!url || (!url.startsWith('http://') && !url.startsWith('https://'))) {
+            return { success: false, error: '仅支持 http/https 协议' }
+          }
+          await browserPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
+          const title = await browserPage.title()
+          return { success: true, title, url: browserPage.url() }
+        }
+        case 'screenshot': {
+          const buffer = await browserPage.screenshot({
+            fullPage: params.fullPage || false,
+            type: params.type || 'png'
+          })
+          return { success: true, data: buffer.toString('base64'), type: params.type || 'png' }
+        }
+        case 'snapshot': {
+          const snapshot = await browserPage.accessibility.snapshot()
+          function flattenSnapshot(node, depth = 0) {
+            if (!node) return ''
+            const indent = '  '.repeat(depth)
+            let text = ''
+            if (node.name) text += `${indent}[${node.role || ''}] ${node.name}\n`
+            if (node.children) {
+              for (const child of node.children) {
+                text += flattenSnapshot(child, depth + 1)
+              }
+            }
+            return text
+          }
+          const text = flattenSnapshot(snapshot)
+          // 同时获取页面标题和 URL
+          const pageTitle = await browserPage.title()
+          const pageUrl = browserPage.url()
+          return {
+            success: true,
+            title: pageTitle,
+            url: pageUrl,
+            accessibilityTree: text.slice(0, 20000),
+            truncated: text.length > 20000
+          }
+        }
+        case 'click': {
+          if (!params.selector) return { success: false, error: '缺少 selector 参数' }
+          await browserPage.click(params.selector, { timeout: 10000 })
+          return { success: true, message: `已点击: ${params.selector}` }
+        }
+        case 'type': {
+          if (!params.selector || params.text === undefined) {
+            return { success: false, error: '缺少 selector 或 text 参数' }
+          }
+          await browserPage.fill(params.selector, params.text, { timeout: 10000 })
+          return { success: true, message: `已填写: ${params.selector}` }
+        }
+        case 'evaluate': {
+          if (!params.expression) return { success: false, error: '缺少 expression 参数' }
+          // 安全限制：禁止在 evaluate 中执行危险操作
+          const forbidden = /\brequire\b|\bimport\b|\bprocess\b|\bglobal\b/i
+          if (forbidden.test(params.expression)) {
+            return { success: false, error: '表达式包含禁止的 API' }
+          }
+          const result = await browserPage.evaluate(params.expression)
+          return { success: true, result: typeof result === 'string' ? result.slice(0, 10000) : JSON.stringify(result).slice(0, 10000) }
+        }
+        case 'close': {
+          if (browserInstance) {
+            await browserInstance.close()
+            browserInstance = null
+            browserPage = null
+          }
+          return { success: true, message: '浏览器已关闭' }
+        }
+        default:
+          return { success: false, error: `未知的浏览器操作: ${action}` }
+      }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : '浏览器操作失败' }
+    }
+  })
+
+  // ============ 企业微信 Webhook IPC ============
+
+  let webhookServer = null
+
+  // IPC: 发送企业微信 Webhook 消息
+  ipcMain.handle('send-webhook', async (_event, { webhookUrl, message, msgType }) => {
+    try {
+      if (!webhookUrl) return { success: false, error: '缺少 Webhook URL' }
+
+      const payload = msgType === 'markdown' ? {
+        msgtype: 'markdown',
+        markdown: { content: message }
+      } : {
+        msgtype: 'text',
+        text: { content: message }
+      }
+
+      const https = require('https')
+      const http = require('http')
+      const urlObj = new URL(webhookUrl)
+      const transport = urlObj.protocol === 'https:' ? https : http
+
+      return new Promise((resolve) => {
+        const postData = JSON.stringify(payload)
+        const req = transport.request({
+          hostname: urlObj.hostname,
+          port: urlObj.port,
+          path: urlObj.pathname + urlObj.search,
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(postData)
+          },
+          timeout: 10000
+        }, (res) => {
+          let body = ''
+          res.on('data', chunk => body += chunk)
+          res.on('end', () => {
+            try {
+              const result = JSON.parse(body)
+              if (result.errcode === 0) {
+                resolve({ success: true, message: '消息发送成功' })
+              } else {
+                resolve({ success: false, error: `发送失败: ${result.errmsg || body}` })
+              }
+            } catch {
+              resolve({ success: false, error: `解析响应失败: ${body.slice(0, 200)}` })
+            }
+          })
+        })
+        req.on('error', (err) => resolve({ success: false, error: err.message }))
+        req.on('timeout', () => { req.destroy(); resolve({ success: false, error: '请求超时' }) })
+        req.write(postData)
+        req.end()
+      })
+    } catch (error) {
+      return { success: false, error: error.message }
+    }
+  })
+
+  // IPC: 启动 Webhook 回调服务器
+  ipcMain.handle('start-webhook-server', (_event, { port }) => {
+    return new Promise((resolve) => {
+      if (webhookServer) {
+        webhookServer.close()
+        webhookServer = null
+      }
+
+      const http = require('http')
+      const server = http.createServer((req, res) => {
+        // 只接受 POST 请求
+        if (req.method !== 'POST') {
+          res.writeHead(405)
+          res.end('Method Not Allowed')
+          return
+        }
+
+        let body = ''
+        req.on('data', chunk => body += chunk)
+        req.on('end', () => {
+          try {
+            const data = JSON.parse(body)
+            // 通知渲染进程收到消息
+            if (mainWindow) {
+              mainWindow.webContents.send('webhook-message', data)
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ errcode: 0, errmsg: 'ok' }))
+          } catch {
+            res.writeHead(400)
+            res.end('Bad Request')
+          }
+        })
+      })
+
+      const listenPort = port || 9527
+      server.listen(listenPort, '127.0.0.1', () => {
+        webhookServer = server
+        resolve({ success: true, port: listenPort, message: `Webhook 服务器已启动，端口 ${listenPort}` })
+      })
+
+      server.on('error', (err) => {
+        resolve({ success: false, error: `启动失败: ${err.message}` })
+      })
+    })
+  })
+
+  // IPC: 停止 Webhook 回调服务器
+  ipcMain.handle('stop-webhook-server', () => {
+    return new Promise((resolve) => {
+      if (webhookServer) {
+        webhookServer.close(() => {
+          webhookServer = null
+          resolve({ success: true, message: 'Webhook 服务器已停止' })
+        })
+      } else {
+        resolve({ success: true, message: '服务器未运行' })
+      }
+    })
   })
 })
 

@@ -12,6 +12,9 @@ import { skillRegistry } from '@/services/skills'
 import { isCustomTheme, getPresetsByCategory, THEME_CATEGORIES } from '@/services/dynasty-presets'
 import type { Skill } from '@/types'
 import { SKILL_CATEGORY_LABELS } from '@/types'
+import { pluginManager_getAll, pluginManager_reloadAll } from '@/services/plugins/plugin-manager'
+import type { LoadedPlugin } from '@/services/plugins/types'
+import { getMessagingConfig, saveMessagingConfig, initMessaging, getWeComAdapter, startWebhookServer, stopWebhookServer } from '@/services/messaging'
 
 const router = useRouter()
 const debateStore = useDebateStore()
@@ -289,6 +292,13 @@ onMounted(() => {
   if (isCustomTheme(selectedDynasty.value)) {
     loadCustomThemeRoles(selectedDynasty.value)
   }
+  // 加载插件列表
+  loadPluginList()
+  // 加载沙箱配置
+  loadSandboxConfig()
+  // 初始化并加载消息集成配置
+  initMessaging()
+  loadMessagingConfigValues()
 })
 
 function loadSummaryModel() {
@@ -545,6 +555,147 @@ async function resetPrompt(ministerId: string) {
     ElMessage.success('已重置为默认 Prompt')
   } catch {
     // cancelled
+  }
+}
+
+// ============ 插件管理 ============
+
+const pluginsLoading = ref(false)
+const loadedPlugins = ref<LoadedPlugin[]>([])
+const pluginErrors = ref<Array<{ filePath: string; error: string }>>([])
+
+function loadPluginList() {
+  loadedPlugins.value = pluginManager_getAll()
+}
+
+async function reloadPlugins() {
+  pluginsLoading.value = true
+  try {
+    const result = await pluginManager_reloadAll()
+    loadedPlugins.value = result.plugins
+    pluginErrors.value = result.errors
+    ElMessage.success(`已重新加载 ${result.count} 个插件`)
+  } catch (error) {
+    ElMessage.error('重载插件失败')
+  } finally {
+    pluginsLoading.value = false
+  }
+}
+
+async function openPluginDir() {
+  if (window.electronAPI?.openPluginDir) {
+    await window.electronAPI.openPluginDir()
+  } else {
+    ElMessage.warning('当前环境不支持打开插件目录（需要 Electron 桌面版）')
+  }
+}
+
+// ============ 沙箱配置 ============
+
+const sandboxEnabled = ref(true)
+const sandboxBlockNetwork = ref(false)
+const sandboxMaxMemory = ref(512)
+const sandboxMaxTimeout = ref(120000)
+
+async function loadSandboxConfig() {
+  if (window.electronAPI?.getSandboxConfig) {
+    const config = await window.electronAPI.getSandboxConfig()
+    sandboxEnabled.value = config.enabled
+    sandboxBlockNetwork.value = config.blockNetwork
+    sandboxMaxMemory.value = config.maxMemoryMB
+    sandboxMaxTimeout.value = config.maxTimeout
+  }
+}
+
+async function onSandboxChange() {
+  if (window.electronAPI?.saveSandboxConfig) {
+    await window.electronAPI.saveSandboxConfig({
+      enabled: sandboxEnabled.value,
+      blockNetwork: sandboxBlockNetwork.value,
+      maxMemoryMB: sandboxMaxMemory.value,
+      maxTimeout: sandboxMaxTimeout.value
+    })
+    ElMessage.success('沙箱配置已保存')
+  }
+}
+
+// ============ 消息集成 ============
+
+const wecomWebhookUrl = ref('')
+const wecomConnected = ref(false)
+const testingWeCom = ref(false)
+const autoPushResults = ref(false)
+const webhookPort = ref(9527)
+const webhookServerRunning = ref(false)
+const serverLoading = ref(false)
+
+function loadMessagingConfigValues() {
+  const config = getMessagingConfig()
+  wecomWebhookUrl.value = config.wecomWebhookUrl || ''
+  autoPushResults.value = config.autoPushResults
+  webhookPort.value = config.webhookPort
+}
+
+function saveMessagingConfigValues() {
+  // 配置企业微信适配器
+  if (wecomWebhookUrl.value) {
+    getWeComAdapter().configure(wecomWebhookUrl.value)
+  }
+  saveMessagingConfig({
+    wecomWebhookUrl: wecomWebhookUrl.value,
+    autoPushResults: autoPushResults.value,
+    webhookPort: webhookPort.value
+  })
+  ElMessage.success('消息集成配置已保存')
+}
+
+async function testWeComConnection() {
+  testingWeCom.value = true
+  try {
+    if (wecomWebhookUrl.value) {
+      getWeComAdapter().configure(wecomWebhookUrl.value)
+    }
+    const result = await getWeComAdapter().testConnection()
+    wecomConnected.value = result.success
+    if (result.success) {
+      ElMessage.success(result.message)
+    } else {
+      ElMessage.error(result.message)
+    }
+  } catch (error) {
+    ElMessage.error('测试连接失败')
+  } finally {
+    testingWeCom.value = false
+  }
+}
+
+async function startServer() {
+  serverLoading.value = true
+  try {
+    const result = await startWebhookServer(webhookPort.value)
+    webhookServerRunning.value = result.success
+    if (result.success) {
+      ElMessage.success(result.message)
+    } else {
+      ElMessage.error(result.message)
+    }
+  } catch (error) {
+    ElMessage.error('启动服务器失败')
+  } finally {
+    serverLoading.value = false
+  }
+}
+
+async function stopServer() {
+  serverLoading.value = true
+  try {
+    const result = await stopWebhookServer()
+    webhookServerRunning.value = false
+    ElMessage.success(result.message || '服务器已停止')
+  } catch (error) {
+    ElMessage.error('停止服务器失败')
+  } finally {
+    serverLoading.value = false
   }
 }
 </script>
@@ -926,6 +1077,255 @@ async function resetPrompt(ministerId: string) {
           </div>
 
           <el-empty v-if="allSkills.length === 0" description="暂无已注册的技能" />
+        </el-tab-pane>
+
+        <!-- 插件管理 -->
+        <el-tab-pane label="插件管理" name="plugins">
+          <div class="tab-header">
+            <div>
+              <h2 class="section-title">自定义工具插件</h2>
+              <p class="section-desc">通过 SKILL.md 文件定义自定义工具，插件放在 plugins 目录中自动发现</p>
+            </div>
+            <div style="display: flex; gap: 8px">
+              <el-button @click="reloadPlugins" :loading="pluginsLoading">重新加载</el-button>
+              <el-button type="primary" @click="openPluginDir">打开插件目录</el-button>
+            </div>
+          </div>
+
+          <!-- 已加载的插件列表 -->
+          <div class="plugins-list" v-if="loadedPlugins.length > 0">
+            <el-card v-for="plugin in loadedPlugins" :key="plugin.manifest.id" shadow="never" class="plugin-card">
+              <div class="plugin-header">
+                <div class="plugin-info">
+                  <span class="plugin-icon">{{ plugin.manifest.icon || '🔌' }}</span>
+                  <div>
+                    <h3 class="plugin-name">{{ plugin.manifest.name }}</h3>
+                    <p class="plugin-desc">{{ plugin.manifest.description }}</p>
+                  </div>
+                </div>
+                <div class="plugin-meta">
+                  <el-tag size="small" type="success">已加载</el-tag>
+                  <el-tag size="small" type="info">{{ plugin.toolDefinitions.length }} 个工具</el-tag>
+                  <span v-if="plugin.manifest.version" class="plugin-version">v{{ plugin.manifest.version }}</span>
+                </div>
+              </div>
+              <div class="plugin-tools">
+                <div v-for="tool in plugin.toolDefinitions" :key="tool.function.name" class="tool-item">
+                  <code class="tool-name">{{ tool.function.name }}</code>
+                  <span class="tool-desc">{{ tool.function.description }}</span>
+                </div>
+              </div>
+            </el-card>
+          </div>
+
+          <!-- 插件错误列表 -->
+          <div v-if="pluginErrors.length > 0" style="margin-top: 16px">
+            <el-alert
+              v-for="(err, idx) in pluginErrors"
+              :key="idx"
+              :title="`插件加载失败: ${err.filePath}`"
+              :description="err.error"
+              type="error"
+              show-icon
+              :closable="false"
+              style="margin-bottom: 8px"
+            />
+          </div>
+
+          <el-empty v-if="loadedPlugins.length === 0 && pluginErrors.length === 0" description="暂无自定义插件，请在插件目录中创建 SKILL.md 文件" />
+
+          <!-- 插件格式说明 -->
+          <el-card shadow="never" class="settings-card" style="margin-top: 16px">
+            <h3 class="card-title">SKILL.md 格式说明</h3>
+            <pre class="plugin-format-example">---
+id: my_plugin
+name: 我的插件
+description: 自定义工具描述
+icon: 🔧
+category: system
+tools:
+  - name: my_tool
+    description: 工具功能描述
+    parameters:
+      type: object
+      properties:
+        input:
+          type: string
+          description: 输入参数
+      required: [input]
+handler: |
+  async function my_tool(args) {
+    return { result: args.input.toUpperCase() }
+  }
+---</pre>
+          </el-card>
+        </el-tab-pane>
+
+        <!-- 沙箱安全 -->
+        <el-tab-pane label="沙箱安全" name="sandbox">
+          <div class="tab-header">
+            <div>
+              <h2 class="section-title">沙箱安全配置</h2>
+              <p class="section-desc">命令执行的安全隔离策略，限制文件访问、网络和系统资源</p>
+            </div>
+          </div>
+
+          <div class="settings-sections">
+            <el-card shadow="never" class="settings-card">
+              <h3 class="card-title">沙箱开关</h3>
+              <div class="settings-item">
+                <div class="settings-item-info">
+                  <span class="settings-item-label">启用沙箱隔离</span>
+                  <span class="settings-item-desc">命令在受限环境中执行，限制文件访问和危险操作</span>
+                </div>
+                <el-switch v-model="sandboxEnabled" @change="onSandboxChange" />
+              </div>
+              <div class="settings-item">
+                <div class="settings-item-info">
+                  <span class="settings-item-label">网络隔离</span>
+                  <span class="settings-item-desc">禁止子进程访问网络（通过设置无效代理实现）</span>
+                </div>
+                <el-switch v-model="sandboxBlockNetwork" @change="onSandboxChange" :disabled="!sandboxEnabled" />
+              </div>
+            </el-card>
+
+            <el-card shadow="never" class="settings-card">
+              <h3 class="card-title">资源限制</h3>
+              <div class="settings-item">
+                <div class="settings-item-info">
+                  <span class="settings-item-label">子进程最大内存 (MB)</span>
+                  <span class="settings-item-desc">限制命令执行时的内存使用，默认 512MB</span>
+                </div>
+                <el-input-number
+                  v-model="sandboxMaxMemory"
+                  :min="128"
+                  :max="2048"
+                  :step="128"
+                  size="small"
+                  @change="onSandboxChange"
+                  :disabled="!sandboxEnabled"
+                />
+              </div>
+              <div class="settings-item">
+                <div class="settings-item-info">
+                  <span class="settings-item-label">最大超时时间 (ms)</span>
+                  <span class="settings-item-desc">命令执行的最大等待时间，默认 120000ms (2分钟)</span>
+                </div>
+                <el-input-number
+                  v-model="sandboxMaxTimeout"
+                  :min="10000"
+                  :max="300000"
+                  :step="10000"
+                  size="small"
+                  @change="onSandboxChange"
+                  :disabled="!sandboxEnabled"
+                />
+              </div>
+            </el-card>
+
+            <el-card shadow="never" class="settings-card">
+              <h3 class="card-title">安全策略说明</h3>
+              <ul class="sandbox-strategy-list">
+                <li><strong>文件系统：</strong>仅允许访问用户选择的工作目录</li>
+                <li><strong>危险命令：</strong>屏蔽 format、fdisk、rm -rf /、shutdown 等危险操作</li>
+                <li><strong>管道注入：</strong>屏蔽 curl|bash、eval 等注入模式</li>
+                <li><strong>超时强制：</strong>超时后强制终止进程树（taskkill /T /F）</li>
+                <li><strong>审批机制：</strong>所有命令执行前需用户确认</li>
+              </ul>
+            </el-card>
+          </div>
+        </el-tab-pane>
+
+        <!-- 消息集成 -->
+        <el-tab-pane label="消息集成" name="messaging">
+          <div class="tab-header">
+            <div>
+              <h2 class="section-title">消息平台集成</h2>
+              <p class="section-desc">将朝议结果推送到企业微信等消息平台，支持接收消息触发辩论</p>
+            </div>
+          </div>
+
+          <div class="settings-sections">
+            <!-- 企业微信配置 -->
+            <el-card shadow="never" class="settings-card">
+              <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 16px">
+                <span style="font-size: 20px">💬</span>
+                <h3 class="card-title" style="margin: 0">企业微信 Webhook</h3>
+                <el-tag :type="wecomConnected ? 'success' : 'info'" size="small">
+                  {{ wecomConnected ? '已连接' : '未连接' }}
+                </el-tag>
+              </div>
+
+              <div class="settings-item">
+                <div class="settings-item-info">
+                  <span class="settings-item-label">Webhook URL</span>
+                  <span class="settings-item-desc">企业微信群机器人的 Webhook 地址</span>
+                </div>
+              </div>
+              <el-input
+                v-model="wecomWebhookUrl"
+                placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."
+                style="margin-bottom: 12px"
+              />
+
+              <div class="settings-item">
+                <div class="settings-item-info">
+                  <span class="settings-item-label">辩论完成后自动推送</span>
+                  <span class="settings-item-desc">朝议结束后自动将结果摘要发送到群聊</span>
+                </div>
+                <el-switch v-model="autoPushResults" @change="saveMessagingConfigValues" />
+              </div>
+
+              <div style="display: flex; gap: 8px; margin-top: 12px">
+                <el-button @click="saveMessagingConfigValues" type="primary">保存配置</el-button>
+                <el-button @click="testWeComConnection" :loading="testingWeCom">测试连接</el-button>
+              </div>
+            </el-card>
+
+            <!-- Webhook 服务器 -->
+            <el-card shadow="never" class="settings-card">
+              <h3 class="card-title">Webhook 回调服务器</h3>
+              <p class="card-desc">启动本地 HTTP 服务器接收企业微信的回调消息，实现双向消息交互</p>
+
+              <div class="settings-item">
+                <div class="settings-item-info">
+                  <span class="settings-item-label">回调端口</span>
+                  <span class="settings-item-desc">本地 HTTP 服务器监听端口，默认 9527</span>
+                </div>
+                <el-input-number
+                  v-model="webhookPort"
+                  :min="1024"
+                  :max="65535"
+                  size="small"
+                />
+              </div>
+
+              <div class="settings-item">
+                <div class="settings-item-info">
+                  <span class="settings-item-label">服务器状态</span>
+                  <el-tag :type="webhookServerRunning ? 'success' : 'info'" size="small">
+                    {{ webhookServerRunning ? '运行中' : '已停止' }}
+                  </el-tag>
+                </div>
+                <div style="display: flex; gap: 8px">
+                  <el-button
+                    v-if="!webhookServerRunning"
+                    type="primary"
+                    size="small"
+                    @click="startServer"
+                    :loading="serverLoading"
+                  >启动</el-button>
+                  <el-button
+                    v-else
+                    type="danger"
+                    size="small"
+                    @click="stopServer"
+                    :loading="serverLoading"
+                  >停止</el-button>
+                </div>
+              </div>
+            </el-card>
+          </div>
         </el-tab-pane>
       </el-tabs>
     </div>
@@ -1617,5 +2017,86 @@ async function resetPrompt(ministerId: string) {
 .custom-prompt-hint {
   font-size: 12px;
   color: var(--ct-text-secondary);
+}
+
+/* 插件管理样式 */
+.plugin-card {
+  margin-bottom: 12px;
+}
+
+.plugin-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.plugin-info {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.plugin-icon {
+  font-size: 24px;
+}
+
+.plugin-name {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--ct-text-primary);
+  margin: 0;
+}
+
+.plugin-desc {
+  font-size: 13px;
+  color: var(--ct-text-secondary);
+  margin: 2px 0 0;
+}
+
+.plugin-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.plugin-version {
+  font-size: 12px;
+  color: var(--ct-text-secondary);
+}
+
+.plugin-tools {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--ct-border);
+}
+
+.plugin-format-example {
+  font-size: 12px;
+  background: var(--ct-bg-tertiary);
+  padding: 12px;
+  border-radius: 6px;
+  overflow-x: auto;
+  line-height: 1.5;
+  margin: 0;
+  color: var(--ct-text-primary);
+}
+
+/* 沙箱安全样式 */
+.sandbox-strategy-list {
+  margin: 0;
+  padding-left: 20px;
+  font-size: 14px;
+  color: var(--ct-text-secondary);
+  line-height: 2;
+}
+
+.sandbox-strategy-list strong {
+  color: var(--ct-text-primary);
+}
+
+.card-desc {
+  font-size: 13px;
+  color: var(--ct-text-secondary);
+  margin: 0 0 12px;
 }
 </style>

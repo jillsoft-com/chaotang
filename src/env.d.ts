@@ -39,6 +39,7 @@ interface ElectronAPI {
     stdout: string
     stderr: string
     timedOut?: boolean
+    sandboxed?: boolean
   }>
   searchCode: (params: {
     pattern: string
@@ -75,6 +76,55 @@ interface ElectronAPI {
     defaultPath?: string
     filters?: Array<{ name: string; extensions: string[] }>
   }) => Promise<{ canceled: boolean; filePaths: string[]; error?: string }>
+
+  // 沙箱配置
+  getSandboxConfig: () => Promise<{
+    enabled: boolean
+    blockNetwork: boolean
+    maxMemoryMB: number
+    maxTimeout: number
+  }>
+  saveSandboxConfig: (config: {
+    enabled?: boolean
+    blockNetwork?: boolean
+    maxMemoryMB?: number
+    maxTimeout?: number
+  }) => Promise<boolean>
+
+  // 插件系统
+  scanPlugins: () => Promise<string[]>
+  readPlugin: (filePath: string) => Promise<{ success: boolean; content?: string; error?: string }>
+  getPluginDir: () => Promise<string>
+  openPluginDir: () => Promise<boolean>
+
+  // 浏览器自动化
+  browserAction: (params: {
+    action: 'navigate' | 'screenshot' | 'snapshot' | 'click' | 'type' | 'evaluate' | 'close'
+    params?: Record<string, any>
+  }) => Promise<{
+    success: boolean
+    error?: string
+    title?: string
+    url?: string
+    data?: string
+    type?: string
+    accessibilityTree?: string
+    truncated?: boolean
+    result?: any
+    message?: string
+  }>
+
+  // 企业微信 Webhook
+  sendWebhook: (params: {
+    webhookUrl: string
+    message: string
+    msgType?: 'text' | 'markdown'
+  }) => Promise<{ success: boolean; message?: string; error?: string }>
+  startWebhookServer: (params: {
+    port?: number
+  }) => Promise<{ success: boolean; port?: number; message?: string; error?: string }>
+  stopWebhookServer: () => Promise<{ success: boolean; message?: string }>
+  onWebhookMessage: (callback: (data: any) => void) => () => void
 }
 
 interface Window {

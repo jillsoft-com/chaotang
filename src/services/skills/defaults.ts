@@ -19,6 +19,9 @@ import {
   searchCodeHandler, gitOperationHandler, runTestsHandler,
   saveMemoryHandler, searchMemoryHandler
 } from '@/services/tools/handlers/minimal'
+import {
+  browserToolDefinitions, browserToolHandlers
+} from '@/services/browser/browser-tools'
 
 // ============ Skill 定义 ============
 
@@ -182,6 +185,19 @@ const allSkills: Array<{ skill: Skill; handlers: Record<string, any> }> = [
       enabled: true
     },
     handlers: { save_memory: saveMemoryHandler, search_memory: searchMemoryHandler }
+  },
+  {
+    skill: {
+      id: 'browser',
+      name: '浏览器自动化',
+      description: '打开网页、截图、获取页面结构、点击元素、填写表单、执行 JavaScript',
+      icon: '🌐',
+      category: 'information',
+      tools: browserToolDefinitions,
+      config: { timeout: 30000 },
+      enabled: true
+    },
+    handlers: browserToolHandlers
   }
 ]
 
@@ -192,12 +208,12 @@ const allSkills: Array<{ skill: Skill; handlers: Record<string, any> }> = [
  * 定义每个角色初始可用的技能
  */
 export const defaultMinisterSkills: Record<string, string[]> = {
-  // 丞相：全局搜索 + 知识库 + 任务协调 + 文件操作 + 文档解析 + 命令行 + 代码搜索 + Git
-  chancellor: ['web_search', 'knowledge_base', 'task_coordinator', 'file_ops', 'document_reader', 'command_executor', 'code_search', 'git_ops', 'test_runner', 'memory'],
+  // 丞相：全局搜索 + 知识库 + 任务协调 + 文件操作 + 文档解析 + 命令行 + 代码搜索 + Git + 浏览器
+  chancellor: ['web_search', 'knowledge_base', 'task_coordinator', 'file_ops', 'document_reader', 'command_executor', 'code_search', 'git_ops', 'test_runner', 'memory', 'browser'],
   // 户部尚书：数据计算 + 搜索 + 文件读取 + 文件操作 + 文档解析 + 命令行 + Git + 测试 + 记忆
   finance: ['calculator', 'web_search', 'file_reader', 'file_ops', 'document_reader', 'command_executor', 'git_ops', 'test_runner', 'memory'],
-  // 太傅：知识库 + 搜索 + 文件读取 + 文件操作 + 文档解析 + 命令行 + 代码搜索 + Git + 测试 + 记忆
-  tutor: ['knowledge_base', 'web_search', 'file_reader', 'file_ops', 'document_reader', 'command_executor', 'code_search', 'git_ops', 'test_runner', 'memory'],
+  // 太傅：知识库 + 搜索 + 文件读取 + 文件操作 + 文档解析 + 命令行 + 代码搜索 + Git + 测试 + 记忆 + 浏览器
+  tutor: ['knowledge_base', 'web_search', 'file_reader', 'file_ops', 'document_reader', 'command_executor', 'code_search', 'git_ops', 'test_runner', 'memory', 'browser'],
   // 大将军：搜索 + 知识库 + 命令行 + Git
   general: ['web_search', 'knowledge_base', 'command_executor', 'git_ops', 'memory'],
   // 御史：搜索 + 知识库 + 文档解析 + 代码搜索
@@ -217,7 +233,7 @@ export function initializeSkills(): void {
   }
 
   // 2. 建立默认绑定（仅在首次初始化时，版本控制确保新技能能补绑）
-  const initialized = localStorage.getItem('skills_initialized_v7')
+  const initialized = localStorage.getItem('skills_initialized_v8')
   if (!initialized) {
     // 清除旧版本标记
     localStorage.removeItem('skills_initialized')
@@ -226,6 +242,7 @@ export function initializeSkills(): void {
     localStorage.removeItem('skills_initialized_v4')
     localStorage.removeItem('skills_initialized_v5')
     localStorage.removeItem('skills_initialized_v6')
+    localStorage.removeItem('skills_initialized_v7')
     localStorage.removeItem('minister_skill_bindings')
     // 重新加载绑定（清除后为空）
     for (const [ministerId, skillIds] of Object.entries(defaultMinisterSkills)) {
@@ -233,8 +250,15 @@ export function initializeSkills(): void {
         skillRegistry.bindSkillToMinister(skillId, ministerId)
       }
     }
-    localStorage.setItem('skills_initialized_v7', 'true')
+    localStorage.setItem('skills_initialized_v8', 'true')
   }
 
-  console.log(`[Skills] 已注册 ${allSkills.length} 个 Skill，完成角色绑定`)
+  // 3. 加载自定义插件
+  import('@/services/plugins/plugin-manager').then(({ pluginManager_loadAll }) => {
+    pluginManager_loadAll().catch(err => {
+      console.warn('[Skills] 插件加载失败:', err)
+    })
+  })
+
+  console.log(`[Skills] 已注册 ${allSkills.length} 个 Skill（含浏览器自动化），完成角色绑定`)
 }
