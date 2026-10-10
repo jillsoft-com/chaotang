@@ -20,6 +20,8 @@ import { memoryStore } from '@/services/memory'
 import { skillRegistry } from '@/services/skills'
 import { toolExecutor } from '@/services/tools/executor'
 import { findPresetById, getCurrentDynastyId } from '@/services/dynasty-presets'
+import { AutonomousEngine } from './autonomous-engine'
+import type { AutonomousEvent } from './autonomous-engine'
 
 // ============ 类型定义 ============
 
@@ -56,6 +58,7 @@ export type AgentEventType =
   | 'worker-progress' // Worker 输出中
   | 'worker-tool'     // Worker 调用工具
   | 'worker-done'     // Worker 完成
+  | 'worker-autonomous' // Worker 自主执行子事件
   | 'synthesizing'    // 丞相汇总中
   | 'complete'        // 全部完成
   | 'error'           // 出错
@@ -81,13 +84,19 @@ export interface CoordinatorConfig {
   continueOnError: boolean
   /** 是否启用 Plan Mode（拆解后等待用户确认） */
   planMode: boolean
+  /** 是否启用自主执行模式（Worker 可自主迭代：执行→验证→修正） */
+  autonomousMode: boolean
+  /** 自主执行模式下的最大迭代轮数（默认 10） */
+  autonomousMaxIterations: number
 }
 
 const DEFAULT_CONFIG: CoordinatorConfig = {
   enabled: true,
   synthesize: true,
   continueOnError: true,
-  planMode: false
+  planMode: false,
+  autonomousMode: false,
+  autonomousMaxIterations: 10
 }
 
 // ============ Coordinator Agent ============
@@ -288,18 +297,67 @@ export class CoordinatorAgent {
 
       const startTime = Date.now()
       try {
-        const result = await this.executeWorkerTask(
-          workerLLM,
-          worker,
-          workerTask,
-          topic,
-          toolDefs,
-          reactiveWorker,
-          workingDirectory,
-          onBeforeToolExecute,
-          agentsMdHint,
-          memoryHint
-        )
+        let result: { content: string; toolCalls: ToolCallResult[] }
+
+        if (this.config.autonomousMode) {
+          // ── 自主执行模式：使用 AutonomousEngine ──
+          const engine = new AutonomousEngine({
+            maxIterations: this.config.autonomousMaxIterations,
+            verifyAfterEachRound: true,
+            workingDirectory,
+            agentsMdHint,
+            memoryHint
+          })
+
+          // 转发自主执行子事件
+          engine.onEvent((evt: AutonomousEvent) => {
+            this.emit({
+              type: 'worker-autonomous',
+              ministerId: worker.id,
+              data: evt
+            })
+          })
+
+          const autoResult = await engine.execute({
+            provider: workerLLM,
+            systemPrompt: worker.systemPrompt,
+            goal: topic,
+            taskContext: `${workerTask.task}${workerTask.context ? '\n补充：' + workerTask.context : ''}`,
+            toolDefs,
+            onContent: (text) => { reactiveWorker.content = text },
+            onBeforeToolExecute
+          })
+
+          // 收集 toolStatuses 用于 UI 显示
+          if (!reactiveWorker.toolStatuses) reactiveWorker.toolStatuses = []
+          for (const tc of autoResult.toolCalls) {
+            reactiveWorker.toolStatuses.push({
+              toolCallId: tc.toolCallId,
+              functionName: tc.functionName,
+              status: tc.status === 'success' ? 'completed' : (tc.status === 'timeout' ? 'timeout' : 'error'),
+              displayName: this.getToolDisplayName(tc.functionName),
+              summary: tc.status === 'success'
+                ? this.buildSummary(tc.result)
+                : tc.error || '执行失败'
+            })
+          }
+
+          result = { content: autoResult.content, toolCalls: autoResult.toolCalls }
+        } else {
+          // ── 标准模式：使用原有的 Worker 执行循环 ──
+          result = await this.executeWorkerTask(
+            workerLLM,
+            worker,
+            workerTask,
+            topic,
+            toolDefs,
+            reactiveWorker,
+            workingDirectory,
+            onBeforeToolExecute,
+            agentsMdHint,
+            memoryHint
+          )
+        }
 
         reactiveWorker.status = 'completed'
         reactiveWorker.toolCalls = result.toolCalls.length > 0 ? result.toolCalls : undefined

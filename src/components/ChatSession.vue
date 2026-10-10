@@ -646,6 +646,9 @@ async function retrySpeech(speech: Speech) {
 // 朝议模式：从 store 读取（全局共享）
 const debateMode = computed(() => debateStore.debateMode)
 
+// 自主执行模式（Agent 模式子选项，每个 Worker 可自主迭代：执行→验证→修正）
+const autonomousMode = ref(false)
+
 // 智能自动滚动：用户手动上滚后不再强制拉回底部
 let lastScrollTime = 0
 let isNearBottom = true
@@ -1309,7 +1312,11 @@ async function runAgentDebate() {
   await nextTick()
   scrollToBottom()
 
-  const agent = new CoordinatorAgent({ planMode: true })
+  const agent = new CoordinatorAgent({
+    planMode: true,
+    autonomousMode: autonomousMode.value,
+    autonomousMaxIterations: 10
+  })
 
   // Plan Mode 确认回调
   const onPlanReady = async () => {
@@ -1510,7 +1517,11 @@ async function sendCourtMessage() {
     const workers = ministers.filter(m => m.id !== 'chancellor')
 
     if (chancellor && workers.length > 0) {
-      const agent = new CoordinatorAgent({ planMode: true })
+      const agent = new CoordinatorAgent({
+        planMode: true,
+        autonomousMode: autonomousMode.value,
+        autonomousMaxIterations: 10
+      })
 
       // Plan Mode 确认回调
       const onPlanReady = async () => {
@@ -2168,6 +2179,9 @@ function renderMarkdown(content: string): string {
               <el-radio-button value="parallel">并行</el-radio-button>
               <el-radio-button value="agent">Agent</el-radio-button>
             </el-radio-group>
+            <el-tooltip v-if="debateStore.debateMode === 'agent'" content="自主执行：每个角色可自主迭代（写→跑→验证→修复）" placement="top">
+              <el-switch v-model="autonomousMode" size="small" class="autonomous-switch" />
+            </el-tooltip>
             <el-tooltip content="添加附件" placement="top">
               <el-button size="small" circle :loading="attachingSessionFile" @click="addSessionAttachment" class="toolbar-icon-btn">
                 <template v-if="!attachingSessionFile">📎</template>
@@ -3457,5 +3471,11 @@ function renderMarkdown(content: string): string {
 @keyframes fadeIn {
   from { opacity: 0; }
   to { opacity: 1; }
+}
+
+/* 自主执行开关 */
+.autonomous-switch {
+  margin-left: 6px;
+  --el-switch-on-color: var(--ct-accent);
 }
 </style>

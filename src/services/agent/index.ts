@@ -8,6 +8,15 @@ export type {
   CoordinatorConfig
 } from './coordinator'
 
+export { AutonomousEngine, autonomousEngine, enhanceWithAutonomousPrompt } from './autonomous-engine'
+export { AUTONOMOUS_PROMPT_SUFFIX, AUTONOMOUS_DEV_PROMPT_SUFFIX } from './autonomous-engine'
+export type {
+  AutonomousConfig,
+  AutonomousEvent,
+  AutonomousEventType,
+  AutonomousResult
+} from './autonomous-engine'
+
 export { PostDebateExecutor, postDebateExecutor } from './post-debate'
 export type {
   ImperialDecree,
