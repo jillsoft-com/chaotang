@@ -13,11 +13,15 @@ import {
   writeFileTool, createDirectoryTool, readDirectoryTool, readDocumentTool, executeCommandTool,
   searchCodeTool, gitOperationTool, runTestsTool,
   saveMemoryTool, searchMemoryTool,
+  factCheckTool, traceSourceTool, chartGeneratorTool, historySearchTool,
+  lintCheckTool, typeCheckTool, refactorRenameTool,
   webSearchHandler, knowledgeQueryHandler, calculateHandler,
   readFileHandler, summarizeResultsHandler,
   writeFileHandler, createDirectoryHandler, readDirectoryHandler, readDocumentHandler, executeCommandHandler,
   searchCodeHandler, gitOperationHandler, runTestsHandler,
-  saveMemoryHandler, searchMemoryHandler
+  saveMemoryHandler, searchMemoryHandler,
+  factCheckHandler, traceSourceHandler, chartGeneratorHandler, historySearchHandler,
+  lintCheckHandler, typeCheckHandler, refactorRenameHandler
 } from '@/services/tools/handlers/minimal'
 import {
   browserToolDefinitions, browserToolHandlers
@@ -198,6 +202,86 @@ const allSkills: Array<{ skill: Skill; handlers: Record<string, any> }> = [
       enabled: true
     },
     handlers: browserToolHandlers
+  },
+  // ============ 角色专属 Skill（Sprint A - #4） ============
+  {
+    skill: {
+      id: 'fact_checking',
+      name: '事实核查',
+      description: '验证说法真伪、交叉验证信息源、追溯来源。御史专属能力。',
+      icon: '⚖️',
+      category: 'verification',
+      tools: [factCheckTool, traceSourceTool],
+      config: { timeout: 20000, maxCallsPerRound: 5 },
+      enabled: true
+    },
+    handlers: { fact_check: factCheckHandler, trace_source: traceSourceHandler }
+  },
+  {
+    skill: {
+      id: 'data_visualization',
+      name: '数据可视化',
+      description: '将数据转化为表格、排行榜、预算分配、进度条、矩阵等可视化文本图表。户部尚书专属能力。',
+      icon: '📊',
+      category: 'analysis',
+      tools: [chartGeneratorTool],
+      config: { timeout: 10000 },
+      enabled: true
+    },
+    handlers: { generate_chart: chartGeneratorHandler }
+  },
+  {
+    skill: {
+      id: 'history_cases',
+      name: '历史案例库',
+      description: '检索历史朝议记录，查找过去的相关案例和经验。太傅专属能力，便于"引经据典"。',
+      icon: '📜',
+      category: 'information',
+      tools: [historySearchTool],
+      config: { timeout: 10000 },
+      enabled: true
+    },
+    handlers: { history_search: historySearchHandler }
+  },
+  // ============ 代码质量 Skill（Sprint B - #11） ============
+  {
+    skill: {
+      id: 'code_quality',
+      name: '代码质量检查',
+      description: '运行 ESLint / Pylint / Ruff 等代码质量检查工具，发现代码问题并可选自动修复',
+      icon: '🔧',
+      category: 'system',
+      tools: [lintCheckTool],
+      config: { timeout: 60000 },
+      enabled: true
+    },
+    handlers: { lint_check: lintCheckHandler }
+  },
+  {
+    skill: {
+      id: 'type_safety',
+      name: '类型检查',
+      description: '运行 TypeScript / MyPy / Cargo check 等类型检查工具，确保代码类型安全',
+      icon: '🛡️',
+      category: 'system',
+      tools: [typeCheckTool],
+      config: { timeout: 120000 },
+      enabled: true
+    },
+    handlers: { type_check: typeCheckHandler }
+  },
+  {
+    skill: {
+      id: 'refactoring',
+      name: '代码重构',
+      description: '跨文件重命名标识符（变量名、函数名、类名等），支持预览模式',
+      icon: '♻️',
+      category: 'system',
+      tools: [refactorRenameTool],
+      config: { timeout: 30000, requireConfirmation: true },
+      enabled: true
+    },
+    handlers: { refactor_rename: refactorRenameHandler }
   }
 ]
 
@@ -208,16 +292,16 @@ const allSkills: Array<{ skill: Skill; handlers: Record<string, any> }> = [
  * 定义每个角色初始可用的技能
  */
 export const defaultMinisterSkills: Record<string, string[]> = {
-  // 丞相：全局搜索 + 知识库 + 任务协调 + 文件操作 + 文档解析 + 命令行 + 代码搜索 + Git + 浏览器
-  chancellor: ['web_search', 'knowledge_base', 'task_coordinator', 'file_ops', 'document_reader', 'command_executor', 'code_search', 'git_ops', 'test_runner', 'memory', 'browser'],
-  // 户部尚书：数据计算 + 搜索 + 文件读取 + 文件操作 + 文档解析 + 命令行 + Git + 测试 + 记忆
-  finance: ['calculator', 'web_search', 'file_reader', 'file_ops', 'document_reader', 'command_executor', 'git_ops', 'test_runner', 'memory'],
-  // 太傅：知识库 + 搜索 + 文件读取 + 文件操作 + 文档解析 + 命令行 + 代码搜索 + Git + 测试 + 记忆 + 浏览器
-  tutor: ['knowledge_base', 'web_search', 'file_reader', 'file_ops', 'document_reader', 'command_executor', 'code_search', 'git_ops', 'test_runner', 'memory', 'browser'],
-  // 大将军：搜索 + 知识库 + 命令行 + Git
-  general: ['web_search', 'knowledge_base', 'command_executor', 'git_ops', 'memory'],
-  // 御史：搜索 + 知识库 + 文档解析 + 代码搜索
-  censor: ['web_search', 'knowledge_base', 'document_reader', 'code_search', 'memory'],
+  // 丞相：全局搜索 + 知识库 + 任务协调 + 文件操作 + 文档解析 + 命令行 + 代码搜索 + Git + 浏览器 + 历史案例 + 代码质量 + 类型检查 + 重构
+  chancellor: ['web_search', 'knowledge_base', 'task_coordinator', 'file_ops', 'document_reader', 'command_executor', 'code_search', 'git_ops', 'test_runner', 'memory', 'browser', 'history_cases', 'code_quality', 'type_safety', 'refactoring'],
+  // 户部尚书：数据计算 + 数据可视化 + 搜索 + 文件读取 + 文件操作 + 文档解析 + 命令行 + Git + 测试 + 记忆
+  finance: ['calculator', 'data_visualization', 'web_search', 'file_reader', 'file_ops', 'document_reader', 'command_executor', 'git_ops', 'test_runner', 'memory'],
+  // 太傅：知识库 + 搜索 + 历史案例 + 文件读取 + 文件操作 + 文档解析 + 命令行 + 代码搜索 + Git + 测试 + 记忆 + 浏览器
+  tutor: ['knowledge_base', 'web_search', 'history_cases', 'file_reader', 'file_ops', 'document_reader', 'command_executor', 'code_search', 'git_ops', 'test_runner', 'memory', 'browser'],
+  // 大将军：搜索 + 知识库 + 命令行 + Git + 代码质量 + 类型检查 + 重构（编码核心角色）
+  general: ['web_search', 'knowledge_base', 'command_executor', 'git_ops', 'memory', 'code_quality', 'type_safety', 'refactoring'],
+  // 御史：搜索 + 知识库 + 文档解析 + 代码搜索 + 事实核查（御史专属核心能力） + 代码质量
+  censor: ['web_search', 'knowledge_base', 'document_reader', 'code_search', 'memory', 'fact_checking', 'code_quality'],
   // 总管：搜索 + 知识库 + 文件读取 + 文件操作 + 文档解析 + 命令行 + 代码搜索 + Git + 记忆
   eunuch: ['web_search', 'knowledge_base', 'file_reader', 'file_ops', 'document_reader', 'command_executor', 'code_search', 'git_ops', 'test_runner', 'memory']
 }
@@ -233,7 +317,7 @@ export function initializeSkills(): void {
   }
 
   // 2. 建立默认绑定（仅在首次初始化时，版本控制确保新技能能补绑）
-  const initialized = localStorage.getItem('skills_initialized_v8')
+  const initialized = localStorage.getItem('skills_initialized_v10')
   if (!initialized) {
     // 清除旧版本标记
     localStorage.removeItem('skills_initialized')
@@ -243,6 +327,8 @@ export function initializeSkills(): void {
     localStorage.removeItem('skills_initialized_v5')
     localStorage.removeItem('skills_initialized_v6')
     localStorage.removeItem('skills_initialized_v7')
+    localStorage.removeItem('skills_initialized_v8')
+    localStorage.removeItem('skills_initialized_v9')
     localStorage.removeItem('minister_skill_bindings')
     // 重新加载绑定（清除后为空）
     for (const [ministerId, skillIds] of Object.entries(defaultMinisterSkills)) {
@@ -250,7 +336,7 @@ export function initializeSkills(): void {
         skillRegistry.bindSkillToMinister(skillId, ministerId)
       }
     }
-    localStorage.setItem('skills_initialized_v8', 'true')
+    localStorage.setItem('skills_initialized_v10', 'true')
   }
 
   // 3. 加载自定义插件
@@ -260,5 +346,5 @@ export function initializeSkills(): void {
     })
   })
 
-  console.log(`[Skills] 已注册 ${allSkills.length} 个 Skill（含浏览器自动化），完成角色绑定`)
+  console.log(`[Skills] 已注册 ${allSkills.length} 个 Skill（含浏览器自动化 + 角色专属工具 + 代码质量），完成角色绑定`)
 }

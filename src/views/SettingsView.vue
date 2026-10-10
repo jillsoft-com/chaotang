@@ -13,8 +13,11 @@ import { isCustomTheme, getPresetsByCategory, THEME_CATEGORIES } from '@/service
 import type { Skill } from '@/types'
 import { SKILL_CATEGORY_LABELS } from '@/types'
 import { pluginManager_getAll, pluginManager_reloadAll } from '@/services/plugins/plugin-manager'
+import { importPluginFromFile } from '@/services/plugins/plugin-loader'
 import type { LoadedPlugin } from '@/services/plugins/types'
 import { getMessagingConfig, saveMessagingConfig, initMessaging, getWeComAdapter, startWebhookServer, stopWebhookServer } from '@/services/messaging'
+import { estimateTokens, estimateCost, formatCost, formatTokens, formatDuration } from '@/utils/token-utils'
+import type { Debate } from '@/types'
 
 const router = useRouter()
 const debateStore = useDebateStore()
@@ -89,6 +92,16 @@ const maxToolRounds = ref(30)
 
 // 上下文压缩阈值（字符数）
 const contextCompressThreshold = ref(50000)
+
+// 字体大小
+const MIN_FONT = 12
+const MAX_FONT = 22
+const messageFontSize = ref(parseInt(localStorage.getItem('message_font_size') || '15', 10))
+
+function saveFontSize(val: number) {
+  messageFontSize.value = val
+  localStorage.setItem('message_font_size', String(val))
+}
 
 // 朝代主题
 const dynastyPresets = ref(debateStore.getDynastyPresets())
@@ -226,6 +239,40 @@ async function deleteCustomTheme(themeId: string) {
 
 // 角色配置
 const ministerLLMMap = ref<Record<string, string>>({})
+
+// 角色自定义头像
+const avatarEmojiOptions = [
+  '👑', '💰', '📚', '⚔️', '🔍', '🏮', '🐲', '🦁', '🐯', '🦅',
+  '🏛️', '⚖️', '📜', '🗡️', '🛡️', '🎭', '👤', '🧙', '🧑‍💼', '👨‍⚖️',
+  '🎖️', '🏅', '💎', '🌟', '🔥', '❄️', '🌊', '⛰️', '🌙', '☀️'
+]
+const avatarUrlInputs = ref<Record<string, string>>({})
+
+function isImageAvatar(avatar: string): boolean {
+  return avatar.startsWith('http') || avatar.startsWith('data:')
+}
+
+function setAvatarFromEmoji(ministerId: string, emoji: string) {
+  debateStore.setMinisterAvatar(ministerId, emoji)
+  avatarUrlInputs.value[ministerId] = ''
+  ElMessage.success('头像已更新')
+}
+
+function setAvatarFromUrl(ministerId: string) {
+  const url = (avatarUrlInputs.value[ministerId] || '').trim()
+  if (!url) {
+    ElMessage.warning('请输入图片 URL')
+    return
+  }
+  debateStore.setMinisterAvatar(ministerId, url)
+  ElMessage.success('头像已更新')
+}
+
+function resetAvatar(ministerId: string) {
+  debateStore.setMinisterAvatar(ministerId, '')
+  avatarUrlInputs.value[ministerId] = ''
+  ElMessage.success('已恢复默认头像')
+}
 
 const llmConfigs = computed(() => llmService.getAll())
 
@@ -590,6 +637,26 @@ async function openPluginDir() {
   }
 }
 
+const importingPlugin = ref(false)
+
+async function importPlugin() {
+  importingPlugin.value = true
+  try {
+    const result = await importPluginFromFile()
+    if (result.success) {
+      ElMessage.success(`已导入插件「${result.pluginName}」，正在加载…`)
+      // 自动重新加载插件
+      await reloadPlugins()
+    } else if (result.error && result.error !== '已取消导入') {
+      ElMessage.error(result.error)
+    }
+  } catch (error) {
+    ElMessage.error('导入插件失败: ' + (error instanceof Error ? error.message : '未知错误'))
+  } finally {
+    importingPlugin.value = false
+  }
+}
+
 // ============ 沙箱配置 ============
 
 const sandboxEnabled = ref(true)
@@ -698,6 +765,110 @@ async function stopServer() {
     serverLoading.value = false
   }
 }
+
+// ============ 数据洞察（v0.6） ============
+
+/** 所有历史会话（含当前活跃会话） */
+const allDebates = computed<Debate[]>(() => {
+  const history = debateStore.debates || []
+  const active = debateStore.activeSession
+  // 合并去重
+  const ids = new Set(history.map(d => d.id))
+  const result = [...history]
+  if (active && !ids.has(active.id)) result.unshift(active)
+  return result.sort((a, b) => b.createdAt - a.createdAt)
+})
+
+/** 统计所有会话的 token / 费用 / 模型使用 */
+const globalStats = computed(() => {
+  let totalPromptTokens = 0
+  let totalCompletionTokens = 0
+  let totalCost = 0
+  let totalDuration = 0
+  let speechCount = 0
+  const modelUsage = new Map<string, { count: number; tokens: number; cost: number }>()
+
+  for (const debate of allDebates.value) {
+    for (const speech of debate.speeches) {
+      if (speech.ministerId === 'emperor') continue
+      speechCount++
+
+      const tu = speech.tokenUsage
+      const model = speech.model || 'unknown'
+      const promptT = tu?.promptTokens || estimateTokens(speech.content) // fallback: estimate
+      const completionT = tu?.completionTokens || estimateTokens(speech.content)
+      const totalT = tu?.totalTokens || promptT + completionT
+      const cost = estimateCost(promptT, completionT, model)
+
+      totalPromptTokens += promptT
+      totalCompletionTokens += completionT
+      totalCost += cost
+      totalDuration += speech.durationMs || 0
+
+      if (!modelUsage.has(model)) {
+        modelUsage.set(model, { count: 0, tokens: 0, cost: 0 })
+      }
+      const mu = modelUsage.get(model)!
+      mu.count++
+      mu.tokens += totalT
+      mu.cost += cost
+    }
+  }
+
+  const modelBreakdown = [...modelUsage.entries()]
+    .map(([model, data]) => ({ model, ...data }))
+    .sort((a, b) => b.tokens - a.tokens)
+
+  return {
+    totalDebates: allDebates.value.length,
+    completedDebates: allDebates.value.filter(d => d.status === 'completed').length,
+    speechCount,
+    totalPromptTokens,
+    totalCompletionTokens,
+    totalTokens: totalPromptTokens + totalCompletionTokens,
+    totalCost,
+    avgDuration: speechCount > 0 ? totalDuration / speechCount : 0,
+    modelBreakdown
+  }
+})
+
+/** 决策时间线：已完成的会话按时间排列 */
+const decisionTimeline = computed(() => {
+  return allDebates.value
+    .filter(d => d.status === 'completed')
+    .slice(0, 20) // 最近 20 条
+    .map(d => {
+      const ministerSpeeches = d.speeches.filter(s => s.ministerId !== 'emperor')
+      const totalTokens = ministerSpeeches.reduce((sum, s) => {
+        const tu = s.tokenUsage
+        return sum + (tu?.totalTokens || estimateTokens(s.content) * 2)
+      }, 0)
+      const totalCost = ministerSpeeches.reduce((sum, s) => {
+        const tu = s.tokenUsage
+        return sum + estimateCost(tu?.promptTokens || 0, tu?.completionTokens || estimateTokens(s.content), s.model || 'unknown')
+      }, 0)
+      return {
+        id: d.id,
+        topic: d.topic,
+        createdAt: d.createdAt,
+        completedAt: d.completedAt,
+        imperialDecree: d.imperialDecree,
+        speechCount: ministerSpeeches.length,
+        totalTokens,
+        totalCost,
+        tags: d.tags || []
+      }
+    })
+})
+
+function formatDate(ts: number): string {
+  const d = new Date(ts)
+  const mm = String(d.getMonth() + 1).padStart(2, '0')
+  const dd = String(d.getDate()).padStart(2, '0')
+  const hh = String(d.getHours()).padStart(2, '0')
+  const mi = String(d.getMinutes()).padStart(2, '0')
+  return `${mm}-${dd} ${hh}:${mi}`
+}
 </script>
 
 <template>
@@ -735,6 +906,26 @@ async function stopServer() {
                   active-text="暗"
                   inactive-text="亮"
                 />
+              </div>
+              <div class="settings-item">
+                <div class="settings-item-info">
+                  <span class="settings-item-label">消息字体大小</span>
+                  <span class="settings-item-desc">调整会话中消息正文的字号（{{ messageFontSize }}px，默认 15px）</span>
+                </div>
+                <div class="font-size-setting">
+                  <el-slider
+                    v-model="messageFontSize"
+                    :min="MIN_FONT"
+                    :max="MAX_FONT"
+                    :step="1"
+                    :show-tooltip="true"
+                    style="width: 160px"
+                    @change="saveFontSize"
+                  />
+                  <el-button size="small" text @click="messageFontSize = 15; saveFontSize(15)" :disabled="messageFontSize === 15">
+                    重置
+                  </el-button>
+                </div>
               </div>
             </el-card>
 
@@ -955,7 +1146,38 @@ async function stopServer() {
               <!-- 角色信息 -->
               <div class="minister-header">
                 <div class="minister-info">
-                  <span class="minister-avatar">{{ minister.avatar }}</span>
+                  <el-popover trigger="click" placement="bottom" :width="320">
+                    <template #reference>
+                      <span class="minister-avatar minister-avatar-clickable" :title="'点击更换头像'">
+                        <img v-if="isImageAvatar(minister.avatar)" :src="minister.avatar" class="minister-avatar-img" />
+                        <span v-else>{{ minister.avatar }}</span>
+                      </span>
+                    </template>
+                    <div class="avatar-editor">
+                      <div class="avatar-editor-title">选择头像</div>
+                      <div class="avatar-emoji-grid">
+                        <span
+                          v-for="emoji in avatarEmojiOptions"
+                          :key="emoji"
+                          class="avatar-emoji-option"
+                          :class="{ active: minister.avatar === emoji }"
+                          @click="setAvatarFromEmoji(minister.id, emoji)"
+                        >{{ emoji }}</span>
+                      </div>
+                      <div class="avatar-url-row">
+                        <el-input
+                          v-model="avatarUrlInputs[minister.id]"
+                          placeholder="图片 URL"
+                          size="small"
+                          @keydown.enter="setAvatarFromUrl(minister.id)"
+                        />
+                        <el-button size="small" type="primary" @click="setAvatarFromUrl(minister.id)">应用</el-button>
+                      </div>
+                      <div class="avatar-reset-row">
+                        <el-button size="small" text type="danger" @click="resetAvatar(minister.id)">恢复默认</el-button>
+                      </div>
+                    </div>
+                  </el-popover>
                   <div>
                     <h3 class="minister-name">{{ minister.name }}</h3>
                     <p class="minister-title">{{ minister.title }}</p>
@@ -1087,6 +1309,7 @@ async function stopServer() {
               <p class="section-desc">通过 SKILL.md 文件定义自定义工具，插件放在 plugins 目录中自动发现</p>
             </div>
             <div style="display: flex; gap: 8px">
+              <el-button @click="importPlugin" :loading="importingPlugin">导入插件</el-button>
               <el-button @click="reloadPlugins" :loading="pluginsLoading">重新加载</el-button>
               <el-button type="primary" @click="openPluginDir">打开插件目录</el-button>
             </div>
@@ -1325,6 +1548,110 @@ handler: |
                 </div>
               </div>
             </el-card>
+          </div>
+        </el-tab-pane>
+
+        <!-- 数据洞察 -->
+        <el-tab-pane label="数据洞察" name="insights">
+          <div class="tab-header">
+            <div>
+              <h2 class="section-title">数据洞察</h2>
+              <p class="section-desc">Token 统计、费用估算、模型使用分析和决策时间线</p>
+            </div>
+          </div>
+
+          <div class="settings-sections">
+            <!-- 总览卡片 -->
+            <el-card shadow="never" class="settings-card">
+              <h3 class="card-title">全局统计</h3>
+              <div class="stats-grid">
+                <div class="stat-item">
+                  <span class="stat-value">{{ globalStats.totalDebates }}</span>
+                  <span class="stat-label">总会话数</span>
+                </div>
+                <div class="stat-item">
+                  <span class="stat-value">{{ globalStats.completedDebates }}</span>
+                  <span class="stat-label">已完成</span>
+                </div>
+                <div class="stat-item">
+                  <span class="stat-value">{{ globalStats.speechCount }}</span>
+                  <span class="stat-label">大臣发言</span>
+                </div>
+                <div class="stat-item">
+                  <span class="stat-value">{{ formatTokens(globalStats.totalTokens) }}</span>
+                  <span class="stat-label">总 Token</span>
+                </div>
+                <div class="stat-item">
+                  <span class="stat-value">{{ formatTokens(globalStats.totalPromptTokens) }}</span>
+                  <span class="stat-label">输入 Token</span>
+                </div>
+                <div class="stat-item">
+                  <span class="stat-value">{{ formatTokens(globalStats.totalCompletionTokens) }}</span>
+                  <span class="stat-label">输出 Token</span>
+                </div>
+                <div class="stat-item">
+                  <span class="stat-value">{{ formatCost(globalStats.totalCost) }}</span>
+                  <span class="stat-label">估算总费用</span>
+                </div>
+                <div class="stat-item">
+                  <span class="stat-value">{{ formatDuration(globalStats.avgDuration) }}</span>
+                  <span class="stat-label">平均响应时间</span>
+                </div>
+              </div>
+            </el-card>
+
+            <!-- 模型使用比例 -->
+            <el-card shadow="never" class="settings-card" v-if="globalStats.modelBreakdown.length > 0">
+              <h3 class="card-title">模型使用分析</h3>
+              <div class="model-breakdown-list">
+                <div v-for="item in globalStats.modelBreakdown" :key="item.model" class="model-breakdown-item">
+                  <div class="model-breakdown-info">
+                    <span class="model-breakdown-name">{{ item.model }}</span>
+                    <span class="model-breakdown-count">{{ item.count }} 次发言</span>
+                  </div>
+                  <div class="model-breakdown-stats">
+                    <span>{{ formatTokens(item.tokens) }} tokens</span>
+                    <span>{{ formatCost(item.cost) }}</span>
+                  </div>
+                  <div class="model-breakdown-bar">
+                    <div
+                      class="model-breakdown-bar-fill"
+                      :style="{ width: (item.tokens / globalStats.totalTokens * 100) + '%' }"
+                    ></div>
+                  </div>
+                </div>
+              </div>
+            </el-card>
+
+            <!-- 决策时间线 -->
+            <el-card shadow="never" class="settings-card" v-if="decisionTimeline.length > 0">
+              <h3 class="card-title">决策时间线（最近 {{ decisionTimeline.length }} 次）</h3>
+              <div class="timeline-list">
+                <div v-for="item in decisionTimeline" :key="item.id" class="timeline-item">
+                  <div class="timeline-dot"></div>
+                  <div class="timeline-content">
+                    <div class="timeline-header">
+                      <span class="timeline-topic">{{ item.topic }}</span>
+                      <span class="timeline-date">{{ formatDate(item.createdAt) }}</span>
+                    </div>
+                    <div class="timeline-meta">
+                      <span>{{ item.speechCount }} 次发言</span>
+                      <span>{{ formatTokens(item.totalTokens) }} tokens</span>
+                      <span>{{ formatCost(item.totalCost) }}</span>
+                      <el-tag v-for="tag in item.tags" :key="tag" size="small" effect="plain">{{ tag }}</el-tag>
+                    </div>
+                    <div v-if="item.imperialDecree" class="timeline-decree">
+                      📜 {{ item.imperialDecree.length > 60 ? item.imperialDecree.slice(0, 60) + '…' : item.imperialDecree }}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </el-card>
+
+            <el-empty
+              v-if="globalStats.totalDebates === 0"
+              description="暂无会话数据，开始一次朝议后将自动生成统计"
+            />
           </div>
         </el-tab-pane>
       </el-tabs>
@@ -1618,6 +1945,81 @@ handler: |
 
 .minister-avatar {
   font-size: 36px;
+  cursor: default;
+  width: 48px;
+  height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.minister-avatar-clickable {
+  cursor: pointer;
+  transition: transform 0.15s, box-shadow 0.15s;
+}
+
+.minister-avatar-clickable:hover {
+  transform: scale(1.1);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.minister-avatar-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 12px;
+}
+
+/* 头像编辑器弹出层 */
+.avatar-editor-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ct-text-primary);
+  margin-bottom: 10px;
+}
+
+.avatar-emoji-grid {
+  display: grid;
+  grid-template-columns: repeat(10, 1fr);
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.avatar-emoji-option {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s;
+  border: 2px solid transparent;
+}
+
+.avatar-emoji-option:hover {
+  background: var(--ct-bg-tertiary);
+  transform: scale(1.15);
+}
+
+.avatar-emoji-option.active {
+  border-color: var(--ct-accent);
+  background: var(--ct-bg-tertiary);
+}
+
+.avatar-url-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.avatar-reset-row {
+  display: flex;
+  justify-content: flex-end;
 }
 
 .minister-name {
@@ -1781,6 +2183,13 @@ handler: |
 }
 
 .max-rounds-control {
+  flex-shrink: 0;
+}
+
+.font-size-setting {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   flex-shrink: 0;
 }
 
@@ -2098,5 +2507,158 @@ handler: |
   font-size: 13px;
   color: var(--ct-text-secondary);
   margin: 0 0 12px;
+}
+
+/* 数据洞察 - 统计网格 */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+}
+
+.stat-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 12px;
+  background: var(--ct-bg-tertiary);
+  border-radius: 8px;
+}
+
+.stat-value {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--ct-accent);
+}
+
+.stat-label {
+  font-size: 12px;
+  color: var(--ct-text-secondary);
+}
+
+/* 模型使用分析 */
+.model-breakdown-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.model-breakdown-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.model-breakdown-info {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.model-breakdown-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ct-text-primary);
+}
+
+.model-breakdown-count {
+  font-size: 12px;
+  color: var(--ct-text-secondary);
+}
+
+.model-breakdown-stats {
+  display: flex;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--ct-text-secondary);
+}
+
+.model-breakdown-bar {
+  height: 4px;
+  background: var(--ct-bg-tertiary);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.model-breakdown-bar-fill {
+  height: 100%;
+  background: var(--ct-accent);
+  border-radius: 2px;
+  transition: width 0.3s;
+}
+
+/* 决策时间线 */
+.timeline-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.timeline-item {
+  display: flex;
+  gap: 12px;
+  padding: 12px 0;
+  position: relative;
+}
+
+.timeline-item + .timeline-item {
+  border-top: 1px solid var(--ct-border-light);
+}
+
+.timeline-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ct-accent);
+  flex-shrink: 0;
+  margin-top: 6px;
+}
+
+.timeline-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.timeline-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+
+.timeline-topic {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ct-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.timeline-date {
+  font-size: 12px;
+  color: var(--ct-text-secondary);
+  flex-shrink: 0;
+}
+
+.timeline-meta {
+  display: flex;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--ct-text-secondary);
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.timeline-decree {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--ct-text-secondary);
+  padding: 6px 10px;
+  background: var(--ct-bg-tertiary);
+  border-radius: 6px;
+  border-left: 3px solid var(--ct-accent);
 }
 </style>

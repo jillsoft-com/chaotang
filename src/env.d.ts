@@ -76,6 +76,11 @@ interface ElectronAPI {
     defaultPath?: string
     filters?: Array<{ name: string; extensions: string[] }>
   }) => Promise<{ canceled: boolean; filePaths: string[]; error?: string }>
+  showSaveDialog: (options: {
+    title?: string
+    defaultPath?: string
+    filters?: Array<{ name: string; extensions: string[] }>
+  }) => Promise<{ canceled: boolean; filePath?: string; error?: string }>
 
   // 沙箱配置
   getSandboxConfig: () => Promise<{
@@ -96,6 +101,16 @@ interface ElectronAPI {
   readPlugin: (filePath: string) => Promise<{ success: boolean; content?: string; error?: string }>
   getPluginDir: () => Promise<string>
   openPluginDir: () => Promise<boolean>
+
+  // 附件
+  readAttachment: (filePath: string) => Promise<{
+    success: boolean
+    content?: string
+    fileName?: string
+    fileSize?: number
+    fileType?: string
+    error?: string
+  }>
 
   // 浏览器自动化
   browserAction: (params: {

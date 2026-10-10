@@ -210,18 +210,35 @@ app.whenReady().then(() => {
   })
 
   // IPC: 打开目录选择对话框
-  ipcMain.handle('show-open-dialog', async (event) => {
+  ipcMain.handle('show-open-dialog', async (event, options) => {
     try {
-      const result = await dialog.showOpenDialog(mainWindow, {
-        title: '选择朝堂工作目录',
-        properties: ['openDirectory']
-      })
-      if (!result.canceled && result.filePaths.length === 1) {
+      const dialogOptions = {
+        title: options?.title || '选择目录',
+        properties: options?.properties || ['openDirectory'],
+        filters: options?.filters || undefined
+      }
+      const result = await dialog.showOpenDialog(mainWindow, dialogOptions)
+      // 如果是选择目录（工作目录场景），记录授权路径
+      if (dialogOptions.properties.includes('openDirectory') && !result.canceled && result.filePaths.length === 1) {
         authorizedRoots.set(event.sender.id, fs.realpathSync(result.filePaths[0]))
       }
       return result
     } catch (error) {
       return { canceled: true, filePaths: [], error: error.message }
+    }
+  })
+
+  // IPC: 保存文件对话框
+  ipcMain.handle('show-save-dialog', async (_event, options) => {
+    try {
+      const result = await dialog.showSaveDialog(mainWindow, {
+        title: options?.title || '保存文件',
+        defaultPath: options?.defaultPath || undefined,
+        filters: options?.filters || undefined
+      })
+      return { canceled: result.canceled, filePath: result.filePath || undefined }
+    } catch (error) {
+      return { canceled: true, error: error.message }
     }
   })
 
@@ -282,6 +299,81 @@ app.whenReady().then(() => {
       }
 
       return { success: true, content, metadata }
+    } catch (error) {
+      return { success: false, error: error.message }
+    }
+  })
+
+  // IPC: 读取附件文件（用于朝议附件，不需要路径授权，用户通过对话框主动选择）
+  ipcMain.handle('read-attachment', async (_event, filePath) => {
+    try {
+      if (!fs.existsSync(filePath)) {
+        throw new Error(`文件不存在: ${filePath}`)
+      }
+      const stats = fs.statSync(filePath)
+      if (stats.size > 20 * 1024 * 1024) {
+        throw new Error('文件过大，最大支持 20MB')
+      }
+      const ext = path.extname(filePath).toLowerCase()
+      let content = ''
+
+      // 文档类型文件
+      if (ext === '.docx' || ext === '.doc') {
+        const mammoth = require('mammoth')
+        const result = await mammoth.extractRawText({ path: filePath })
+        content = result.value
+      } else if (ext === '.pdf') {
+        const pdfParse = require('pdf-parse')
+        const buffer = fs.readFileSync(filePath)
+        const data = await pdfParse(buffer)
+        content = data.text
+      } else if (ext === '.xlsx' || ext === '.xls') {
+        const XLSX = require('xlsx')
+        const workbook = XLSX.readFile(filePath)
+        const sheets = []
+        for (const name of workbook.SheetNames) {
+          const sheet = workbook.Sheets[name]
+          const csv = XLSX.utils.sheet_to_csv(sheet)
+          sheets.push(`--- Sheet: ${name} ---\n${csv}`)
+        }
+        content = sheets.join('\n\n')
+      } else if (ext === '.pptx') {
+        const mammoth = require('mammoth')
+        try {
+          const result = await mammoth.extractRawText({ path: filePath })
+          content = result.value
+        } catch {
+          content = '[PPTX 文件无法解析文本内容]'
+        }
+      } else {
+        // 文本类型文件
+        const textExts = new Set([
+          '.txt', '.md', '.csv', '.json', '.xml', '.html', '.htm',
+          '.js', '.ts', '.vue', '.jsx', '.tsx', '.py', '.java', '.kt',
+          '.c', '.cpp', '.h', '.hpp', '.cs', '.go', '.rs', '.rb',
+          '.php', '.swift', '.sh', '.bash', '.zsh', '.bat', '.ps1',
+          '.sql', '.yaml', '.yml', '.toml', '.ini', '.conf', '.cfg',
+          '.log', '.env', '.gitignore', '.dockerfile'
+        ])
+        if (textExts.has(ext) || stats.size < 1024 * 100) {
+          content = fs.readFileSync(filePath, 'utf-8')
+        } else {
+          throw new Error(`不支持的附件格式: ${ext}`)
+        }
+      }
+
+      // 截断过长内容（保留前 30000 字符）
+      if (content.length > 30000) {
+        content = content.slice(0, 30000) + '\n... (内容过长，已截断，仅保留前 30000 字符)'
+      }
+
+      return {
+        success: true,
+        content,
+        fileName: path.basename(filePath),
+        fileSize: stats.size,
+        fileType: ext.replace(/^\./, '')
+      }
     } catch (error) {
       return { success: false, error: error.message }
     }

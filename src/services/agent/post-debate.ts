@@ -9,7 +9,7 @@
  * 所有动作通过 LLM 生成，基于朝议过程中各大臣的发言记录。
  */
 
-import type { Debate, Minister, ChatMessage, LLMConfig } from '@/types'
+import type { Debate, Minister, ChatMessage, LLMConfig, DecisionReport, DecisionEntry } from '@/types'
 import { createProvider } from '@/services/llm'
 
 // ============ 类型定义 ============
@@ -41,7 +41,7 @@ export interface PostDebateResult {
 }
 
 /** 执行动作类型 */
-export type PostDebateAction = 'decree' | 'action-items' | 'report'
+export type PostDebateAction = 'decree' | 'action-items' | 'report' | 'decision-report'
 
 // ============ Post-Debate Executor ============
 
@@ -204,6 +204,101 @@ export class PostDebateExecutor {
   }
 
   /**
+   * 生成决策质量报告（四象限）
+   * 拍板后由丞相汇总产出：共识点 / 分歧点 / 风险清单 / 待验证假设
+   * 用于把辩论结果变成可执行、可复盘的决策产物
+   */
+  async generateDecisionReport(
+    debate: Debate,
+    ministers: Minister[],
+    llmConfig: LLMConfig
+  ): Promise<DecisionReport> {
+    const provider = createProvider(llmConfig)
+    const debateSummary = this.buildDebateSummary(debate, ministers)
+
+    // 准备角色列表，让 LLM 能准确映射 source
+    const ministerCatalog = ministers
+      .map(m => `- ${m.name}（id: ${m.id}，title: ${m.title}）`)
+      .join('\n')
+
+    const messages: ChatMessage[] = [
+      {
+        role: 'system',
+        content: `你是帝王的谋士兼书记官。你的任务是把一场朝议整理成结构化的「决策报告」，按四个象限分类：
+
+1. consensus（共识点）：多位角色共同支持的观点、事实或结论
+2. disagreements（分歧点）：角色间存在争议或不同立场的内容
+3. risks（风险清单）：需要注意的潜在问题、障碍或代价
+4. assumptions（待验证假设）：尚未确认、需要后续验证的前提、数据或结论
+
+每个象限输出 0-5 条，每条包含：
+- title：简洁标题（不超过 15 字）
+- detail：具体说明（不超过 80 字）
+- sources：提出这条的角色 id 数组（如 ["chancellor", "censor"]），必须使用下面提供的角色 id
+- importance：1-5 的重要程度
+
+另外输出：
+- verdict：一句话决策结论（不超过 30 字）
+- nextSteps：下一步行动建议（3-5 条，按优先级排序，每条不超过 40 字）
+
+严格以 JSON 格式输出，不要使用 markdown 代码块包裹，不要包含其他文字。`
+      },
+      {
+        role: 'user',
+        content: `议题：${debate.topic}\n\n参与角色目录：\n${ministerCatalog}\n\n朝议记录：\n${debateSummary}\n\n请生成决策报告 JSON。`
+      }
+    ]
+
+    const content = await provider.chatStream(messages, () => {})
+
+    // 容错解析 JSON
+    const emptyReport = (): DecisionReport => ({
+      consensus: [],
+      disagreements: [],
+      risks: [],
+      assumptions: [],
+      generatedAt: Date.now(),
+      generatedBy: `${llmConfig.provider}:${llmConfig.model}`
+    })
+
+    try {
+      let jsonStr = content
+      const codeMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/)
+      if (codeMatch) jsonStr = codeMatch[1].trim()
+      const braceMatch = jsonStr.match(/\{[\s\S]*\}/)
+      if (braceMatch) jsonStr = braceMatch[0]
+
+      const parsed = JSON.parse(jsonStr)
+      const normalize = (items: any[]): DecisionEntry[] => {
+        if (!Array.isArray(items)) return []
+        return items.slice(0, 8).map((it, i) => ({
+          id: `entry-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          title: String(it.title || '').slice(0, 40) || `条目 ${i + 1}`,
+          detail: String(it.detail || '').slice(0, 200),
+          sources: Array.isArray(it.sources) ? it.sources.filter((s: any) => typeof s === 'string') : [],
+          importance: Math.max(1, Math.min(5, Number(it.importance) || 3))
+        }))
+      }
+
+      return {
+        consensus: normalize(parsed.consensus),
+        disagreements: normalize(parsed.disagreements),
+        risks: normalize(parsed.risks),
+        assumptions: normalize(parsed.assumptions),
+        verdict: typeof parsed.verdict === 'string' ? parsed.verdict.slice(0, 200) : undefined,
+        nextSteps: Array.isArray(parsed.nextSteps)
+          ? parsed.nextSteps.slice(0, 8).map((s: any) => String(s).slice(0, 100))
+          : undefined,
+        generatedAt: Date.now(),
+        generatedBy: `${llmConfig.provider}:${llmConfig.model}`
+      }
+    } catch (err) {
+      console.warn('[PostDebate] 决策报告 JSON 解析失败，返回空报告:', err)
+      return emptyReport()
+    }
+  }
+
+  /**
    * 批量执行退朝动作
    */
   async executePostDebate(
@@ -225,6 +320,10 @@ export class PostDebateExecutor {
             break
           case 'report':
             result.report = await this.generateReport(debate, ministers, llmConfig)
+            break
+          case 'decision-report':
+            const report = await this.generateDecisionReport(debate, ministers, llmConfig)
+            ;(result as any).decisionReport = report
             break
         }
       } catch (error) {

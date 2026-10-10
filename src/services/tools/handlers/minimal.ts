@@ -1005,6 +1005,681 @@ export const searchMemoryHandler: ToolHandler = async (args) => {
   }
 }
 
+// ============ 角色专属工具（Sprint A - #4） ============
+
+/**
+ * fact_check — 事实核查（御史专属）
+ * 验证某个说法的真伪，交叉验证多个信息源
+ */
+export const factCheckTool: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'fact_check',
+    description: '事实核查。验证某个说法、数据或结论的真伪，交叉验证多个信息源，给出置信度评分。御史用于指出前序发言中的可疑之处。',
+    parameters: {
+      type: 'object',
+      properties: {
+        claim: {
+          type: 'string',
+          description: '需要核查的说法、声明或结论'
+        },
+        context: {
+          type: 'string',
+          description: '可选的上下文（谁提出的、什么场景下说的）'
+        },
+        sources: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '可选的参考来源（网址、文档名等）'
+        }
+      },
+      required: ['claim']
+    }
+  }
+}
+
+/**
+ * trace_source — 来源追溯（御史专属）
+ * 查找某个说法的原始出处
+ */
+export const traceSourceTool: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'trace_source',
+    description: '追溯某个说法、数据或引用的原始出处。查找信息从哪里来，是否可靠。',
+    parameters: {
+      type: 'object',
+      properties: {
+        statement: {
+          type: 'string',
+          description: '需要追溯来源的说法或数据'
+        }
+      },
+      required: ['statement']
+    }
+  }
+}
+
+/**
+ * generate_chart — 图表/数据可视化（户部专属，文本形态）
+ * 用 ASCII/Markdown 表格、进度条、排行榜、预算分配表等方式呈现数据
+ */
+export const chartGeneratorTool: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'generate_chart',
+    description: '将数据转化为可视化的文本图表。支持表格(table)、排行榜(ranking)、预算分配(budget)、进度条(progress)、对比矩阵(matrix) 五种格式。户部尚书用于呈现财务、成本、收益数据。',
+    parameters: {
+      type: 'object',
+      properties: {
+        chart_type: {
+          type: 'string',
+          enum: ['table', 'ranking', 'budget', 'progress', 'matrix'],
+          description: '图表类型'
+        },
+        title: {
+          type: 'string',
+          description: '图表标题'
+        },
+        data: {
+          type: 'array',
+          description: '数据项列表，每项至少包含 label 和 value',
+          items: {
+            type: 'object',
+            properties: {
+              label: { type: 'string', description: '标签' },
+              value: { type: 'number', description: '数值' },
+              note: { type: 'string', description: '可选备注' }
+            }
+          }
+        },
+        unit: {
+          type: 'string',
+          description: '单位（如 万元、%）'
+        }
+      },
+      required: ['chart_type', 'data']
+    }
+  }
+}
+
+/**
+ * history_search — 历史案例检索（太傅专属）
+ * 从历史朝议记录中检索相关案例
+ */
+export const historySearchTool: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'history_search',
+    description: '检索历史朝议记录，查找与当前议题相关的过去案例。太傅用于"引经据典"，参考过去的决策和经验。',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: '检索关键词或问题'
+        },
+        tags: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '可选的标签筛选'
+        },
+        limit: {
+          type: 'integer',
+          description: '返回数量，默认 5，最大 10'
+        }
+      },
+      required: ['query']
+    }
+  }
+}
+
+/**
+ * fact_check 处理器
+ * 本地规则 + 网络搜索交叉验证，输出 verdict(判定) + confidence(置信度 0-100) + evidence
+ */
+export const factCheckHandler: ToolHandler = async (args) => {
+  const { claim, context, sources } = args
+
+  // 1. 本地规则：识别明显的夸大、绝对词、数据可疑信号
+  const signals: string[] = []
+  const absoluteWords = /\b(总是|从不|所有|全部|永远|绝对|必然|100%|always|never|all|none|every|must)\b/i
+  if (absoluteWords.test(claim)) signals.push('包含绝对化用词，可能过度概括')
+  if (/\d+%/.test(claim) && !/来源|根据|统计/.test(claim)) signals.push('包含百分比但无来源')
+  if (/\d{4}\s*年/.test(claim) && /预计|将会|必然/.test(claim)) signals.push('对未来做确定性表述')
+
+  // 2. 调用 web_search 搜索佐证
+  let webEvidence: Array<{ title: string; snippet: string; url: string }> = []
+  try {
+    const searchResult = await webSearchHandler({ query: claim, max_results: 3 })
+    webEvidence = (searchResult as any).results || []
+  } catch { /* 搜索失败不影响主流程 */ }
+
+  // 3. 判定置信度
+  let confidence = 50
+  if (signals.length === 0 && webEvidence.length >= 2) confidence = 78
+  else if (signals.length === 0) confidence = 60
+  else if (webEvidence.length >= 2) confidence = 55
+  else confidence = 35
+
+  let verdict: '可信' | '部分可信' | '存疑' | '无法验证' = '部分可信'
+  if (confidence >= 75) verdict = '可信'
+  else if (confidence >= 55) verdict = '部分可信'
+  else if (confidence >= 40) verdict = '存疑'
+  else verdict = '无法验证'
+
+  return {
+    claim,
+    context: context || '',
+    verdict,
+    confidence,
+    signals,
+    evidence: webEvidence.map(e => ({
+      title: e.title,
+      snippet: e.snippet,
+      url: e.url
+    })),
+    referenced_sources: sources || [],
+    suggestion: signals.length > 0
+      ? '建议要求原说法者补充来源或弱化绝对化表述'
+      : (webEvidence.length > 0 ? '已找到佐证材料，可作为参考' : '未找到明确佐证，建议进一步核实')
+  }
+}
+
+/**
+ * trace_source 处理器
+ * 对声明做网络搜索，返回最相关的源头
+ */
+export const traceSourceHandler: ToolHandler = async (args) => {
+  const { statement } = args
+  try {
+    const searchResult = await webSearchHandler({ query: statement, max_results: 5 })
+    const results = (searchResult as any).results || []
+    return {
+      statement,
+      source_count: results.length,
+      possible_origins: results.map((r: any) => ({
+        title: r.title,
+        snippet: r.snippet,
+        url: r.url
+      })),
+      reliability_hint: results.length >= 3
+        ? '找到多处相关来源，建议对比权威媒体与官方出处'
+        : '来源较少，建议通过官方渠道进一步确认'
+    }
+  } catch (err) {
+    return {
+      statement,
+      source_count: 0,
+      possible_origins: [],
+      reliability_hint: '搜索失败，请手动核实'
+    }
+  }
+}
+
+/**
+ * generate_chart 处理器
+ * 纯文本图表渲染，便于在 Markdown 气泡中直接展示
+ */
+export const chartGeneratorHandler: ToolHandler = async (args) => {
+  const { chart_type, title, data, unit } = args
+  if (!Array.isArray(data) || data.length === 0) {
+    throw new Error('data 不能为空')
+  }
+  const items = data.map((d: any) => ({
+    label: String(d.label || ''),
+    value: Number(d.value) || 0,
+    note: d.note || ''
+  }))
+  const unitLabel = unit ? ` (${unit})` : ''
+  const lines: string[] = []
+  if (title) lines.push(`### ${title}`)
+
+  const maxVal = Math.max(...items.map(i => Math.abs(i.value)), 1)
+
+  switch (chart_type) {
+    case 'table': {
+      lines.push(`| 项目 | 数值${unitLabel} | 备注 |`)
+      lines.push('| --- | ---: | --- |')
+      for (const it of items) lines.push(`| ${it.label} | ${it.value.toLocaleString('zh-CN')} | ${it.note} |`)
+      break
+    }
+    case 'ranking': {
+      const sorted = [...items].sort((a, b) => b.value - a.value)
+      sorted.forEach((it, i) => {
+        lines.push(`${i + 1}. **${it.label}** — ${it.value.toLocaleString('zh-CN')}${unitLabel}`)
+      })
+      break
+    }
+    case 'budget': {
+      const total = items.reduce((s, it) => s + Math.abs(it.value), 0) || 1
+      for (const it of items) {
+        const pct = Math.round((Math.abs(it.value) / total) * 100)
+        const bar = '█'.repeat(Math.max(1, Math.round(pct / 5)))
+        lines.push(`- ${it.label.padEnd(12, ' ')} ${bar} ${pct}%  (${it.value.toLocaleString('zh-CN')}${unitLabel})`)
+      }
+      lines.push(`\n合计：${total.toLocaleString('zh-CN')}${unitLabel}`)
+      break
+    }
+    case 'progress': {
+      for (const it of items) {
+        const pct = Math.min(100, Math.max(0, (it.value / maxVal) * 100))
+        const filled = Math.round(pct / 5)
+        const bar = '▓'.repeat(filled) + '░'.repeat(20 - filled)
+        lines.push(`${it.label.padEnd(12, ' ')} [${bar}] ${pct.toFixed(0)}%`)
+      }
+      break
+    }
+    case 'matrix': {
+      lines.push(`| 维度 | 数值${unitLabel} | 条形 |`)
+      lines.push('| --- | ---: | --- |')
+      for (const it of items) {
+        const barLen = Math.round((Math.abs(it.value) / maxVal) * 15)
+        lines.push(`| ${it.label} | ${it.value.toLocaleString('zh-CN')} | ${'■'.repeat(barLen)} |`)
+      }
+      break
+    }
+    default:
+      throw new Error(`不支持的 chart_type: ${chart_type}`)
+  }
+
+  return {
+    chart_type,
+    title: title || '',
+    markdown: lines.join('\n'),
+    item_count: items.length
+  }
+}
+
+/**
+ * history_search 处理器
+ * 从 localStorage debates_history 中检索历史朝议
+ */
+export const historySearchHandler: ToolHandler = async (args) => {
+  const { query, tags, limit = 5 } = args
+  const cap = Math.min(Number(limit) || 5, 10)
+
+  let debates: any[] = []
+  try {
+    const raw = localStorage.getItem('debates_history')
+    debates = raw ? JSON.parse(raw) : []
+  } catch {
+    debates = []
+  }
+
+  if (!Array.isArray(debates) || debates.length === 0) {
+    return { query, message: '历史朝议记录为空', results: [] }
+  }
+
+  const keywords = String(query).toLowerCase().split(/\s+/).filter(Boolean)
+  const tagSet = Array.isArray(tags) ? new Set(tags.map((t: string) => String(t).toLowerCase())) : null
+
+  const scored = debates
+    .filter((d: any) => d.status === 'completed')
+    .map((d: any) => {
+      const speeches = Array.isArray(d.speeches) ? d.speeches : []
+      const fullText = [
+        d.topic || '',
+        d.imperialDecree || '',
+        ...speeches.map((s: any) => s.content || '')
+      ].join(' ').toLowerCase()
+      const score = keywords.filter(k => fullText.includes(k)).length
+      const debateTags: string[] = Array.isArray(d.tags) ? d.tags : []
+      const tagMatch = tagSet ? debateTags.some((t: string) => tagSet.has(t.toLowerCase())) : true
+      return { debate: d, score, tagMatch }
+    })
+    .filter(x => x.score > 0 && x.tagMatch)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, cap)
+
+  return {
+    query,
+    total_matches: scored.length,
+    results: scored.map(({ debate }) => ({
+      id: debate.id,
+      topic: debate.topic,
+      createdAt: debate.createdAt,
+      createdAtLabel: new Date(debate.createdAt).toLocaleString('zh-CN'),
+      tags: debate.tags || [],
+      imperialDecree: debate.imperialDecree || '',
+      speeches_count: (debate.speeches || []).length,
+      snippet: (debate.imperialDecree || debate.topic || '').slice(0, 150)
+    }))
+  }
+}
+
+// ============ 代码质量工具（Sprint B - #11） ============
+
+/**
+ * lint_check — 代码质量检查（ESLint / Pylint 等）
+ * 在项目目录中运行 lint 工具，返回问题列表
+ */
+export const lintCheckTool: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'lint_check',
+    description: '运行代码质量检查（ESLint/Pylint/ShellCheck 等），返回项目中的代码问题列表。支持自动检测框架，也可指定命令。大将军/丞相用于代码审查。',
+    parameters: {
+      type: 'object',
+      properties: {
+        cwd: {
+          type: 'string',
+          description: '项目目录路径'
+        },
+        files: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '要检查的文件列表（可选，不填则检查整个项目）'
+        },
+        command: {
+          type: 'string',
+          description: '自定义 lint 命令（可选，不填则自动检测：npx eslint / pylint 等）'
+        },
+        fix: {
+          type: 'boolean',
+          description: '是否自动修复可修复的问题，默认 false',
+          default: false
+        }
+      },
+      required: ['cwd']
+    }
+  }
+}
+
+/**
+ * type_check — 类型检查（TypeScript / MyPy 等）
+ * 检查项目中的类型错误
+ */
+export const typeCheckTool: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'type_check',
+    description: '运行类型检查（tsc --noEmit / mypy / cargo check 等），返回类型错误列表。自动检测项目语言和框架。大将军用于确保代码重构后类型安全。',
+    parameters: {
+      type: 'object',
+      properties: {
+        cwd: {
+          type: 'string',
+          description: '项目目录路径'
+        },
+        command: {
+          type: 'string',
+          description: '自定义类型检查命令（可选，不填则自动检测）'
+        }
+      },
+      required: ['cwd']
+    }
+  }
+}
+
+/**
+ * refactor_rename — 跨文件重命名
+ * 在项目中搜索并替换标识符名称
+ */
+export const refactorRenameTool: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'refactor_rename',
+    description: '跨文件重命名标识符（变量名、函数名、类名等）。在项目中搜索所有引用并统一替换。大将军用于代码重构。',
+    parameters: {
+      type: 'object',
+      properties: {
+        cwd: {
+          type: 'string',
+          description: '项目目录路径'
+        },
+        oldName: {
+          type: 'string',
+          description: '旧名称（要替换的标识符）'
+        },
+        newName: {
+          type: 'string',
+          description: '新名称（替换后的标识符）'
+        },
+        filePattern: {
+          type: 'string',
+          description: '文件扩展名过滤，如 "*.ts" 或 "ts,vue"（可选，不填则搜索所有代码文件）'
+        },
+        dryRun: {
+          type: 'boolean',
+          description: '预览模式，只返回会被修改的文件和行，不实际写入，默认 true',
+          default: true
+        }
+      },
+      required: ['cwd', 'oldName', 'newName']
+    }
+  }
+}
+
+/**
+ * lint_check 处理器
+ * 自动检测 lint 框架并运行
+ */
+export const lintCheckHandler: ToolHandler = async (args) => {
+  const { cwd, files, command, fix = false } = args
+
+  if (!window.electronAPI?.executeCommand) {
+    return { message: '当前为 Web 模式，无法运行 lint 检查。请使用 Electron 桌面版。', success: false }
+  }
+
+  // 自动检测 lint 命令
+  let lintCmd = command
+  if (!lintCmd) {
+    // 检查 package.json 中是否有 eslint
+    try {
+      const pkgResult = await window.electronAPI.readFile(`${cwd}/package.json`)
+      if (pkgResult.success && pkgResult.content) {
+        const pkg = JSON.parse(pkgResult.content)
+        const deps = { ...pkg.dependencies, ...pkg.devDependencies }
+        if (deps.eslint || deps['@typescript-eslint/parser']) {
+          const fixFlag = fix ? ' --fix' : ''
+          const fileList = Array.isArray(files) && files.length > 0
+            ? files.map((f: string) => `"${f}"`).join(' ')
+            : '.'
+          lintCmd = `npx eslint ${fileList}${fixFlag} --format json 2>&1`
+        }
+      }
+    } catch { /* 检测失败，尝试通用命令 */ }
+
+    // 检查 Python 项目
+    if (!lintCmd) {
+      try {
+        const dirResult = await window.electronAPI.readDirectory(cwd)
+        if (dirResult.success && dirResult.items) {
+          const hasPython = dirResult.items.some(i => i.name.endsWith('.py'))
+          const hasRuff = dirResult.items.some(i => i.name === 'ruff.toml' || i.name === 'pyproject.toml')
+          if (hasRuff) {
+            lintCmd = fix ? `ruff check --fix ${cwd}` : `ruff check ${cwd} --output-format=json`
+          } else if (hasPython) {
+            lintCmd = `python -m pylint ${cwd} --output-format=json 2>&1`
+          }
+        }
+      } catch { /* 跳过 */ }
+    }
+
+    if (!lintCmd) {
+      return { success: false, message: '未检测到 lint 框架（eslint/pylint/ruff），请手动指定 command 参数。' }
+    }
+  }
+
+  try {
+    const result = await window.electronAPI.executeCommand({ command: lintCmd, cwd, timeout: 60000 })
+    // 尝试解析 JSON 输出
+    let issues: any[] = []
+    try {
+      issues = JSON.parse(result.stdout || '[]')
+    } catch {
+      // 非 JSON 输出，返回原始文本
+      return {
+        command: lintCmd,
+        success: result.success,
+        exitCode: result.exitCode,
+        output: result.stdout || result.stderr,
+        issue_count: (result.stdout?.match(/\b(error|warning|warn)\b/gi) || []).length,
+        fix_applied: fix
+      }
+    }
+    return {
+      command: lintCmd,
+      success: true,
+      issue_count: Array.isArray(issues) ? issues.length : 0,
+      issues: Array.isArray(issues) ? issues.slice(0, 50) : issues,
+      fix_applied: fix
+    }
+  } catch (error) {
+    throw new Error(`Lint 检查失败: ${error instanceof Error ? error.message : '未知错误'}`)
+  }
+}
+
+/**
+ * type_check 处理器
+ * 自动检测类型检查框架并运行
+ */
+export const typeCheckHandler: ToolHandler = async (args) => {
+  const { cwd, command } = args
+
+  if (!window.electronAPI?.executeCommand) {
+    return { message: '当前为 Web 模式，无法运行类型检查。请使用 Electron 桌面版。', success: false }
+  }
+
+  let checkCmd = command
+  if (!checkCmd) {
+    // 检测项目类型
+    try {
+      const dirResult = await window.electronAPI.readDirectory(cwd)
+      if (dirResult.success && dirResult.items) {
+        const names = new Set(dirResult.items.map(i => i.name))
+
+        // TypeScript 项目
+        if (names.has('tsconfig.json') || names.has('tsconfig.node.json')) {
+          checkCmd = 'npx tsc --noEmit 2>&1'
+        }
+        // Rust 项目
+        else if (names.has('Cargo.toml')) {
+          checkCmd = 'cargo check 2>&1'
+        }
+        // Go 项目
+        else if (names.has('go.mod')) {
+          checkCmd = 'go vet ./... 2>&1'
+        }
+        // Python + mypy
+        else if (names.has('mypy.ini') || names.has('.mypy.ini') || names.has('pyproject.toml')) {
+          checkCmd = `python -m mypy ${cwd} 2>&1`
+        }
+      }
+    } catch { /* 检测失败 */ }
+
+    if (!checkCmd) {
+      return { success: false, message: '未检测到类型检查框架（tsc/mypy/cargo/go），请手动指定 command 参数。' }
+    }
+  }
+
+  try {
+    const result = await window.electronAPI.executeCommand({ command: checkCmd, cwd, timeout: 120000 })
+    const output = result.stdout || result.stderr || ''
+
+    // 统计错误数
+    const errorMatches = output.match(/error\b/gi) || []
+    const warningMatches = output.match(/warning\b/gi) || []
+
+    return {
+      command: checkCmd,
+      success: result.exitCode === 0,
+      exitCode: result.exitCode,
+      error_count: errorMatches.length,
+      warning_count: warningMatches.length,
+      output: output.length > 5000 ? output.slice(0, 5000) + '\n...(输出过长已截断)' : output
+    }
+  } catch (error) {
+    throw new Error(`类型检查失败: ${error instanceof Error ? error.message : '未知错误'}`)
+  }
+}
+
+/**
+ * refactor_rename 处理器
+ * 使用 search_code + read_file + write_file 实现跨文件重命名
+ */
+export const refactorRenameHandler: ToolHandler = async (args) => {
+  const { cwd, oldName, newName, filePattern, dryRun = true } = args
+
+  if (!oldName || !newName) {
+    throw new Error('oldName 和 newName 不能为空')
+  }
+  if (oldName === newName) {
+    return { success: true, message: '新旧名称相同，无需操作', changes: [] }
+  }
+
+  // 搜索所有引用
+  let searchResults: Array<{ file: string; line: number; content: string }> = []
+  if (window.electronAPI?.searchCode) {
+    const result = await window.electronAPI.searchCode({
+      pattern: oldName,
+      directory: cwd,
+      filePattern,
+      maxResults: 200,
+      isRegex: false
+    })
+    if (result.success) {
+      searchResults = result.results || []
+    }
+  }
+
+  if (searchResults.length === 0) {
+    return { success: true, message: `未找到 "${oldName}" 的任何引用`, changes: [] }
+  }
+
+  // 按文件分组
+  const fileMap = new Map<string, Array<{ line: number; content: string }>>()
+  for (const r of searchResults) {
+    if (!fileMap.has(r.file)) fileMap.set(r.file, [])
+    fileMap.get(r.file)!.push({ line: r.line, content: r.content })
+  }
+
+  const changes = Array.from(fileMap.entries()).map(([file, refs]) => ({
+    file,
+    match_count: refs.length,
+    lines: refs.map(r => ({ line: r.line, content: r.content.trim() }))
+  }))
+
+  if (!dryRun && window.electronAPI?.readFile && window.electronAPI?.writeFile) {
+    // 实际执行替换
+    let filesModified = 0
+    for (const [file] of fileMap) {
+      try {
+        const readResult = await window.electronAPI.readFile(file)
+        if (!readResult.success || !readResult.content) continue
+
+        // 全词替换（避免部分匹配）
+        const regex = new RegExp(`\\b${oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g')
+        const newContent = readResult.content.replace(regex, newName)
+
+        if (newContent !== readResult.content) {
+          const writeResult = await window.electronAPI.writeFile(file, newContent)
+          if (writeResult.success) filesModified++
+        }
+      } catch { /* 单文件失败不影响其他文件 */ }
+    }
+    return {
+      success: true,
+      dryRun: false,
+      files_matched: changes.length,
+      files_modified: filesModified,
+      total_references: searchResults.length,
+      changes
+    }
+  }
+
+  // 预览模式
+  return {
+    success: true,
+    dryRun: true,
+    message: `预览模式：找到 ${searchResults.length} 处引用，分布在 ${changes.length} 个文件中。设置 dryRun=false 执行实际替换。`,
+    files_matched: changes.length,
+    total_references: searchResults.length,
+    changes
+  }
+}
+
 /**
  * 所有工具的映射（供注册使用）
  */
@@ -1023,7 +1698,14 @@ export const MINIMAL_TOOL_HANDLERS: Record<string, ToolHandler> = {
   run_tests: runTestsHandler,
   save_memory: saveMemoryHandler,
   search_memory: searchMemoryHandler,
-  summarize_results: summarizeResultsHandler
+  summarize_results: summarizeResultsHandler,
+  fact_check: factCheckHandler,
+  trace_source: traceSourceHandler,
+  generate_chart: chartGeneratorHandler,
+  history_search: historySearchHandler,
+  lint_check: lintCheckHandler,
+  type_check: typeCheckHandler,
+  refactor_rename: refactorRenameHandler
 }
 
 export const MINIMAL_TOOL_DEFINITIONS: ToolDefinition[] = [
@@ -1041,5 +1723,12 @@ export const MINIMAL_TOOL_DEFINITIONS: ToolDefinition[] = [
   runTestsTool,
   saveMemoryTool,
   searchMemoryTool,
-  summarizeResultsTool
+  summarizeResultsTool,
+  factCheckTool,
+  traceSourceTool,
+  chartGeneratorTool,
+  historySearchTool,
+  lintCheckTool,
+  typeCheckTool,
+  refactorRenameTool
 ]

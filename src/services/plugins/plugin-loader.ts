@@ -6,7 +6,7 @@
  */
 
 import type { LoadedPlugin, PluginScanResult } from './types'
-import { parseSkillMd, toToolDefinition, compileHandler } from './skill-parser'
+import { parseSkillMd, toToolDefinition, compileHandler, extractFrontmatter, parseSimpleYaml } from './skill-parser'
 
 /**
  * 扫描插件目录，返回所有 SKILL.md 文件的路径
@@ -116,5 +116,87 @@ export async function loadAllPlugins(): Promise<PluginScanResult> {
     count: plugins.length,
     plugins,
     errors
+  }
+}
+
+// ============ 插件导入 ============
+
+export interface ImportPluginResult {
+  success: boolean
+  pluginId?: string
+  pluginName?: string
+  error?: string
+}
+
+/**
+ * 通过文件对话框选择并导入 SKILL.md 插件文件
+ *
+ * 流程：
+ * 1. 打开文件选择对话框（过滤 .md 文件）
+ * 2. 读取并解析 YAML frontmatter 提取插件 ID
+ * 3. 在 plugins/<id>/ 下写入 SKILL.md
+ * 4. 返回导入结果
+ */
+export async function importPluginFromFile(): Promise<ImportPluginResult> {
+  // 1. 打开文件选择对话框
+  if (!window.electronAPI?.showOpenDialog) {
+    return { success: false, error: '当前环境不支持文件选择（需要 Electron 桌面版）' }
+  }
+
+  const dialogResult = await window.electronAPI.showOpenDialog({
+    title: '导入插件 — 选择 SKILL.md 文件',
+    properties: ['openFile'],
+    filters: [
+      { name: 'SKILL.md', extensions: ['md'] },
+      { name: '所有文件', extensions: ['*'] }
+    ]
+  })
+
+  if (dialogResult.canceled || dialogResult.filePaths.length === 0) {
+    return { success: false, error: '已取消导入' }
+  }
+
+  const sourcePath = dialogResult.filePaths[0]
+
+  // 2. 读取文件内容
+  try {
+    const readResult = await window.electronAPI!.readFile(sourcePath)
+    if (!readResult.success || !readResult.content) {
+      return { success: false, error: `读取文件失败: ${readResult.error || '文件内容为空'}` }
+    }
+
+    // 3. 解析 frontmatter 提取插件 ID
+    const { frontmatter } = extractFrontmatter(readResult.content)
+    if (!frontmatter) {
+      return { success: false, error: '文件格式无效：未找到 YAML frontmatter（需要以 --- 开头）' }
+    }
+
+    const yaml = parseSimpleYaml(frontmatter)
+    const pluginId = yaml.id as string
+    const pluginName = (yaml.name as string) || pluginId || '未命名插件'
+
+    if (!pluginId) {
+      return { success: false, error: 'YAML 中缺少 id 字段，无法导入' }
+    }
+
+    // 4. 获取插件目录并创建子目录
+    const pluginDir = await window.electronAPI!.getPluginDir()
+    const targetDir = `${pluginDir}/${pluginId}`
+    await window.electronAPI!.createDirectory(targetDir)
+
+    // 5. 写入 SKILL.md
+    const targetPath = `${targetDir}/SKILL.md`
+    const writeResult = await window.electronAPI!.writeFile(targetPath, readResult.content)
+    if (!writeResult.success) {
+      return { success: false, error: `写入文件失败: ${writeResult.error || '未知错误'}` }
+    }
+
+    console.log(`[Plugins] 已导入插件: ${pluginId} → ${targetPath}`)
+    return { success: true, pluginId, pluginName }
+  } catch (error) {
+    return {
+      success: false,
+      error: `导入失败: ${error instanceof Error ? error.message : '未知错误'}`
+    }
   }
 }

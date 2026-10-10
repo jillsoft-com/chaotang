@@ -1,8 +1,14 @@
 import { defineStore } from 'pinia'
 import { ref, computed, watch } from 'vue'
-import type { Minister, Debate, Speech, DebateMode } from '@/types'
+import type { Minister, Debate, Speech, DebateMode, DecisionReport, LLMConfig, Attachment } from '@/types'
 import type { LLMProviderType } from '@/types/llm'
 import { promptService } from '@/services/prompt-config'
+import { postDebateExecutor } from '@/services/agent/post-debate'
+import { llmService } from '@/services/llm-config'
+import { backgroundScheduler } from '@/services/scheduler'
+import { gepaEngine } from '@/services/learning'
+import { parseActionItemsFromReport, parseActionItemsFromDecree, executeActionItems } from '@/services/agent/imperial-executor'
+import type { ExecutionReport } from '@/services/agent/imperial-executor'
 import {
   DYNASTY_PRESETS,
   getCurrentDynastyId,
@@ -48,6 +54,9 @@ export const useDebateStore = defineStore('debate', () => {
   // 初始化时加载
   loadDebates()
 
+  // Sprint D - #17：初始化 GEPA 自学习引擎
+  gepaEngine.initialize()
+
   const sortedMinisters = computed(() =>
     [...ministers.value].sort((a, b) => a.order - b.order)
   )
@@ -72,13 +81,16 @@ export const useDebateStore = defineStore('debate', () => {
     // 应用朝代主题
     applyDynastyTheme(ministerDefs)
 
+    // 应用自定义头像覆盖
+    const customAvatars = JSON.parse(localStorage.getItem('minister_custom_avatars') || '{}') as Record<string, string>
+
     ministers.value = ministerDefs.map(def => {
       const promptConfig = promptService.getPrompt(def.id)
       return {
         id: def.id,
         name: def.name,
         title: def.title,
-        avatar: def.avatar,
+        avatar: customAvatars[def.id] || def.avatar,
         systemPrompt: promptConfig.systemPrompt,
         llm: customConfig[def.id] || { provider: 'openai' as const, model: 'gpt-4o-mini' },
         order: def.order,
@@ -95,6 +107,30 @@ export const useDebateStore = defineStore('debate', () => {
     setCurrentDynastyId(dynastyId)
     currentDynastyId.value = dynastyId
     initializeMinisters()  // 重新初始化大臣，应用新主题
+  }
+
+  // 设置角色自定义头像
+  function setMinisterAvatar(ministerId: string, avatar: string): void {
+    const saved = JSON.parse(localStorage.getItem('minister_custom_avatars') || '{}') as Record<string, string>
+    if (avatar) {
+      saved[ministerId] = avatar
+    } else {
+      delete saved[ministerId]
+    }
+    localStorage.setItem('minister_custom_avatars', JSON.stringify(saved))
+    // 更新当前内存中的大臣对象
+    const minister = ministers.value.find(m => m.id === ministerId)
+    if (minister) {
+      minister.avatar = avatar || getDefaultAvatar(ministerId)
+    }
+  }
+
+  function getDefaultAvatar(ministerId: string): string {
+    const defaults: Record<string, string> = {
+      chancellor: '👑', finance: '💰', tutor: '📚',
+      general: '⚔️', censor: '🔍', eunuch: '🏮'
+    }
+    return defaults[ministerId] || '👤'
   }
 
   // 保存自定义主题的角色名称并刷新
@@ -160,7 +196,7 @@ export const useDebateStore = defineStore('debate', () => {
     localStorage.setItem('debate_mode', mode)
   })
 
-  function startDebate(topic: string, mode: 'court' | 'compare' = 'court', mentionedMinisters?: string[], workingDirectory?: string) {
+  function startDebate(topic: string, mode: 'court' | 'compare' = 'court', mentionedMinisters?: string[], workingDirectory?: string, attachments?: Attachment[]) {
     const session: Debate = {
       id: Date.now().toString(),
       topic,
@@ -178,7 +214,8 @@ export const useDebateStore = defineStore('debate', () => {
       status: 'running',
       createdAt: Date.now(),
       mentionedMinisters,
-      workingDirectory: workingDirectory || undefined
+      workingDirectory: workingDirectory || undefined,
+      attachments: attachments && attachments.length > 0 ? attachments : undefined
     }
     sessions.value.push(session)
     activeSessionId.value = session.id
@@ -251,26 +288,28 @@ export const useDebateStore = defineStore('debate', () => {
     }
   }
 
-  function completeDebate(imperialDecree?: string) {
+  function completeDebate(imperialDecree?: string, force?: boolean) {
     if (!activeSession.value) return
 
     const session = activeSession.value
 
-    // 防护检查：确认所有预期的大臣都已发言完毕
-    const mentioned = session.mentionedMinisters
-    const expectedMinisters = mentioned && mentioned.length > 0
-      ? ministers.value.filter(m => mentioned.includes(m.id))
-      : ministers.value
+    // 防护检查：确认所有预期的大臣都已发言完毕（force=true 时跳过，用于退朝/拍板）
+    if (!force) {
+      const mentioned = session.mentionedMinisters
+      const expectedMinisters = mentioned && mentioned.length > 0
+        ? ministers.value.filter(m => mentioned.includes(m.id))
+        : ministers.value
 
-    const allCompleted = expectedMinisters.every(m =>
-      session.speeches.some(s => s.ministerId === m.id && (s.status === 'completed' || s.status === 'error'))
-    )
-    if (!allCompleted) {
-      console.warn('[completeDebate] 跳过：并非所有大臣都已发言完毕',
-        '预期:', expectedMinisters.map(m => m.id),
-        '已发言:', session.speeches.filter(s => s.ministerId !== 'emperor' && s.status === 'completed').map(s => s.ministerId)
+      const allCompleted = expectedMinisters.every(m =>
+        session.speeches.some(s => s.ministerId === m.id && (s.status === 'completed' || s.status === 'error'))
       )
-      return
+      if (!allCompleted) {
+        console.warn('[completeDebate] 跳过：并非所有大臣都已发言完毕',
+          '预期:', expectedMinisters.map(m => m.id),
+          '已发言:', session.speeches.filter(s => s.ministerId !== 'emperor' && s.status === 'completed').map(s => s.ministerId)
+        )
+        return
+      }
     }
 
     session.status = 'completed'
@@ -291,6 +330,138 @@ export const useDebateStore = defineStore('debate', () => {
       debates.value.unshift(snapshot)
     }
     saveDebates()
+
+    // Sprint A - #1：朝议模式自动触发决策报告生成（不阻塞主流程）
+    if (session.mode === 'court') {
+      generateDecisionReportAsync(session.id).catch(err => {
+        console.warn('[completeDebate] 决策报告生成失败:', err)
+      })
+    }
+  }
+
+  /**
+   * Sprint D - #3：执行圣旨/决策报告中的行动项
+   */
+  async function executeImperialDecree(debateId: string): Promise<ExecutionReport | null> {
+    const debate = debates.value.find(d => d.id === debateId)
+    if (!debate) return null
+
+    // 优先从决策报告解析行动项，否则从圣旨文本解析
+    let actionItems
+    if (debate.decisionReport?.nextSteps && debate.decisionReport.nextSteps.length > 0) {
+      actionItems = parseActionItemsFromReport(debate.decisionReport)
+    } else if (debate.imperialDecree) {
+      actionItems = parseActionItemsFromDecree(debate.imperialDecree)
+    } else {
+      return null
+    }
+
+    if (actionItems.length === 0) return null
+
+    const report = await executeActionItems(actionItems, debate.workingDirectory)
+    return report
+  }
+
+  /**
+   * Sprint C - #9：为已完成的朝议安排“再上奏”跟踪任务
+   * 调用后会在后台定期检查指标，条件触发时生成新奏报
+   */
+  function scheduleFollowUp(debateId: string, metrics: string[], triggerCondition: string, checkIntervalMs?: number): string | null {
+    const debate = debates.value.find(d => d.id === debateId)
+    if (!debate) return null
+    const task = backgroundScheduler.scheduleFollowUp({
+      debateId,
+      metrics,
+      triggerCondition,
+      checkIntervalMs: checkIntervalMs || 30 * 60 * 1000,
+      deadline: 0 // 永久跟踪
+    })
+    return task.id
+  }
+
+  /**
+   * Sprint C - #9：为已完成的朝议安排长辩论（分阶段执行）
+   */
+  function scheduleLongDebate(debateId: string, topic: string, stages: string[], stageIntervalMs?: number): string | null {
+    const debate = debates.value.find(d => d.id === debateId)
+    if (!debate) return null
+    const task = backgroundScheduler.scheduleLongDebate({
+      debateId,
+      topic,
+      stages,
+      stageIntervalMs: stageIntervalMs || 60 * 60 * 1000
+    })
+    return task.id
+  }
+
+  /**
+   * 异步生成决策报告（四象限）
+   * 拍板后由丞相的 LLM 汇总产出，结果写入 debates 并持久化
+   */
+  async function generateDecisionReportAsync(debateId: string): Promise<DecisionReport | null> {
+    const debate = debates.value.find(d => d.id === debateId)
+    if (!debate || debate.mode !== 'court') return null
+
+    // 优先使用丞相模型，否则回退到默认 LLM
+    const chancellor = ministers.value.find(m => m.id === 'chancellor')
+    let resolved: LLMConfig | null = chancellor?.llm ? { ...chancellor.llm } : null
+
+    // 尝试用 llmId 取回完整配置（含 apiKey/baseURL）
+    if (resolved) {
+      const llmId = (resolved as any).llmId
+      if (llmId) {
+        const fullConfig = llmService.getById(llmId)
+        if (fullConfig) {
+          resolved = {
+            provider: fullConfig.provider,
+            model: fullConfig.model,
+            apiKey: fullConfig.apiKey,
+            baseURL: fullConfig.baseURL
+          }
+        }
+      }
+    }
+
+    // 无 apiKey 则回退到默认配置
+    if (!resolved || !resolved.apiKey) {
+      const defaultCfg = llmService.getAll().find(c => c.isDefault) || llmService.getAll()[0]
+      if (!defaultCfg) return null
+      resolved = {
+        provider: defaultCfg.provider,
+        model: defaultCfg.model,
+        apiKey: defaultCfg.apiKey,
+        baseURL: defaultCfg.baseURL
+      }
+    }
+
+    if (!resolved) return null
+
+    try {
+      const report = await postDebateExecutor.generateDecisionReport(
+        debate,
+        ministers.value,
+        resolved
+      )
+      // 把报告写回 debates 数组并持久化
+      const idx = debates.value.findIndex(d => d.id === debateId)
+      if (idx !== -1) {
+        debates.value[idx].decisionReport = report
+        saveDebates()
+      }
+      // 同步到 session（如果还开着）
+      const sess = sessions.value.find(s => s.id === debateId)
+      if (sess) sess.decisionReport = report
+
+      // Sprint D - #17：从决策报告中学习经验模式
+      gepaEngine.learnFromDebate(debate, report).catch(err => {
+        console.warn('[GEPA] 自学习失败:', err)
+      })
+
+      return report
+    } catch (err) {
+      console.warn('[generateDecisionReportAsync] 失败:', err)
+      return null
+    }
   }
 
   function reopenSession(debateId: string) {
@@ -424,6 +595,96 @@ export const useDebateStore = defineStore('debate', () => {
     closeSession(debateId)
   }
 
+  // ============ Sprint A - #10 会话历史全文搜索 + 标签 ============
+
+  /**
+   * 为某个历史朝议添加/移除标签（toggle）
+   */
+  function toggleDebateTag(debateId: string, tag: string) {
+    const normalized = tag.trim()
+    if (!normalized) return
+    const debate = debates.value.find(d => d.id === debateId)
+    if (!debate) return
+    const tags = debate.tags ? [...debate.tags] : []
+    const idx = tags.indexOf(normalized)
+    if (idx >= 0) tags.splice(idx, 1)
+    else tags.push(normalized)
+    debate.tags = tags
+    saveDebates()
+    // 同步 session
+    const sess = sessions.value.find(s => s.id === debateId)
+    if (sess) sess.tags = tags
+  }
+
+  /**
+   * 直接设置某个朝议的标签列表
+   */
+  function setDebateTags(debateId: string, tags: string[]) {
+    const debate = debates.value.find(d => d.id === debateId)
+    if (!debate) return
+    debate.tags = tags.map(t => t.trim()).filter(Boolean)
+    saveDebates()
+    const sess = sessions.value.find(s => s.id === debateId)
+    if (sess) sess.tags = debate.tags
+  }
+
+  /**
+   * 获取所有已使用的标签（按使用次数降序）
+   */
+  function getAllTags(): Array<{ tag: string; count: number }> {
+    const counter = new Map<string, number>()
+    for (const d of debates.value) {
+      if (Array.isArray(d.tags)) {
+        for (const t of d.tags) counter.set(t, (counter.get(t) || 0) + 1)
+      }
+    }
+    return Array.from(counter.entries())
+      .map(([tag, count]) => ({ tag, count }))
+      .sort((a, b) => b.count - a.count)
+  }
+
+  /**
+   * 全文搜索历史朝议（含活动会话）
+   * - query: 关键词（空格分词，OR 匹配）
+   * - tagFilter: 标签数组（AND 匹配，全部包含才返回）
+   * - limit: 返回数量，默认 50
+   */
+  function searchDebates(query: string, tagFilter?: string[], limit: number = 50): Debate[] {
+    const keywords = query.trim().toLowerCase().split(/\s+/).filter(Boolean)
+    const tagSet = tagFilter && tagFilter.length > 0
+      ? new Set(tagFilter.map(t => t.toLowerCase()))
+      : null
+
+    // 合并历史朝议 + 活动会话（去重）
+    const allDebates: Debate[] = [...debates.value]
+    const ids = new Set(allDebates.map(d => d.id))
+    for (const s of sessions.value) {
+      if (!ids.has(s.id)) allDebates.push(s)
+    }
+
+    return allDebates
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .filter(d => {
+        // 标签筛选（AND）
+        if (tagSet) {
+          const dt = (d.tags || []).map(t => t.toLowerCase())
+          for (const need of tagSet) {
+            if (!dt.includes(need)) return false
+          }
+        }
+        // 关键词筛选（OR，全匹配任一词即可）
+        if (keywords.length === 0) return true
+        const haystack = [
+          d.topic || '',
+          d.imperialDecree || '',
+          ...(d.tags || []),
+          ...(d.speeches || []).map(s => s.content || '')
+        ].join(' ').toLowerCase()
+        return keywords.some(k => haystack.includes(k))
+      })
+      .slice(0, limit)
+  }
+
   /**
    * 确保某个 ID 在 sessions 中存在（如果是历史记录则先 reopen）
    * 返回 session 对象
@@ -450,6 +711,7 @@ export const useDebateStore = defineStore('debate', () => {
     initializeMinisters,
     switchDynasty,
     updateCustomThemeRole,
+    setMinisterAvatar,
     createCustomTheme,
     removeCustomTheme,
     updateCustomThemePrompt,
@@ -470,6 +732,14 @@ export const useDebateStore = defineStore('debate', () => {
     duplicateSession,
     forkSession,
     deleteDebate,
-    ensureSession
+    ensureSession,
+    generateDecisionReportAsync,
+    toggleDebateTag,
+    setDebateTags,
+    getAllTags,
+    searchDebates,
+    scheduleFollowUp,
+    scheduleLongDebate,
+    executeImperialDecree
   }
 })

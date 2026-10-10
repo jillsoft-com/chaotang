@@ -1,19 +1,23 @@
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useDebateStore } from '@/stores/debate'
-import { Promotion, Setting, Fold, Expand, Plus, Close, House, Clock, Right, FolderOpened, Edit, DocumentCopy, Connection, Delete, User, InfoFilled } from '@element-plus/icons-vue'
+import { Promotion, Setting, Fold, Expand, Plus, Close, House, Clock, Right, Back, FolderOpened, Edit, DocumentCopy, Connection, Delete, User, InfoFilled, Search } from '@element-plus/icons-vue'
 import ChatSession from '@/components/ChatSession.vue'
 import { llmService } from '@/services/llm-config'
 import { ElMessageBox } from 'element-plus'
+import { TOPIC_TEMPLATES, getTemplateCategories, applyTemplate as applyTopicTemplate } from '@/services/topic-templates'
+import type { TopicTemplate } from '@/services/topic-templates'
+import type { Attachment } from '@/types'
+import { backgroundScheduler } from '@/services/scheduler'
 
 const router = useRouter()
 const debateStore = useDebateStore()
 const topic = ref('')
 const showSidebar = ref(true)
 
-// 角色选中状态
-const selectedMinisters = ref<Set<string>>(new Set(debateStore.ministers.map(m => m.id)))
+// 角色选中状态（默认仅选中丞相）
+const selectedMinisters = ref<Set<string>>(new Set(['chancellor']))
 
 function toggleMinisterSelection(ministerId: string) {
   const newSet = new Set(selectedMinisters.value)
@@ -78,6 +82,74 @@ let resizeStartWidth = 0
 function toggleRightPanel() {
   showRightPanel.value = !showRightPanel.value
 }
+
+// ============ 右侧任务面板 ============
+
+const rightPanelTab = ref<'tasks' | 'attachments'>('tasks')
+
+/** 当前会话关联的后台任务 */
+const sessionTasks = computed(() => {
+  const sessionId = debateStore.activeSessionId
+  if (!sessionId) return []
+  return backgroundScheduler.getAll().filter(t => t.debateId === sessionId)
+})
+
+const activeTaskCount = computed(() => sessionTasks.value.filter(t => t.status === 'pending' || t.status === 'running').length)
+
+function openTaskPanel() {
+  rightPanelTab.value = 'tasks'
+  showRightPanel.value = true
+}
+
+function openAttachmentPanel() {
+  rightPanelTab.value = 'attachments'
+  showRightPanel.value = true
+}
+
+function getTaskStatusIcon(status: string): string {
+  switch (status) {
+    case 'pending': return '⏳'
+    case 'running': return '🔄'
+    case 'completed': return '✅'
+    case 'failed': return '❌'
+    case 'cancelled': return '🚫'
+    default: return '❓'
+  }
+}
+
+function getTaskStatusLabel(status: string): string {
+  switch (status) {
+    case 'pending': return '等待中'
+    case 'running': return '执行中'
+    case 'completed': return '已完成'
+    case 'failed': return '失败'
+    case 'cancelled': return '已取消'
+    default: return status
+  }
+}
+
+function getTaskTypeLabel(type: string): string {
+  switch (type) {
+    case 'delayed': return '延时任务'
+    case 'interval': return '周期任务'
+    case 'follow-up': return '再上奏'
+    case 'long-debate': return '长辩论'
+    default: return type
+  }
+}
+
+function formatTime(ts: number): string {
+  if (!ts) return '-'
+  const d = new Date(ts)
+  return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+function cancelTask(taskId: string) {
+  backgroundScheduler.cancel(taskId)
+}
+
+/** 当前会话的附件列表（代理到 session） */
+const sessionAttachments = computed(() => debateStore.activeSession?.attachments || [])
 
 function startResizeRight(e: MouseEvent) {
   isResizingRight = true
@@ -156,7 +228,7 @@ function parseMentions(text: string): string[] {
 }
 
 function startDebate() {
-  if (!topic.value.trim()) return
+  if (!topic.value.trim() && attachments.value.length === 0) return
   const mentioned = parseMentions(topic.value)
   // 优先使用 @ 指定的大臣，否则使用复选框选中的大臣
   let ministersForSession: string[] | undefined
@@ -167,8 +239,187 @@ function startDebate() {
     ministersForSession = Array.from(selectedMinisters.value)
   }
   const dir = workingDirectory.value.trim() || undefined
-  debateStore.startDebate(topic.value, 'court', ministersForSession, dir)
+  const atts = attachments.value.length > 0 ? [...attachments.value] : undefined
+  debateStore.startDebate(topic.value, 'court', ministersForSession, dir, atts)
   topic.value = ''
+  attachments.value = []
+}
+
+// ============ 附件功能 ============
+
+const attachments = ref<Attachment[]>([])
+const attachingFile = ref(false)
+const isDraggingFiles = ref(false)
+
+/** 通过文件路径读取附件（拖拽和对话框共用） */
+async function loadAttachmentFiles(filePaths: string[]) {
+  if (!window.electronAPI?.readAttachment) return
+  attachingFile.value = true
+  try {
+    for (const filePath of filePaths) {
+      const readResult = await window.electronAPI.readAttachment(filePath)
+      if (readResult.success && readResult.content) {
+        const att: Attachment = {
+          id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          fileName: readResult.fileName || filePath.split(/[\\/]/).pop() || '附件',
+          filePath,
+          fileSize: readResult.fileSize || 0,
+          fileType: readResult.fileType || 'unknown',
+          content: readResult.content,
+          addedAt: Date.now()
+        }
+        attachments.value.push(att)
+      } else {
+        ElMessageBox.alert(`文件读取失败：${readResult.error || '未知错误'}\n${filePath}`, '附件导入失败', { type: 'error' })
+      }
+    }
+  } catch (error) {
+    console.error('[loadAttachmentFiles] 失败:', error)
+  } finally {
+    attachingFile.value = false
+  }
+}
+
+async function addAttachment() {
+  if (!window.electronAPI?.showOpenDialog || !window.electronAPI?.readAttachment) {
+    ElMessageBox.alert('附件功能需要 Electron 桌面版支持', '提示', { type: 'info' })
+    return
+  }
+  try {
+    const result = await window.electronAPI.showOpenDialog({
+      title: '选择附件文件',
+      properties: ['openFile', 'multiSelections'],
+      filters: [
+        { name: '文档', extensions: ['pdf', 'doc', 'docx', 'txt', 'md', 'csv', 'xlsx', 'xls', 'pptx'] },
+        { name: '所有文件', extensions: ['*'] }
+      ]
+    })
+    if (result.canceled || result.filePaths.length === 0) return
+    await loadAttachmentFiles(result.filePaths)
+  } catch (error) {
+    console.error('[addAttachment] 失败:', error)
+  }
+}
+
+// 拖拽文件处理
+function onDragOver(e: DragEvent) {
+  e.preventDefault()
+  e.stopPropagation()
+  if (e.dataTransfer?.types.includes('Files')) {
+    isDraggingFiles.value = true
+  }
+}
+
+function onDragLeave(e: DragEvent) {
+  e.preventDefault()
+  // 只有真正离开容器时才重置
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+  const { clientX, clientY } = e
+  if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) {
+    isDraggingFiles.value = false
+  }
+}
+
+async function onDropFiles(e: DragEvent) {
+  e.preventDefault()
+  e.stopPropagation()
+  isDraggingFiles.value = false
+
+  const files = e.dataTransfer?.files
+  if (!files || files.length === 0) return
+
+  // Electron 环境下 file.path 包含完整路径
+  const paths: string[] = []
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i] as any
+    if (f.path) {
+      paths.push(f.path)
+    }
+  }
+  if (paths.length > 0) {
+    await loadAttachmentFiles(paths)
+  } else {
+    ElMessageBox.alert('无法获取文件路径，请通过按钮选择文件', '拖拽导入失败', { type: 'warning' })
+  }
+}
+
+function removeAttachment(id: string) {
+  attachments.value = attachments.value.filter(a => a.id !== id)
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return bytes + ' B'
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
+}
+
+// ============ 主题模板库 ============
+
+const showTemplateDialog = ref(false)
+const templateCategory = ref('all')
+const selectedTemplate = ref<TopicTemplate | null>(null)
+const placeholderValues = ref<Record<string, string>>({})
+
+const templateCategories = getTemplateCategories()
+
+const filteredTemplates = computed(() => {
+  if (templateCategory.value === 'all') return TOPIC_TEMPLATES
+  return TOPIC_TEMPLATES.filter(t => t.category === templateCategory.value)
+})
+
+function openTemplateDialog() {
+  templateCategory.value = 'all'
+  selectedTemplate.value = null
+  showTemplateDialog.value = true
+}
+
+function pickTemplate(tpl: TopicTemplate) {
+  if (tpl.placeholders && tpl.placeholders.length > 0) {
+    // 有占位符，进入填充步骤
+    selectedTemplate.value = tpl
+    const vals: Record<string, string> = {}
+    for (const ph of tpl.placeholders) {
+      vals[ph.key] = ph.defaultValue || ''
+    }
+    placeholderValues.value = vals
+  } else {
+    // 无占位符，直接应用
+    doApplyTemplate(tpl, {})
+  }
+}
+
+function confirmPlaceholder() {
+  if (!selectedTemplate.value) return
+  doApplyTemplate(selectedTemplate.value, placeholderValues.value)
+}
+
+function doApplyTemplate(tpl: TopicTemplate, values: Record<string, string>) {
+  // 填充议题
+  const finalTopic = applyTopicTemplate(tpl, values)
+  topic.value = finalTopic
+
+  // 设置模式（如果模板有推荐模式）
+  if (tpl.recommendedMode && tpl.recommendedMode !== 'court') {
+    debateStore.debateMode = tpl.recommendedMode
+  }
+
+  // 预选角色
+  if (tpl.recommendedMinisters && tpl.recommendedMinisters.length > 0) {
+    const ministerSet = new Set<string>()
+    for (const id of tpl.recommendedMinisters) {
+      if (debateStore.ministers.find(m => m.id === id)) {
+        ministerSet.add(id)
+      }
+    }
+    // 保留已选中的角色，同时加入模板推荐的角色
+    for (const id of selectedMinisters.value) {
+      ministerSet.add(id)
+    }
+    selectedMinisters.value = ministerSet
+  }
+
+  showTemplateDialog.value = false
+  selectedTemplate.value = null
 }
 
 function toggleSidebar() {
@@ -181,6 +432,10 @@ function summonMinister(ministerId: string) {
 
 function goToWelcome() {
   debateStore.activeSessionId = null
+}
+
+function goToHistorySearch() {
+  router.push({ path: '/history', query: { search: '1' } })
 }
 
 function switchTab(id: string) {
@@ -267,6 +522,44 @@ function getMinisterLLMName(minister: typeof debateStore.ministers[0]): string {
   }
   return minister.llm.model || '未配置'
 }
+
+// ============ 全局快捷键 ============
+
+const topicInputRef = ref<{ focus: () => void } | null>(null)
+
+function handleHomeKeydown(e: KeyboardEvent) {
+  const ctrl = e.ctrlKey || e.metaKey
+  // Ctrl+N 新建会话
+  if (ctrl && e.key === 'n') {
+    e.preventDefault()
+    goToWelcome()
+    // 等 DOM 更新后聚焦输入框
+    setTimeout(() => topicInputRef.value?.focus(), 100)
+  }
+  // Ctrl+H 历史
+  if (ctrl && e.key === 'h') {
+    e.preventDefault()
+    router.push('/history')
+  }
+  // Ctrl+, 设置
+  if (ctrl && e.key === ',') {
+    e.preventDefault()
+    router.push('/settings')
+  }
+  // Ctrl+Shift+F 搜索历史
+  if (ctrl && e.shiftKey && e.key === 'F') {
+    e.preventDefault()
+    goToHistorySearch()
+  }
+}
+
+onMounted(() => {
+  window.addEventListener('keydown', handleHomeKeydown)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('keydown', handleHomeKeydown)
+})
 </script>
 
 <template>
@@ -279,8 +572,11 @@ function getMinisterLLMName(minister: typeof debateStore.ministers[0]): string {
       <button class="toolbar-icon-btn" title="首页" @click="goToWelcome">
         <el-icon :size="20"><House /></el-icon>
       </button>
-      <button class="toolbar-icon-btn" title="历史朝议">
+      <button class="toolbar-icon-btn" title="历史朝议" @click="router.push('/history')">
         <el-icon :size="20"><Clock /></el-icon>
+      </button>
+      <button class="toolbar-icon-btn" title="搜索历史会话" @click="goToHistorySearch">
+        <el-icon :size="20"><Search /></el-icon>
       </button>
     </div>
     <div class="toolbar-bottom">
@@ -363,7 +659,7 @@ function getMinisterLLMName(minister: typeof debateStore.ministers[0]): string {
         </div>
         <div class="tab-bar-right">
           <button class="toolbar-icon-btn" :class="{ active: showRightPanel }" title="侧边面板" @click="toggleRightPanel">
-            <el-icon :size="16"><Right /></el-icon>
+            <el-icon :size="16"><Right v-if="showRightPanel" /><Back v-else /></el-icon>
           </button>
         </div>
       </div>
@@ -398,7 +694,7 @@ function getMinisterLLMName(minister: typeof debateStore.ministers[0]): string {
       <!-- Content Area -->
       <div class="content-area">
       <template v-if="debateStore.activeSession">
-        <ChatSession :sessionId="debateStore.activeSessionId!" :key="debateStore.activeSessionId!" />
+        <ChatSession :sessionId="debateStore.activeSessionId!" :key="debateStore.activeSessionId!" @open-task-panel="openTaskPanel" @open-attachment-panel="openAttachmentPanel" />
       </template>
 
       <!-- Welcome Page -->
@@ -436,7 +732,17 @@ function getMinisterLLMName(minister: typeof debateStore.ministers[0]): string {
         </div>
 
         <div class="input-section">
-          <div class="input-container">
+          <div
+            class="input-container"
+            :class="{ 'drag-over': isDraggingFiles }"
+            @dragover="onDragOver"
+            @dragleave="onDragLeave"
+            @drop="onDropFiles"
+          >
+            <!-- 拖拽提示遮罩 -->
+            <div v-if="isDraggingFiles" class="drop-overlay">
+              <div class="drop-overlay-content">📎 释放文件以添加附件</div>
+            </div>
             <!-- @ 选人弹出层 -->
             <div v-if="showMentionPopup" class="mention-popup">
               <div class="mention-title">选择大臣</div>
@@ -454,6 +760,7 @@ function getMinisterLLMName(minister: typeof debateStore.ministers[0]): string {
             </div>
 
             <el-input
+              ref="topicInputRef"
               v-model="topic"
               type="textarea"
               :autosize="{ minRows: 3, maxRows: 6 }"
@@ -461,6 +768,16 @@ function getMinisterLLMName(minister: typeof debateStore.ministers[0]): string {
               @keydown.enter.exact.prevent="startDebate"
               resize="none"
             />
+
+            <!-- 附件列表 -->
+            <div v-if="attachments.length > 0" class="attachment-chips">
+              <div v-for="att in attachments" :key="att.id" class="attachment-chip">
+                <span class="attachment-chip-icon">{{ att.fileType === 'pdf' ? '📄' : att.fileType === 'docx' || att.fileType === 'doc' ? '📝' : att.fileType === 'xlsx' || att.fileType === 'xls' ? '📊' : '📎' }}</span>
+                <span class="attachment-chip-name" :title="att.filePath">{{ att.fileName }}</span>
+                <span class="attachment-chip-size">{{ formatFileSize(att.fileSize) }}</span>
+                <button class="attachment-chip-remove" @click="removeAttachment(att.id)">&times;</button>
+              </div>
+            </div>
 
             <div class="input-actions">
               <el-radio-group v-model="debateStore.debateMode" size="small">
@@ -479,16 +796,27 @@ function getMinisterLLMName(minister: typeof debateStore.ministers[0]): string {
                   {{ workingDirectory ? workingDirName : '工作目录' }}
                 </el-button>
                 <el-button
+                  size="small"
+                  :loading="attachingFile"
+                  @click="addAttachment"
+                  title="添加附件（合同、文档等，供大臣审议）"
+                >
+                  📎 附件{{ attachments.length > 0 ? ` (${attachments.length})` : '' }}
+                </el-button>
+                <el-button
                   type="primary"
                   :icon="Promotion"
                   circle
-                  :disabled="!topic.trim()"
+                  :disabled="!topic.trim() && attachments.length === 0"
                   @click="startDebate"
                 />
               </div>
             </div>
           </div>
-          <div class="input-hint">按 Enter 发送，Shift + Enter 换行，输入 @ 可指定大臣 · Agent 模式自动拆解任务 · {{ selectedCount }}/{{ totalCount }} 角色参与</div>
+          <div class="input-hint">
+            <span class="template-picker-link" @click="openTemplateDialog">📋 选择模板</span>
+            <span>按 Enter 发送，Shift + Enter 换行，输入 @ 可指定大臣 · Agent 模式自动拆解任务 · {{ selectedCount }}/{{ totalCount }} 角色参与</span>
+          </div>
         </div>
       </template>
       </div>
@@ -500,15 +828,86 @@ function getMinisterLLMName(minister: typeof debateStore.ministers[0]): string {
       <!-- Right Panel -->
       <div v-if="showRightPanel" class="right-panel" :style="{ width: rightPanelWidth + 'px' }">
         <div class="right-panel-header">
-          <span>面板</span>
+          <div class="right-panel-tabs">
+            <button
+              class="right-panel-tab"
+              :class="{ active: rightPanelTab === 'tasks' }"
+              @click="rightPanelTab = 'tasks'"
+            >
+              📋 任务{{ activeTaskCount > 0 ? ` (${activeTaskCount})` : '' }}
+            </button>
+            <button
+              class="right-panel-tab"
+              :class="{ active: rightPanelTab === 'attachments' }"
+              @click="rightPanelTab = 'attachments'"
+            >
+              📎 附件{{ sessionAttachments.length > 0 ? ` (${sessionAttachments.length})` : '' }}
+            </button>
+          </div>
           <el-button text size="small" @click="toggleRightPanel">
-            <el-icon><Close /></el-icon>
+            <el-icon><Right v-if="showRightPanel" /><Back v-else /></el-icon>
           </el-button>
         </div>
+
         <div class="right-panel-body">
-          <p style="color: var(--ct-text-muted); font-size: 13px; text-align: center; margin-top: 40px;">
-            预留区域
-          </p>
+          <!-- 任务列表 -->
+          <template v-if="rightPanelTab === 'tasks'">
+            <div v-if="sessionTasks.length === 0" class="panel-empty">
+              <p>🕊️ 当前会话暂无关联任务</p>
+              <p class="panel-empty-hint">拍板后的行动项、再上奏、长辩论等会显示在这里</p>
+            </div>
+            <div v-else class="task-list">
+              <div v-for="task in sessionTasks" :key="task.id" class="task-card" :class="`task-status-${task.status}`">
+                <div class="task-card-header">
+                  <span class="task-status-icon">{{ getTaskStatusIcon(task.status) }}</span>
+                  <span class="task-title">{{ task.title }}</span>
+                </div>
+                <div class="task-card-meta">
+                  <el-tag size="small" :type="task.status === 'running' ? 'warning' : task.status === 'completed' ? 'success' : task.status === 'failed' ? 'danger' : 'info'">
+                    {{ getTaskTypeLabel(task.type) }}
+                  </el-tag>
+                  <span class="task-status-label">{{ getTaskStatusLabel(task.status) }}</span>
+                </div>
+                <p class="task-desc">{{ task.description }}</p>
+                <div class="task-card-footer">
+                  <span class="task-time" v-if="task.lastRunAt">上次: {{ formatTime(task.lastRunAt) }}</span>
+                  <span class="task-time" v-else>下次: {{ formatTime(task.nextRunAt) }}</span>
+                  <span class="task-runs" v-if="task.runCount > 0">已执行 {{ task.runCount }} 次</span>
+                  <el-button
+                    v-if="task.status === 'pending' || task.status === 'running'"
+                    size="small"
+                    type="danger"
+                    text
+                    @click="cancelTask(task.id)"
+                  >取消</el-button>
+                </div>
+                <div v-if="task.lastResult" class="task-result">
+                  <div class="task-result-label">最近结果：</div>
+                  <div class="task-result-content">{{ task.lastResult }}</div>
+                </div>
+                <div v-if="task.error" class="task-error">
+                  ❌ {{ task.error }}
+                </div>
+              </div>
+            </div>
+          </template>
+
+          <!-- 附件列表 -->
+          <template v-if="rightPanelTab === 'attachments'">
+            <div v-if="sessionAttachments.length === 0" class="panel-empty">
+              <p>📎 当前会话暂无附件</p>
+              <p class="panel-empty-hint">在会话输入区点击“附件”按钮或拖拽文件添加</p>
+            </div>
+            <div v-else class="panel-attachment-list">
+              <div v-for="att in sessionAttachments" :key="att.id" class="panel-att-item">
+                <div class="panel-att-icon">{{ att.fileType === 'pdf' ? '📄' : att.fileType === 'docx' || att.fileType === 'doc' ? '📝' : att.fileType === 'xlsx' || att.fileType === 'xls' ? '📊' : '📎' }}</div>
+                <div class="panel-att-info">
+                  <div class="panel-att-name" :title="att.filePath">{{ att.fileName }}</div>
+                  <div class="panel-att-meta">{{ att.fileType.toUpperCase() }} · {{ att.fileSize < 1024 ? att.fileSize + ' B' : att.fileSize < 1048576 ? (att.fileSize / 1024).toFixed(1) + ' KB' : (att.fileSize / 1048576).toFixed(1) + ' MB' }} · {{ att.content?.length || 0 }} 字符</div>
+                </div>
+              </div>
+            </div>
+          </template>
         </div>
       </div>
     </main>
@@ -544,6 +943,68 @@ function getMinisterLLMName(minister: typeof debateStore.ministers[0]): string {
     </div>
   </div>
   </div>
+
+  <!-- 主题模板库对话框 -->
+  <el-dialog v-model="showTemplateDialog" title="📋 议题模板库" width="680px" align-center>
+    <div class="template-dialog-body">
+      <!-- 分类标签 -->
+      <div class="template-categories">
+        <el-radio-group v-model="templateCategory" size="small">
+          <el-radio-button v-for="cat in templateCategories" :key="cat.id" :value="cat.id">
+            {{ cat.icon }} {{ cat.name }}
+          </el-radio-button>
+        </el-radio-group>
+      </div>
+
+      <!-- 模板列表 -->
+      <div v-if="!selectedTemplate" class="template-grid">
+        <div
+          v-for="tpl in filteredTemplates"
+          :key="tpl.id"
+          class="template-card"
+          @click="pickTemplate(tpl)"
+        >
+          <div class="template-card-header">
+            <span class="template-icon">{{ tpl.icon }}</span>
+            <span class="template-name">{{ tpl.name }}</span>
+            <el-tag v-if="tpl.recommendedMode" size="small" type="info" class="template-mode-tag">
+              {{ tpl.recommendedMode === 'agent' ? 'Agent' : tpl.recommendedMode === 'parallel' ? '并行' : tpl.recommendedMode === 'serial' ? '串行' : '朝议' }}
+            </el-tag>
+          </div>
+          <p class="template-desc">{{ tpl.topic || '自由议题，由圣上亲自拟定' }}</p>
+          <div v-if="tpl.recommendedMinisters && tpl.recommendedMinisters.length > 0" class="template-ministers">
+            推荐角色：{{ tpl.recommendedMinisters.length }} 位
+          </div>
+        </div>
+      </div>
+
+      <!-- 占位符填充 -->
+      <div v-else class="template-placeholder-form">
+        <div class="template-placeholder-header">
+          <span class="template-icon">{{ selectedTemplate.icon }}</span>
+          <div>
+            <h3>{{ selectedTemplate.name }}</h3>
+            <p class="template-placeholder-topic">{{ selectedTemplate.topic }}</p>
+          </div>
+        </div>
+        <div class="template-placeholder-inputs">
+          <div v-for="ph in selectedTemplate.placeholders" :key="ph.key" class="placeholder-field">
+            <label>{{ ph.label }}</label>
+            <el-input
+              v-model="placeholderValues[ph.key]"
+              :placeholder="ph.defaultValue || '请输入'"
+              size="default"
+              @keydown.enter.prevent="confirmPlaceholder"
+            />
+          </div>
+        </div>
+        <div class="template-placeholder-actions">
+          <el-button @click="selectedTemplate = null">返回</el-button>
+          <el-button type="primary" @click="confirmPlaceholder">应用模板</el-button>
+        </div>
+      </div>
+    </div>
+  </el-dialog>
 
   <!-- About 弹窗 -->
   <el-dialog v-model="showAboutDialog" title="" :show-close="true" width="420px" class="about-dialog" align-center>
@@ -930,6 +1391,211 @@ function getMinisterLLMName(minister: typeof debateStore.ministers[0]): string {
   padding: 12px;
 }
 
+/* 右侧面板 - 标签页 */
+.right-panel-tabs {
+  display: flex;
+  gap: 2px;
+  flex: 1;
+}
+
+.right-panel-tab {
+  padding: 4px 12px;
+  border: none;
+  background: transparent;
+  color: var(--ct-text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+  border-radius: 6px;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.right-panel-tab:hover {
+  background: var(--ct-bg-tertiary);
+  color: var(--ct-text-primary);
+}
+
+.right-panel-tab.active {
+  background: var(--ct-bg-tertiary);
+  color: var(--ct-accent);
+  font-weight: 500;
+}
+
+/* 空状态 */
+.panel-empty {
+  text-align: center;
+  padding: 32px 12px;
+  color: var(--ct-text-muted);
+}
+
+.panel-empty p {
+  margin: 4px 0;
+  font-size: 13px;
+}
+
+.panel-empty-hint {
+  font-size: 12px !important;
+  opacity: 0.7;
+}
+
+/* 任务卡片 */
+.task-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.task-card {
+  padding: 10px 12px;
+  border: 1px solid var(--ct-border);
+  border-radius: 8px;
+  background: var(--ct-bg);
+  transition: all 0.15s;
+}
+
+.task-card:hover {
+  border-color: var(--ct-accent);
+}
+
+.task-card.task-status-running {
+  border-color: rgba(212, 175, 55, 0.4);
+  box-shadow: 0 0 8px rgba(212, 175, 55, 0.08);
+}
+
+.task-card.task-status-failed {
+  border-color: rgba(239, 68, 68, 0.3);
+}
+
+.task-card-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.task-status-icon {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.task-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ct-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-card-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.task-status-label {
+  font-size: 11px;
+  color: var(--ct-text-muted);
+}
+
+.task-desc {
+  font-size: 12px;
+  color: var(--ct-text-secondary);
+  margin: 0 0 6px;
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.task-card-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--ct-text-muted);
+}
+
+.task-card-footer .el-button {
+  margin-left: auto;
+  padding: 0 4px;
+  font-size: 11px;
+}
+
+.task-result {
+  margin-top: 6px;
+  padding: 6px 8px;
+  background: var(--ct-bg-secondary);
+  border-radius: 4px;
+  font-size: 11px;
+}
+
+.task-result-label {
+  color: var(--ct-text-muted);
+  margin-bottom: 2px;
+}
+
+.task-result-content {
+  color: var(--ct-text-secondary);
+  line-height: 1.4;
+  white-space: pre-wrap;
+  max-height: 80px;
+  overflow-y: auto;
+}
+
+.task-error {
+  margin-top: 6px;
+  padding: 4px 8px;
+  background: rgba(239, 68, 68, 0.08);
+  border-radius: 4px;
+  font-size: 11px;
+  color: #ef4444;
+}
+
+/* 附件面板 */
+.panel-attachment-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.panel-att-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--ct-border);
+  border-radius: 8px;
+  background: var(--ct-bg);
+}
+
+.panel-att-icon {
+  font-size: 20px;
+  flex-shrink: 0;
+}
+
+.panel-att-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.panel-att-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ct-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.panel-att-meta {
+  font-size: 11px;
+  color: var(--ct-text-muted);
+  margin-top: 2px;
+}
+
 .welcome-content {
   max-width: 800px;
   margin: 0 auto;
@@ -1055,6 +1721,140 @@ function getMinisterLLMName(minister: typeof debateStore.ministers[0]): string {
   text-align: center;
   font-size: 12px;
   color: var(--ct-text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+}
+
+.template-picker-link {
+  color: var(--ct-accent);
+  cursor: pointer;
+  font-weight: 500;
+  transition: opacity 0.2s;
+  white-space: nowrap;
+}
+
+.template-picker-link:hover {
+  opacity: 0.8;
+  text-decoration: underline;
+}
+
+/* 模板库对话框 */
+.template-dialog-body {
+  min-height: 300px;
+}
+
+.template-categories {
+  margin-bottom: 16px;
+  text-align: center;
+}
+
+.template-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+  max-height: 400px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.template-card {
+  padding: 14px;
+  border: 1px solid var(--ct-border);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.2s;
+  background: var(--ct-bg);
+}
+
+.template-card:hover {
+  border-color: var(--ct-accent);
+  box-shadow: 0 2px 8px rgba(212, 175, 55, 0.12);
+  transform: translateY(-1px);
+}
+
+.template-card-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.template-icon {
+  font-size: 20px;
+}
+
+.template-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ct-text-primary);
+}
+
+.template-mode-tag {
+  margin-left: auto;
+}
+
+.template-desc {
+  font-size: 12px;
+  color: var(--ct-text-secondary);
+  margin: 0 0 6px;
+  line-height: 1.5;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.template-ministers {
+  font-size: 11px;
+  color: var(--ct-text-muted);
+}
+
+/* 占位符填充表单 */
+.template-placeholder-form {
+  padding: 8px 0;
+}
+
+.template-placeholder-header {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  margin-bottom: 20px;
+}
+
+.template-placeholder-header h3 {
+  margin: 0;
+  font-size: 16px;
+  color: var(--ct-text-primary);
+}
+
+.template-placeholder-topic {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--ct-text-muted);
+  line-height: 1.5;
+}
+
+.template-placeholder-inputs {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.placeholder-field label {
+  display: block;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ct-text-secondary);
+  margin-bottom: 4px;
+}
+
+.template-placeholder-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 /* @ Mention Popup */
@@ -1369,5 +2169,105 @@ function getMinisterLLMName(minister: typeof debateStore.ministers[0]): string {
 
 .about-link-icon {
   font-size: 13px;
+}
+
+/* ============ 附件列表 ============ */
+
+.attachment-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 0 4px;
+}
+
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 16px;
+  background: var(--ct-bg-tertiary, rgba(255, 255, 255, 0.04));
+  border: 1px solid var(--ct-border, rgba(255, 255, 255, 0.08));
+  font-size: 12px;
+  color: var(--ct-text-secondary, #9ca3af);
+  max-width: 240px;
+}
+
+.attachment-chip-icon {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.attachment-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 160px;
+  color: var(--ct-text-primary, #e5e7eb);
+}
+
+.attachment-chip-size {
+  font-size: 11px;
+  color: var(--ct-text-muted, #6b7280);
+  flex-shrink: 0;
+}
+
+.attachment-chip-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border: none;
+  background: transparent;
+  color: var(--ct-text-muted, #6b7280);
+  cursor: pointer;
+  border-radius: 50%;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0;
+  flex-shrink: 0;
+  transition: all 0.15s;
+}
+
+.attachment-chip-remove:hover {
+  background: rgba(239, 68, 68, 0.2);
+  color: #ef4444;
+}
+
+/* ============ 拖拽文件 ============ */
+
+.input-container.drag-over {
+  border-color: var(--ct-accent);
+  box-shadow: 0 0 0 2px rgba(212, 175, 55, 0.25);
+}
+
+.drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+  border-radius: 12px;
+  backdrop-filter: blur(2px);
+  pointer-events: none;
+  animation: fadeIn 0.15s ease;
+}
+
+.drop-overlay-content {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--ct-accent);
+  padding: 12px 24px;
+  border: 2px dashed var(--ct-accent);
+  border-radius: 12px;
+  background: rgba(212, 175, 55, 0.08);
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 </style>

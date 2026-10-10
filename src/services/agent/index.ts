@@ -15,3 +15,13 @@ export type {
   PostDebateResult,
   PostDebateAction
 } from './post-debate'
+
+export {
+  parseActionItemsFromReport,
+  parseActionItemsFromDecree,
+  executeActionItems,
+  formatExecutionReport
+} from './imperial-executor'
+export type { ExecutionReport } from './imperial-executor'
+
+export { buildProjectIndex, searchProjectIndex, generateContextHint, getProjectIndex } from './repository-context'

@@ -20,6 +20,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   runTests: (params) => ipcRenderer.invoke('run-tests', params),
   // 对话框通道
   showOpenDialog: (options) => ipcRenderer.invoke('show-open-dialog', options),
+  showSaveDialog: (options) => ipcRenderer.invoke('show-save-dialog', options),
   // 沙箱配置通道
   getSandboxConfig: () => ipcRenderer.invoke('get-sandbox-config'),
   saveSandboxConfig: (config) => ipcRenderer.invoke('save-sandbox-config', config),
@@ -28,6 +29,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   readPlugin: (filePath) => ipcRenderer.invoke('read-plugin', filePath),
   getPluginDir: () => ipcRenderer.invoke('get-plugin-dir'),
   openPluginDir: () => ipcRenderer.invoke('open-plugin-dir'),
+  // 附件通道
+  readAttachment: (filePath) => ipcRenderer.invoke('read-attachment', filePath),
   // 浏览器自动化通道
   browserAction: (params) => ipcRenderer.invoke('browser-action', params),
   // 企业微信 Webhook 通道
