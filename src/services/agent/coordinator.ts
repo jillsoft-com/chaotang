@@ -15,13 +15,22 @@ import type { Minister, ChatMessage, ToolCall, ToolCallResult, LLMConfig, Speech
 import type { LLMProvider } from '@/services/llm/types'
 import { createProvider } from '@/services/llm'
 import { llmService } from '@/services/llm-config'
-import { compressContext, getCompressThreshold, countMessageChars } from './context-compressor'
+import { compressContext, countMessageChars } from './context-compressor'
 import { memoryStore } from '@/services/memory'
 import { skillRegistry } from '@/services/skills'
 import { toolExecutor } from '@/services/tools/executor'
 import { findPresetById, getCurrentDynastyId } from '@/services/dynasty-presets'
 import { AutonomousEngine } from './autonomous-engine'
 import type { AutonomousEvent } from './autonomous-engine'
+import { taskScheduler } from './task-scheduler'
+import type { ExecutionContext, LeafExecContext, LeafResult } from './task-scheduler'
+import type { TaskTreeSnapshot, TaskNode } from './task-tree'
+import { createTree, createNode, addNode, transitionStatus } from './task-tree'
+import { filterToolDefinitionsForReadOnlyNode, WRITE_TOOLS } from './resource-lock'
+import { buildRootContext } from './hierarchical-summary'
+import { BudgetTracker } from './budget-display'
+import { ContextManager } from './context-manager'
+import type { NodeCost } from './execution-guardian'
 
 // ============ 类型定义 ============
 
@@ -30,12 +39,18 @@ export interface WorkerTask {
   ministerId: string   // 执行者 ID
   task: string         // 子任务描述
   context?: string     // 补充上下文
+  /** 是否启用自主执行（由丞相在拆解时决定） */
+  autonomous?: boolean
+  /** 是否为只读任务（仅分析/调研，不写文件/执行命令） */
+  readOnly?: boolean
 }
 
 /** 任务拆解结果 */
 export interface TaskDecomposition {
   plan: string          // 丞相的分析计划
   tasks: WorkerTask[]   // 子任务列表
+  /** 任务树快照（树模式时使用） */
+  taskTree?: TaskTreeSnapshot
 }
 
 /** Worker 执行结果 */
@@ -54,11 +69,17 @@ export type AgentEventType =
   | 'start'           // 开始
   | 'decomposing'     // 丞相分析中
   | 'plan-ready'      // 拆解完成
+  | 'tree-created'    // 任务树已创建
   | 'worker-start'    // Worker 开始
   | 'worker-progress' // Worker 输出中
   | 'worker-tool'     // Worker 调用工具
   | 'worker-done'     // Worker 完成
   | 'worker-autonomous' // Worker 自主执行子事件
+  | 'node-completed'  // 任务节点完成
+  | 'node-failed'     // 任务节点失败
+  | 'tree-completed'  // 任务树完成
+  | 'tree-failed'     // 任务树失败
+  | 'guardian-alert'  // 监护器报警（循环/停滞/预算）
   | 'synthesizing'    // 丞相汇总中
   | 'complete'        // 全部完成
   | 'error'           // 出错
@@ -84,9 +105,7 @@ export interface CoordinatorConfig {
   continueOnError: boolean
   /** 是否启用 Plan Mode（拆解后等待用户确认） */
   planMode: boolean
-  /** 是否启用自主执行模式（Worker 可自主迭代：执行→验证→修正） */
-  autonomousMode: boolean
-  /** 自主执行模式下的最大迭代轮数（默认 10） */
+  /** 自主执行的最大迭代轮数（默认 10，由丞相决定是否启用） */
   autonomousMaxIterations: number
 }
 
@@ -95,7 +114,6 @@ const DEFAULT_CONFIG: CoordinatorConfig = {
   synthesize: true,
   continueOnError: true,
   planMode: false,
-  autonomousMode: false,
   autonomousMaxIterations: 10
 }
 
@@ -195,12 +213,20 @@ export class CoordinatorAgent {
     getReactiveSpeech: (speechId: string) => Speech
     shouldContinue: () => boolean
     workingDirectory?: string
+    /** 辩论 ID（用于任务树持久化） */
+    debateId?: string
     /** Plan Mode: 拆解完成后回调，返回 true 继续执行，false 取消 */
     onPlanReady?: (plan: TaskDecomposition) => Promise<boolean>
     /** Approval Mode: 危险命令执行前回调，返回 true 批准，false 拒绝 */
     onBeforeToolExecute?: (toolCall: ToolCall) => Promise<boolean>
+    /** 保存任务树快照（可选） */
+    saveSnapshot?: (tree: TaskTreeSnapshot) => void
+    /** 重试节点回调（监护器报警时调用，返回 true 确认重试） */
+    onRetryNode?: (nodeId: string, reason: string) => Promise<boolean>
+    /** 检查是否有遗留的中断任务树，返回用户选择 + 中断的树：{ choice, tree } */
+    onRecoverInterrupted?: () => Promise<{ choice: 'resume' | 'restart' | null; tree?: TaskTreeSnapshot }>
   }): Promise<void> {
-    const { topic, chancellor, workers, resolveLLM, addSpeech, getReactiveSpeech, shouldContinue, workingDirectory, onPlanReady, onBeforeToolExecute } = params
+    const { topic, chancellor, workers, resolveLLM, addSpeech, getReactiveSpeech, shouldContinue, workingDirectory, debateId, onPlanReady, onBeforeToolExecute, saveSnapshot, onRetryNode, onRecoverInterrupted } = params
 
     this.emit({ type: 'start', data: { topic, workerCount: workers.length } })
 
@@ -215,6 +241,35 @@ export class CoordinatorAgent {
     const memoryHint = memorySummary
       ? `\n\n=== 历史记忆（跨会话持久记忆） ===\n${memorySummary}\n=== 记忆结束 ===\n重要提示：以上是你之前会话中保存的记忆，请参考这些信息来回答。如果你发现了新的重要信息，可以使用 save_memory 工具保存。`
       : ''
+
+    // ── Phase 0: 检查是否有遗留的中断任务树 ──
+    if (onRecoverInterrupted && saveSnapshot) {
+      const { choice, tree } = await onRecoverInterrupted()
+      if (choice === 'resume' && tree) {
+        // 用户选择继续中断的任务树（树由回调直接从持久化存储提供）
+        if (tree.state === 'interrupted') {
+          for (const node of Object.values(tree.nodes)) {
+            if (node.status === 'interrupted') {
+              transitionStatus(tree, node.id, 'ready', '用户确认继续')
+            }
+          }
+          tree.state = 'running'
+          saveSnapshot(tree)
+        }
+
+        // 直接启动调度器（跳过丞相拆解）
+        await this.startSchedulerAndWait(tree, {
+          workers, resolveLLM, addSpeech, getReactiveSpeech, shouldContinue,
+          workingDirectory, onBeforeToolExecute, saveSnapshot, onRetryNode,
+          agentsMdHint, memoryHint, topic
+        })
+        this.emit({ type: 'complete', data: { resumed: true } })
+        return
+      } else if (choice === null) {
+        this.emit({ type: 'complete', data: { cancelled: true, reason: '用户取消了恢复' } })
+        return
+      }
+    }
 
     // ── Phase 1: 丞相拆解任务 ──
     this.emit({ type: 'decomposing' })
@@ -266,135 +321,111 @@ export class CoordinatorAgent {
 
     if (!shouldContinue()) return
 
-    // ── Phase 2: Workers 执行子任务 ──
+    // ── 构建任务树 ──
     const workerResults: WorkerResult[] = []
-
-    for (const workerTask of decomposition.tasks) {
-      if (!shouldContinue()) return
-
-      const worker = workers.find(w => w.id === workerTask.ministerId)
-      if (!worker) {
-        console.warn(`[Agent] Worker not found: ${workerTask.ministerId}`)
-        continue
-      }
-
-      this.emit({ type: 'worker-start', ministerId: worker.id, data: workerTask })
-
-      const workerSpeechId = `${worker.id}-agent-${Date.now()}`
-      const workerSpeech: Speech = {
-        id: workerSpeechId,
-        ministerId: worker.id,
-        content: '',
-        timestamp: Date.now(),
-        status: 'streaming',
-        toolStatuses: []
-      }
-      addSpeech(workerSpeech)
-
-      const reactiveWorker = getReactiveSpeech(workerSpeechId)
-      const workerLLM = createProvider(resolveLLM(worker.llm))
-      const toolDefs = skillRegistry.getToolDefinitionsForMinister(worker.id)
-
-      const startTime = Date.now()
-      try {
-        let result: { content: string; toolCalls: ToolCallResult[] }
-
-        if (this.config.autonomousMode) {
-          // ── 自主执行模式：使用 AutonomousEngine ──
-          const engine = new AutonomousEngine({
-            maxIterations: this.config.autonomousMaxIterations,
-            verifyAfterEachRound: true,
-            workingDirectory,
-            agentsMdHint,
-            memoryHint
-          })
-
-          // 转发自主执行子事件
-          engine.onEvent((evt: AutonomousEvent) => {
-            this.emit({
-              type: 'worker-autonomous',
-              ministerId: worker.id,
-              data: evt
-            })
-          })
-
-          const autoResult = await engine.execute({
-            provider: workerLLM,
-            systemPrompt: worker.systemPrompt,
-            goal: topic,
-            taskContext: `${workerTask.task}${workerTask.context ? '\n补充：' + workerTask.context : ''}`,
-            toolDefs,
-            onContent: (text) => { reactiveWorker.content = text },
-            onBeforeToolExecute
-          })
-
-          // 收集 toolStatuses 用于 UI 显示
-          if (!reactiveWorker.toolStatuses) reactiveWorker.toolStatuses = []
-          for (const tc of autoResult.toolCalls) {
-            reactiveWorker.toolStatuses.push({
-              toolCallId: tc.toolCallId,
-              functionName: tc.functionName,
-              status: tc.status === 'success' ? 'completed' : (tc.status === 'timeout' ? 'timeout' : 'error'),
-              displayName: this.getToolDisplayName(tc.functionName),
-              summary: tc.status === 'success'
-                ? this.buildSummary(tc.result)
-                : tc.error || '执行失败'
-            })
-          }
-
-          result = { content: autoResult.content, toolCalls: autoResult.toolCalls }
-        } else {
-          // ── 标准模式：使用原有的 Worker 执行循环 ──
-          result = await this.executeWorkerTask(
-            workerLLM,
-            worker,
-            workerTask,
-            topic,
-            toolDefs,
-            reactiveWorker,
-            workingDirectory,
-            onBeforeToolExecute,
-            agentsMdHint,
-            memoryHint
-          )
-        }
-
-        reactiveWorker.status = 'completed'
-        reactiveWorker.toolCalls = result.toolCalls.length > 0 ? result.toolCalls : undefined
-
-        workerResults.push({
-          ministerId: worker.id,
-          ministerName: worker.name,
-          task: workerTask.task,
-          content: result.content,
-          toolCalls: result.toolCalls,
-          duration: Date.now() - startTime,
-          status: 'success'
-        })
-
-        this.emit({ type: 'worker-done', ministerId: worker.id })
-      } catch (error) {
-        const errMsg = `执行失败：${error instanceof Error ? error.message : '未知错误'}`
-        reactiveWorker.content = errMsg
-        reactiveWorker.status = 'error'
-
-        workerResults.push({
-          ministerId: worker.id,
-          ministerName: worker.name,
-          task: workerTask.task,
-          content: errMsg,
-          toolCalls: [],
-          duration: Date.now() - startTime,
-          status: 'error'
-        })
-
-        this.emit({ type: 'error', ministerId: worker.id, data: { phase: 'worker', error } })
-
-        if (!this.config.continueOnError) break
-      }
+    const taskTree = this.buildTaskTree(decomposition, topic, debateId || `debate-${Date.now()}`)
+    if (taskTree) {
+      decomposition.taskTree = taskTree
+      this.emit({ type: 'tree-created', data: { tree: taskTree } })
     }
 
-    if (!shouldContinue()) return
+    if (taskTree && Object.keys(taskTree.nodes).length > 1) {
+      // ── Phase 2: 调度器模式执行任务树 ──
+      const { workerResults: treeResults } = await this.startSchedulerAndWait(taskTree, {
+        workers, resolveLLM, addSpeech, getReactiveSpeech, shouldContinue,
+        workingDirectory, onBeforeToolExecute, saveSnapshot, onRetryNode,
+        agentsMdHint, memoryHint, topic
+      })
+      workerResults.push(...treeResults)
+    } else {
+      // ── Phase 2 (legacy): 扁平执行模式 ──
+      for (const workerTask of decomposition.tasks) {
+        if (!shouldContinue()) return
+
+        const worker = workers.find(w => w.id === workerTask.ministerId)
+        if (!worker) {
+          console.warn(`[Agent] Worker not found: ${workerTask.ministerId}`)
+          continue
+        }
+
+        this.emit({ type: 'worker-start', ministerId: worker.id, data: workerTask })
+
+        const workerSpeechId = `${worker.id}-agent-${Date.now()}`
+        const workerSpeech: Speech = {
+          id: workerSpeechId,
+          ministerId: worker.id,
+          content: '',
+          timestamp: Date.now(),
+          status: 'streaming',
+          toolStatuses: []
+        }
+        addSpeech(workerSpeech)
+
+        const reactiveWorker = getReactiveSpeech(workerSpeechId)
+        const workerLLM = createProvider(resolveLLM(worker.llm))
+        const toolDefs = skillRegistry.getToolDefinitionsForMinister(worker.id)
+
+        const previousWorkersSummary = this.buildPreviousWorkersSummary(workerResults)
+        const taskContextWithHistory = previousWorkersSummary
+          ? `${workerTask.task}${workerTask.context ? '\n补充：' + workerTask.context : ''}\n\n=== 前序成员已完成的工作 ===\n${previousWorkersSummary}\n=== 前序工作结束 ===\n重要：请不要重复创建前序成员已创建的文件，不要覆盖他们的输出。你的工作应在他们的基础上继续。`
+          : `${workerTask.task}${workerTask.context ? '\n补充：' + workerTask.context : ''}`
+
+        const startTime = Date.now()
+        try {
+          let result: { content: string; toolCalls: ToolCallResult[] }
+
+          if (workerTask.autonomous) {
+            const engine = new AutonomousEngine({
+              maxIterations: this.config.autonomousMaxIterations,
+              verifyAfterEachRound: true,
+              workingDirectory,
+              agentsMdHint,
+              memoryHint
+            })
+            engine.onEvent((evt: AutonomousEvent) => {
+              this.emit({ type: 'worker-autonomous', ministerId: worker.id, data: evt })
+            })
+            const autoResult = await engine.execute({
+              provider: workerLLM,
+              systemPrompt: worker.systemPrompt,
+              goal: topic,
+              taskContext: taskContextWithHistory,
+              toolDefs,
+              onContent: (text) => { reactiveWorker.content = text },
+              onBeforeToolExecute
+            })
+            if (!reactiveWorker.toolStatuses) reactiveWorker.toolStatuses = []
+            for (const tc of autoResult.toolCalls) {
+              reactiveWorker.toolStatuses.push({
+                toolCallId: tc.toolCallId,
+                functionName: tc.functionName,
+                status: tc.status === 'success' ? 'completed' : (tc.status === 'timeout' ? 'timeout' : 'error'),
+                displayName: this.getToolDisplayName(tc.functionName),
+                summary: tc.status === 'success' ? this.buildSummary(tc.result) : tc.error || '执行失败'
+              })
+            }
+            result = { content: autoResult.content, toolCalls: autoResult.toolCalls }
+          } else {
+            const enhancedTask: WorkerTask = previousWorkersSummary
+              ? { ...workerTask, task: `${workerTask.task}\n\n=== 前序成员已完成的工作 ===\n${previousWorkersSummary}\n=== 前序工作结束 ===\n重要：请不要重复创建前序成员已创建的文件。` }
+              : workerTask
+            result = await this.executeWorkerTask(workerLLM, worker, enhancedTask, topic, toolDefs, reactiveWorker, workingDirectory, onBeforeToolExecute, agentsMdHint, memoryHint)
+          }
+
+          reactiveWorker.status = 'completed'
+          reactiveWorker.toolCalls = result.toolCalls.length > 0 ? result.toolCalls : undefined
+          workerResults.push({ ministerId: worker.id, ministerName: worker.name, task: workerTask.task, content: result.content, toolCalls: result.toolCalls, duration: Date.now() - startTime, status: 'success' })
+          this.emit({ type: 'worker-done', ministerId: worker.id })
+        } catch (error) {
+          const errMsg = `执行失败：${error instanceof Error ? error.message : '未知错误'}`
+          reactiveWorker.content = errMsg
+          reactiveWorker.status = 'error'
+          workerResults.push({ ministerId: worker.id, ministerName: worker.name, task: workerTask.task, content: errMsg, toolCalls: [], duration: Date.now() - startTime, status: 'error' })
+          this.emit({ type: 'error', ministerId: worker.id, data: { phase: 'worker', error } })
+          if (!this.config.continueOnError) break
+        }
+      }
+    }
 
     // ── Phase 3: 丞相汇总 ──
     if (this.config.synthesize && workerResults.length > 0) {
@@ -413,13 +444,29 @@ export class CoordinatorAgent {
       const reactiveSummary = getReactiveSpeech(summarySpeechId)
 
       try {
+        // 成本归因摘要（任务树模式）
+        let costTable = ''
+        if (taskTree && Object.keys(taskTree.nodes).length > 1) {
+          const costs = taskScheduler.getTreeCost(taskTree.runId)
+          if (costs.length > 0) {
+            costTable = this.formatCostAttribution(costs)
+          }
+        }
+
+        // 逐层汇总：任务树模式下使用 buildRootContext 为丞相提供分层摘要
+        let hierarchicalContext = ''
+        if (taskTree && Object.keys(taskTree.nodes).length > 1) {
+          hierarchicalContext = buildRootContext(taskTree, taskTree.rootId)
+        }
+
         const summary = await this.synthesizeResults(
           chancellorLLM,
           topic,
           workerResults,
-          (text) => { reactiveSummary.content = text }
+          (text) => { reactiveSummary.content = (costTable ? costTable + '\n\n' : '') + text },
+          hierarchicalContext
         )
-        reactiveSummary.content = summary
+        reactiveSummary.content = (costTable ? costTable + '\n\n' : '') + summary
         reactiveSummary.status = 'completed'
       } catch (error) {
         reactiveSummary.content = `汇总失败：${error instanceof Error ? error.message : '未知错误'}`
@@ -468,10 +515,21 @@ ${workerDesc}
     {
       "ministerId": "成员ID",
       "task": "具体子任务描述，包含明确的交付物要求",
-      "context": "补充说明（可选）"
+      "context": "补充说明（可选）",
+      "autonomous": true,
+      "readOnly": false
     }
   ]
 }
+
+关于 autonomous 字段：
+- true = 该成员需要自主执行（可迭代多轮：写代码→编译→报错→改代码→重跑）
+- false = 一次性输出即可（如输出方案文档、分析报告）
+- 判断规则：如果任务需要创建实际文件并验证结果正确性，设为 true；如果只需输出文字方案，设为 false
+
+关于 readOnly 字段：
+- true = 纯分析/调研任务，不需要创建或修改任何文件
+- false = 需要创建、修改文件或执行命令
 
 要求：
 1. 每个任务分配给最合适的成员
@@ -492,10 +550,21 @@ ${workerDesc}
     {
       "ministerId": "大臣ID",
       "task": "具体子任务描述，清晰明确",
-      "context": "补充说明（可选）"
+      "context": "补充说明（可选）",
+      "autonomous": false,
+      "readOnly": false
     }
   ]
 }
+
+关于 autonomous 字段：
+- true = 该大臣需要自主执行（可迭代多轮：执行工具→检查结果→修正→重试）
+- false = 一次性分析即可（只需输出意见和建议）
+- 判断规则：如果任务需要执行实际操作（创建文件、运行命令、修改代码等），设为 true；如果只需分析和建议，设为 false
+
+关于 readOnly 字段：
+- true = 纯调研/分析任务，不需要创建或修改任何文件、不执行命令
+- false = 需要执行实际操作
 
 要求：
 1. 每个任务分配给最合适的大臣
@@ -540,9 +609,15 @@ ${workerDesc}
 
       if (parsed.tasks && Array.isArray(parsed.tasks)) {
         const validIds = workers.map(w => w.id)
-        const validTasks = parsed.tasks.filter(
-          (t: any) => validIds.includes(t.ministerId) && typeof t.task === 'string'
-        )
+        const validTasks = parsed.tasks
+          .filter((t: any) => validIds.includes(t.ministerId) && typeof t.task === 'string')
+          .map((t: any) => ({
+            ministerId: t.ministerId,
+            task: t.task,
+            context: t.context || undefined,
+            autonomous: t.autonomous === true,  // 只有明确为 true 才启用
+            readOnly: 'readOnly' in t ? t.readOnly === true : undefined  // 保留 undefined 让 buildTaskTree 推断默认值
+          }))
 
         if (validTasks.length > 0) {
           return {
@@ -566,6 +641,39 @@ ${workerDesc}
   }
 
   /**
+   * 从丞相拆解结果构建任务树
+   */
+  private buildTaskTree(decomposition: TaskDecomposition, topic: string, debateId: string): TaskTreeSnapshot | null {
+    const tree = createTree(debateId, topic, decomposition.plan, 'chancellor')
+
+    if (decomposition.tasks.length === 0) return null
+
+    for (let i = 0; i < decomposition.tasks.length; i++) {
+      const task = decomposition.tasks[i]
+      const isReadOnly = task.readOnly ?? !task.autonomous
+      const node = createNode({
+        title: task.task.slice(0, 50) || `任务 ${i + 1}`,
+        description: task.task,
+        parentId: tree.rootId,
+        createdBy: 'chancellor',
+        assigneeId: task.ministerId,
+        mode: task.autonomous ? 'action' : 'analysis',
+        autonomous: task.autonomous === true,
+        readOnly: isReadOnly,
+        decomposition: task.autonomous ? 'leaf' : 'unexamined',
+        priority: 0,
+        budget: { maxIterations: this.config.autonomousMaxIterations, maxToolCalls: 50, timeoutMs: 5 * 60 * 1000 }
+      })
+      const result = addNode(tree, node)
+      if (!result.ok) {
+        console.warn(`[Agent] 添加任务节点失败: ${task.task.slice(0, 30)} - ${result.error}`)
+      }
+    }
+
+    return tree
+  }
+
+  /**
    * Phase 2: 执行 Worker 子任务（带工具调用循环）
    */
   private async executeWorkerTask(
@@ -578,7 +686,8 @@ ${workerDesc}
     workingDirectory?: string,
     onBeforeToolExecute?: (toolCall: ToolCall) => Promise<boolean>,
     agentsMdHint?: string,
-    memoryHint?: string
+    memoryHint?: string,
+    onToolCall?: () => boolean | void
   ): Promise<{ content: string; toolCalls: ToolCallResult[] }> {
     const dirHint = workingDirectory
       ? `\n项目工作目录: ${workingDirectory}\n创建文件时请使用相对路径（如 src/components/xxx.vue），系统会自动解析到工作目录下。`
@@ -617,8 +726,18 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
 
     const allToolCalls: ToolCallResult[] = []
     let finalContent = ''
+    let budgetExhausted = false  // P1: 预算耗尽标志，用于终止整个任务循环
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      // P1: 如果预算已耗尽，终止整个任务循环
+      if (budgetExhausted) {
+        messages.push({
+          role: 'user',
+          content: '工具调用预算已耗尽，请输出当前进展的最终总结。'
+        })
+        break
+      }
+
       const pendingToolCalls: ToolCall[] = []
 
       const content = await provider.chatStreamWithTools(
@@ -753,6 +872,40 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
           } catch { /* 读取失败不影响执行 */ }
         }
 
+        // P0: 运行时只读授权——在执行前拦截写工具调用
+        if (workerTask.readOnly && WRITE_TOOLS.has(tc.function.name)) {
+          const rejected: ToolCallResult = {
+            toolCallId: tc.id, functionName: tc.function.name, arguments: {},
+            result: { success: false, error: '只读节点不允许调用写工具' },
+            status: 'error', duration: 0, error: '只读权限拦截'
+          }
+          allToolCalls.push(rejected)
+          messages.push({
+            role: 'tool',
+            content: JSON.stringify({ success: false, error: '当前任务为只读模式，不允许执行写操作。请改用分析/调研方式完成任务。' }),
+            tool_call_id: tc.id, name: tc.function.name
+          })
+          continue
+        }
+
+        // P1: 执行前原子预留预算额度
+        if (onToolCall) {
+          try {
+            const reserved = onToolCall()
+            if (reserved === false) {
+              // 预算耗尽：不执行工具，直接拒绝
+              const rejected: ToolCallResult = {
+                toolCallId: tc.id, functionName: tc.function.name, arguments: {},
+                result: { success: false, error: '工具调用预算已耗尽' },
+                status: 'error', duration: 0, error: '预算耗尽'
+              }
+              allToolCalls.push(rejected)
+              budgetExhausted = true
+              break
+            }
+          } catch { /* 忽略回调异常 */ }
+        }
+
         const result = await toolExecutor.execute(tc)
         allToolCalls.push(result)
 
@@ -796,18 +949,19 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
         })
       }
 
-      // 上下文压缩：工具执行完后检查是否需要压缩
+      // 上下文压缩（R8：通过 ContextManager 按模型容量管理）
       if (round < MAX_TOOL_ROUNDS - 1) {
-        const threshold = getCompressThreshold()
-        const totalChars = countMessageChars(messages)
-        if (totalChars > threshold) {
+        const ctxMgr = new ContextManager(minister.llm?.model || 'unknown')
+        const ctxMessages = messages.map(m => ({ role: m.role as 'system' | 'user' | 'assistant', content: typeof m.content === 'string' ? m.content : '' }))
+        if (ctxMgr.exceedsContextLimit(ctxMessages)) {
           const summaryProvider = this.getSummaryProvider()
           if (summaryProvider) {
-            console.log(`[Agent] 上下文超过阈值 (${totalChars} > ${threshold})，开始压缩...`)
+            console.log(`[Agent] 上下文超出模型容量 (${ctxMgr.estimateTokens(ctxMessages.reduce((s, m) => s + m.content, ''))} tokens > ${ctxMgr.getBudget().maxTokens})，开始压缩...`)
             try {
-              const compressed = await compressContext(messages, summaryProvider, threshold)
+              const compressed = await compressContext(messages, summaryProvider, ctxMgr.getAvailableChars())
+              const afterChars = countMessageChars(compressed)
               messages.splice(0, messages.length, ...compressed)
-              console.log(`[Agent] 压缩完成, 消息数: ${messages.length}, 字符: ${countMessageChars(messages)}`)
+              console.log(`[Agent] 压缩完成, 消息数: ${messages.length}, 字符: ${afterChars}`)
             } catch (e) {
               console.warn('[Agent] 压缩失败，继续执行:', e)
             }
@@ -837,14 +991,22 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
     provider: LLMProvider,
     topic: string,
     results: WorkerResult[],
-    onContent: (text: string) => void
+    onContent: (text: string) => void,
+    hierarchicalContext?: string
   ): Promise<string> {
-    const workerOutputs = results.map(r => {
-      const toolInfo = r.toolCalls.length > 0
-        ? `（使用了 ${r.toolCalls.length} 个工具）`
-        : ''
-      return `### ${r.ministerName}的分析${toolInfo}\n**任务**：${r.task}\n\n${r.content}`
-    }).join('\n\n---\n\n')
+    const workerOutputs = hierarchicalContext
+      ? ''  // 树模式：只使用逐层汇总，不传入叶子全文
+      : results.map(r => {
+          const toolInfo = r.toolCalls.length > 0
+            ? `（使用了 ${r.toolCalls.length} 个工具）`
+            : ''
+          return `### ${r.ministerName}的分析${toolInfo}\n**任务**：${r.task}\n\n${r.content}`
+        }).join('\n\n---\n\n')
+
+    // 任务树模式下的逐层汇总上下文
+    const hierarchySection = hierarchicalContext
+      ? `\n\n=== 任务树逐层汇总 ===\n${hierarchicalContext}\n=== 汇总结束 ===\n请参考以上分层摘要进行综合判断，无需重述每个叶子的细节。`
+      : ''
 
     const messages: ChatMessage[] = [
       {
@@ -876,9 +1038,9 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
         content: (() => {
           const isIndustry = this.getCurrentThemeCategory() === 'industry'
           if (isIndustry) {
-            return `项目需求：${topic}\n\n以下是各团队成员的交付成果：\n\n${workerOutputs}\n\n请输出项目总结报告。`
+            return `项目需求：${topic}\n\n以下是各团队成员的交付成果：\n\n${workerOutputs}${hierarchySection}\n\n请输出项目总结报告。`
           }
-          return `议题：${topic}\n\n以下是各位大臣的分析结果：\n\n${workerOutputs}\n\n请给出你的综合奏报。`
+          return `议题：${topic}\n\n以下是各位大臣的分析结果：\n\n${workerOutputs}${hierarchySection}\n\n请给出你的综合奏报。`
         })()
       }
     ]
@@ -892,25 +1054,73 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
   private formatDecomposition(decomposition: TaskDecomposition, workers: Minister[]): string {
     const lines: string[] = []
 
-    // 分析计划
     lines.push(`**📋 议题分析**\n`)
     lines.push(`${decomposition.plan}\n`)
-
-    // 任务分配
     lines.push(`**⚔️ 任务分配**\n`)
 
     decomposition.tasks.forEach((task, i) => {
       const worker = workers.find(w => w.id === task.ministerId)
       const name = worker ? `${worker.avatar} ${worker.name}` : task.ministerId
       const title = worker ? `（${worker.title}）` : ''
-
-      lines.push(`${i + 1}. **${name}**${title}`)
+      const autoBadge = task.autonomous ? ' 🔄' : ''
+      lines.push(`${i + 1}. **${name}**${title}${autoBadge}`)
       lines.push(`   ${task.task}`)
-      if (task.context) {
-        lines.push(`   > ${task.context}`)
-      }
+      if (task.context) lines.push(`   > ${task.context}`)
       lines.push('')
     })
+
+    // 展示任务树结构（如果有）
+    if (decomposition.taskTree) {
+      lines.push('**🌳 任务树结构**\n')
+      const tree = decomposition.taskTree
+      const root = tree.nodes[tree.rootId]
+      if (root) {
+        for (const childId of root.childIds) {
+          const child = tree.nodes[childId]
+          if (child) {
+            const w = workers.find(m => m.id === child.assigneeId)
+            const wName = w ? `${w.avatar} ${w.name}` : (child.assigneeId || '未分配')
+            const badge = child.autonomous ? '🔄' : '📝'
+            lines.push(`  ${badge} **${child.title}** → ${wName}`)
+            lines.push(`    状态: ${child.status} | 优先级: ${child.priority}`)
+          }
+        }
+      }
+      lines.push('')
+    }
+
+    return lines.join('\n')
+  }
+
+  /**
+   * 格式化成本归因表格
+   */
+  private formatCostAttribution(costs: NodeCost[]): string {
+    if (costs.length === 0) return ''
+
+    const lines: string[] = [
+      '**📊 执行成本归因**',
+      '',
+      '| 任务 | 迭代 | 工具调用 | 耗时 | 估算 Token |',
+      '|------|------|----------|------|------------|'
+    ]
+
+    let totalIterations = 0
+    let totalToolCalls = 0
+    let totalElapsed = 0
+    let totalTokens = 0
+
+    for (const cost of costs) {
+      const elapsed = cost.elapsedMs > 0 ? `${(cost.elapsedMs / 1000).toFixed(1)}s` : '-'
+      const tokens = cost.estimatedTokens > 0 ? `~${cost.estimatedTokens}` : '-'
+      lines.push(`| ${cost.title} | ${cost.iterations} | ${cost.toolCalls} | ${elapsed} | ${tokens} |`)
+      totalIterations += cost.iterations
+      totalToolCalls += cost.toolCalls
+      totalElapsed += cost.elapsedMs
+      totalTokens += cost.estimatedTokens
+    }
+
+    lines.push(`| **合计** | **${totalIterations}** | **${totalToolCalls}** | **${(totalElapsed / 1000).toFixed(1)}s** | **~${totalTokens}** |`)
 
     return lines.join('\n')
   }
@@ -972,6 +1182,305 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
       return str.length > 60 ? str.slice(0, 60) + '...' : str
     }
     return String(result)
+  }
+
+  /**
+   * 启动调度器并等待任务树完成（复用于恢复和正常流程）
+   */
+  private async startSchedulerAndWait(
+    tree: TaskTreeSnapshot,
+    params: {
+      workers: Minister[]; resolveLLM: (llm: LLMConfig) => LLMConfig
+      addSpeech: (speech: Speech) => void; getReactiveSpeech: (id: string) => Speech
+      shouldContinue: () => boolean; workingDirectory?: string
+      onBeforeToolExecute?: (tc: ToolCall) => Promise<boolean>
+      saveSnapshot?: (tree: TaskTreeSnapshot) => void
+      onRetryNode?: (nodeId: string, reason: string) => Promise<boolean>
+      agentsMdHint?: string; memoryHint?: string; topic: string
+    }
+  ): Promise<{ workerResults: WorkerResult[] }> {
+    const { workers, resolveLLM, addSpeech, getReactiveSpeech, shouldContinue, workingDirectory, onBeforeToolExecute, saveSnapshot, onRetryNode, agentsMdHint, memoryHint, topic } = params
+    const workerResults: WorkerResult[] = []
+    // 预算追踪器：追踪整棵树和每个节点的工具调用消耗
+    const defaultMaxIterations = 10
+    const budgetTracker = new BudgetTracker(tree.limits.maxToolCallsPerRun, defaultMaxIterations)
+    budgetTracker.onWarning((w) => {
+      this.emit({ type: 'guardian-alert', data: { runId: tree.runId, nodeId: w.nodeId, record: { type: 'budget', message: w.message }, schedulerType: 'budget-warning' } })
+    })
+    // 每次工具调用后的增量计数器（用于 per-tool-call budget-update）
+    // P1: 从树的既有已消耗用量初始化，避免恢复任务树时重置预算
+    let liveToolCallCount = tree.usage.toolCalls
+    const onToolCall = (): boolean => {
+      // P1: 原子预留——在执行前检查并递增，并行场景下同步操作保证原子性
+      if (liveToolCallCount >= tree.limits.maxToolCallsPerRun) {
+        return false  // 预算已耗尽，不执行
+      }
+      liveToolCallCount++
+      const remaining = tree.limits.maxToolCallsPerRun - liveToolCallCount
+      // P1: 即时同步预留用量到快照，防止崩溃丢失
+      tree.usage.toolCalls = liveToolCallCount
+      try { saveSnapshot?.(tree) } catch { /* 快照保存失败不影响执行 */ }
+      const snapshot = {
+        nodeId: '__live__',
+        nodeUsage: { iterations: 0, toolCalls: liveToolCallCount, elapsedMs: 0 },
+        treeUsage: { iterations: tree.usage.iterations, toolCalls: liveToolCallCount, elapsedMs: tree.usage.elapsedMs },
+        remaining: { toolCalls: remaining, iterations: 0 },
+        timestamp: Date.now()
+      }
+      budgetTracker.processBudgetUpdate(snapshot)
+      return true
+    }
+
+    const schedulerListener = (evt: any) => {
+      if (evt.type === 'node-completed' || evt.type === 'node-failed') {
+        const node = tree.nodes[evt.nodeId]
+        if (node && node.assigneeId) {
+          const worker = workers.find(w => w.id === node.assigneeId)
+          this.emit({ type: evt.type === 'node-completed' ? 'node-completed' : 'node-failed', ministerId: node.assigneeId, data: evt.data })
+          workerResults.push({
+            ministerId: node.assigneeId, ministerName: worker?.name || node.assigneeId,
+            task: node.title, content: node.resultSummary || '', toolCalls: [], duration: 0,
+            status: evt.type === 'node-completed' ? 'success' : 'error'
+          })
+          this.emit({ type: 'worker-done', ministerId: node.assigneeId })
+        }
+      }
+      // 调度器的 budget-update 事件转发给 BudgetTracker（使用实时计数器避免滞后）
+      if (evt.type === 'budget-update' && evt.data) {
+        budgetTracker.processBudgetUpdate({
+          nodeId: evt.nodeId || '__unknown__',
+          nodeUsage: evt.data.nodeUsage,
+          treeUsage: { iterations: evt.data.treeUsage.iterations, toolCalls: liveToolCallCount, elapsedMs: evt.data.treeUsage.elapsedMs },
+          remaining: { toolCalls: tree.limits.maxToolCallsPerRun - liveToolCallCount, iterations: evt.data.remaining.iterations },
+          timestamp: Date.now()
+        })
+      }
+      if (evt.type === 'guardian-paused' || evt.type === 'guardian-warning') {
+        this.emit({ type: 'guardian-alert', data: { runId: evt.runId, nodeId: evt.nodeId, record: evt.data?.record, schedulerType: evt.type } })
+        if (evt.type === 'guardian-paused' && onRetryNode && evt.nodeId) {
+          const reason = evt.data?.record?.detail || '监护器暂停了该节点'
+          onRetryNode(evt.nodeId, reason).then(confirmed => {
+            if (confirmed) taskScheduler.retryNode(evt.runId, evt.nodeId, true)
+          }).catch(() => {})
+        }
+      }
+    }
+    const unsub = taskScheduler.onEvent(schedulerListener)
+
+    await new Promise<void>((resolve) => {
+      const treeDone = (evt: any) => {
+        if (evt.runId !== tree.runId) return
+        if (evt.type === 'tree-completed' || evt.type === 'tree-failed') {
+          unsub()
+          resolve()
+        }
+      }
+      taskScheduler.onEvent(treeDone)
+
+      const context: ExecutionContext = {
+        ministers: workers, resolveLLM,
+        createSpeech: (ministerId: string) => ({ id: `${ministerId}-${Date.now()}`, ministerId, content: '', timestamp: Date.now(), status: 'streaming' }),
+        getReactiveSpeech, shouldContinue, workingDirectory, onBeforeToolExecute,
+        agentsMdHint, memoryHint,
+        saveSnapshot: (t: TaskTreeSnapshot) => { saveSnapshot?.(t) },
+        requestWorkerDecomposition: async (w, n, t) => this.requestWorkerDecomposition(w, n, t, topic, addSpeech, getReactiveSpeech, resolveLLM),
+        executeLeaf: async (n, lc, as) => this.executeLeafNode(n, lc, as, topic, workers, resolveLLM, addSpeech, getReactiveSpeech, onBeforeToolExecute, workingDirectory, agentsMdHint, memoryHint, onToolCall)
+      }
+
+      taskScheduler.start(tree, context)
+    })
+
+    return { workerResults }
+  }
+
+  /**
+   * 执行叶子节点（调度器调用）
+   */
+  private async executeLeafNode(
+    node: TaskNode, leafContext: LeafExecContext, abortSignal: AbortSignal | undefined,
+    topic: string, workers: Minister[], resolveLLM: (llm: LLMConfig) => LLMConfig,
+    addSpeech: (speech: Speech) => void, getReactiveSpeech: (id: string) => Speech,
+    onBeforeToolExecute?: (tc: ToolCall) => Promise<boolean>,
+    workingDirectory?: string, agentsMdHint?: string, memoryHint?: string,
+    onToolCall?: () => boolean | void
+  ): Promise<LeafResult> {
+    const worker = workers.find(w => w.id === node.assigneeId)
+    if (!worker) return { content: `未找到执行者: ${node.assigneeId}`, toolCalls: [], duration: 0, status: 'error' }
+
+    const workerSpeechId = `${worker.id}-tree-${Date.now()}`
+    const workerSpeech: Speech = { id: workerSpeechId, ministerId: worker.id, content: '', timestamp: Date.now(), status: 'streaming', toolStatuses: [] }
+    addSpeech(workerSpeech)
+    const reactiveWorker = getReactiveSpeech(workerSpeechId)
+    const workerLLM = createProvider(resolveLLM(worker.llm))
+    // 实际工具集：只读节点过滤掉写工具
+    let toolDefs = skillRegistry.getToolDefinitionsForMinister(worker.id)
+    if (node.readOnly) {
+      toolDefs = filterToolDefinitionsForReadOnlyNode(toolDefs)
+    }
+    const taskContextWithHistory = leafContext.previousResultsSummary
+      ? `${node.description}\n\n${leafContext.previousResultsSummary}`
+      : node.description
+    const startTime = Date.now()
+
+    try {
+      let result: { content: string; toolCalls: ToolCallResult[] }
+      let goalReached = true
+      let hasToolFailure = false
+      if (node.autonomous) {
+        const engine = new AutonomousEngine({ maxIterations: node.budget.maxIterations, verifyAfterEachRound: true, workingDirectory, agentsMdHint, memoryHint, modelId: worker.llm?.model, readOnly: node.readOnly })
+        engine.onEvent((evt: AutonomousEvent) => { this.emit({ type: 'worker-autonomous', ministerId: worker.id, data: evt }) })
+        const autoResult = await engine.execute({
+          provider: workerLLM, systemPrompt: worker.systemPrompt, goal: topic, taskContext: taskContextWithHistory, toolDefs,
+          onContent: (text) => { reactiveWorker.content = text }, onBeforeToolExecute, abortSignal, onToolCall
+        })
+        if (!reactiveWorker.toolStatuses) reactiveWorker.toolStatuses = []
+        for (const tc of autoResult.toolCalls) {
+          reactiveWorker.toolStatuses.push({ toolCallId: tc.toolCallId, functionName: tc.functionName, status: tc.status === 'success' ? 'completed' : 'error', displayName: this.getToolDisplayName(tc.functionName), summary: tc.status === 'success' ? this.buildSummary(tc.result) : tc.error || '执行失败' })
+        }
+        result = { content: autoResult.content, toolCalls: autoResult.toolCalls }
+        goalReached = autoResult.goalReached
+      } else {
+        const wt: WorkerTask = { ministerId: worker.id, task: node.description, readOnly: node.readOnly }
+        result = await this.executeWorkerTask(workerLLM, worker, wt, topic, toolDefs, reactiveWorker, workingDirectory, onBeforeToolExecute, agentsMdHint, memoryHint, onToolCall)
+        // 非自主路径：检查关键写操作是否失败（同一工具同参数只看最后一次结果）
+        const criticalTools = new Set(['write_file', 'create_directory', 'execute_command', 'run_tests', 'git_operation'])
+        const lastAttemptByKey = new Map<string, { functionName: string; status: string }>()
+        for (const tc of result.toolCalls) {
+          if (!criticalTools.has(tc.functionName)) continue
+          let argsKey = ''
+          try { argsKey = JSON.stringify(tc.arguments) } catch { /* 忽略 */ }
+          const key = `${tc.functionName}:${argsKey}`
+          lastAttemptByKey.set(key, { functionName: tc.functionName, status: tc.status })
+        }
+        hasToolFailure = false
+        for (const { status } of lastAttemptByKey.values()) {
+          if (status === 'error' || status === 'timeout') {
+            hasToolFailure = true
+            break
+          }
+        }
+      }
+      reactiveWorker.status = 'completed'
+      reactiveWorker.toolCalls = result.toolCalls.length > 0 ? result.toolCalls : undefined
+
+      // P2: 检测 LLM 输出中的复杂度信号（明确表明任务过于复杂需要更深拆解）
+      const complexitySignal = this.detectComplexitySignal(result.content)
+
+      // 验收判定：自主引擎的 goalReached 为 false 时视为失败
+      if (!goalReached) {
+        return { content: result.content, toolCalls: result.toolCalls, duration: Date.now() - startTime, status: 'error', goalReached: false, complexitySignal }
+      }
+
+      // 非自主路径：关键写操作失败时视为未达标
+      if (hasToolFailure) {
+        return { content: result.content, toolCalls: result.toolCalls, duration: Date.now() - startTime, status: 'error', goalReached: false, complexitySignal }
+      }
+
+      return { content: result.content, toolCalls: result.toolCalls, duration: Date.now() - startTime, status: 'success', goalReached: true, complexitySignal }
+    } catch (error) {
+      const errMsg = error instanceof Error ? error.message : '未知错误'
+      reactiveWorker.content = errMsg
+      reactiveWorker.status = 'error'
+      return { content: errMsg, toolCalls: [], duration: Date.now() - startTime, status: 'error' }
+    }
+  }
+
+  /**
+   * 请求 Worker 渐进拆解（调度器调用）
+   */
+  private async requestWorkerDecomposition(
+    worker: Minister, node: TaskNode, tree: TaskTreeSnapshot, topic: string,
+    addSpeech: (speech: Speech) => void, getReactiveSpeech: (id: string) => Speech,
+    resolveLLM: (llm: LLMConfig) => LLMConfig
+  ): Promise<TaskTreeSnapshot> {
+    const speechId = `${worker.id}-decompose-${Date.now()}`
+    const speech: Speech = { id: speechId, ministerId: worker.id, content: '', timestamp: Date.now(), status: 'streaming' }
+    addSpeech(speech)
+    const reactive = getReactiveSpeech(speechId)
+    const provider = createProvider(resolveLLM(worker.llm))
+
+    const messages: ChatMessage[] = [{
+      role: 'system',
+      content: `${worker.systemPrompt}\n\n你被分配了一个任务，请将其拆解为 2-4 个具体子任务。\n\n父任务：${node.description}\n总体目标：${topic}\n\n请按 JSON 格式输出：\n{\n  "subtasks": [\n    { "title": "子任务标题", "description": "详细描述", "assigneeId": "执行者ID（可留空表示自己）", "autonomous": true }\n  ]\n}`
+    }, { role: 'user', content: `请拆解任务：${node.title}` }]
+
+    try {
+      const content = await provider.chatStream(messages, (t) => { reactive.content = t })
+      reactive.status = 'completed'
+      const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/) || content.match(/\{[\s\S]*\}/)
+      const jsonStr = jsonMatch ? (jsonMatch[1] || jsonMatch[0]) : content
+      const parsed = JSON.parse(jsonStr)
+      if (parsed.subtasks && Array.isArray(parsed.subtasks) && parsed.subtasks.length > 0) {
+        for (const st of parsed.subtasks) {
+          const child = createNode({ title: st.title || '子任务', description: st.description || '', parentId: node.id, createdBy: worker.id, assigneeId: st.assigneeId || worker.id, autonomous: st.autonomous === true, readOnly: st.readOnly === true || (!st.autonomous), decomposition: 'leaf', mode: 'action' })
+          addNode(tree, child)
+        }
+      }
+    } catch { /* 拆解失败，保持为叶子 */ }
+
+    return tree
+  }
+
+  /**
+   * 构建前序 Worker 的输出摘要，传递给后续 Worker
+   * 确保后面的 Worker 知道前面已经创建了什么文件、完成了什么工作
+   */
+  private buildPreviousWorkersSummary(results: WorkerResult[]): string {
+    if (results.length === 0) return ''
+
+    const parts: string[] = []
+    for (const r of results) {
+      // 提取已创建/修改的文件列表
+      const createdFiles: string[] = []
+      for (const tc of r.toolCalls) {
+        if (tc.functionName === 'write_file' && tc.status === 'success') {
+          try {
+            const args = tc.arguments as Record<string, any>
+            if (args.path) createdFiles.push(args.path)
+          } catch { /* 忽略 */ }
+        }
+        if (tc.functionName === 'create_directory' && tc.status === 'success') {
+          try {
+            const args = tc.arguments as Record<string, any>
+            if (args.path) createdFiles.push(args.path + '/')
+          } catch { /* 忽略 */ }
+        }
+      }
+
+      // 截断输出内容（避免过长，每个 Worker 最多 1500 字符）
+      const contentPreview = r.content.length > 1500
+        ? r.content.slice(0, 1500) + '...(已截断)'
+        : r.content
+
+      let summary = `### ${r.ministerName}（${r.ministerId}）\n`
+      summary += `**任务**：${r.task}\n`
+      if (createdFiles.length > 0) {
+        summary += `**已创建/修改的文件**：\n${createdFiles.map(f => `- ${f}`).join('\n')}\n`
+      }
+      summary += `**输出**：${contentPreview}\n`
+
+      parts.push(summary)
+    }
+
+    return parts.join('\n---\n\n')
+  }
+
+  /**
+   * 检测 LLM 输出中是否包含复杂度信号
+   * 即明确表明任务过于复杂、需要进一步拆解的文本特征
+   */
+  private detectComplexitySignal(content: string): boolean {
+    if (!content || content.length < 10) return false
+    // 仅扫描前 2000 字符，避免长输出全量扫描
+    const text = content.slice(0, 2000).toLowerCase()
+    const patterns = [
+      '任务过于复杂', '需要进一步拆解', '需要更细的拆分', '需要更深入的拆解',
+      '建议拆分为', '建议分解为', '拆分成多个步骤', '分解为多个子任务',
+      '无法在一次执行中完成', '无法在单次', '超出单次执行范围',
+      'too complex', 'needs further decomposition', 'should be broken down',
+      'requires more granular', 'needs to be split'
+    ]
+    return patterns.some(p => text.includes(p))
   }
 }
 

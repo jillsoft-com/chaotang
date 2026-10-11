@@ -5,6 +5,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   version: process.versions.electron,
   loadApiKeys: () => ipcRenderer.invoke('load-api-keys'),
   saveApiKeys: (keys) => ipcRenderer.invoke('save-api-keys', keys),
+  // 本地键值存储通道
+  storeGet: (key) => ipcRenderer.invoke('store-get', key),
+  storeGetAll: () => ipcRenderer.invoke('store-get-all'),
+  storeSet: (key, value) => ipcRenderer.invoke('store-set', key, value),
+  storeDelete: (key) => ipcRenderer.invoke('store-delete', key),
+  storeGetPath: () => ipcRenderer.invoke('store-get-path'),
   // 文件操作通道
   readFile: (filePath) => ipcRenderer.invoke('read-file', filePath),
   writeFile: (filePath, content) => ipcRenderer.invoke('write-file', filePath, content),
@@ -31,6 +37,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   openPluginDir: () => ipcRenderer.invoke('open-plugin-dir'),
   // 附件通道
   readAttachment: (filePath) => ipcRenderer.invoke('read-attachment', filePath),
+  // 任意文件读写通道（对话框授权的一次性令牌机制）
+  readArbitraryFile: (filePath, token) => ipcRenderer.invoke('read-arbitrary-file', filePath, token),
+  writeArbitraryFile: (filePath, content, token) => ipcRenderer.invoke('write-arbitrary-file', filePath, content, token),
   // 浏览器自动化通道
   browserAction: (params) => ipcRenderer.invoke('browser-action', params),
   // 企业微信 Webhook 通道

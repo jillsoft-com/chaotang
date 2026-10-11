@@ -1,0 +1,61 @@
+{
+  "url": "file:///D:/Workspace/ChaoTang/dist/index.html#/",
+  "title": "朝堂 - 多角色辩论式 AI 对话工具",
+  "body": "朝堂\n新的会话\n历史朝议\n朝堂\n\n百官进言，圣裁由你\n\n必选\n👑\n丞相\n百官之长\ngpt-4o-mini\n💰\n户部尚书\n财政大臣\ngpt-4o-mini\n📚\n太傅\n帝师元老\ngpt-4o-mini\n⚔️\n大将军\n武官之首\ngpt-4o-mini\n🔍\n御史\n监察御史\ngpt-4o-mini\n🏮\n司礼监总管\n内廷心腹\ngpt-4o-mini\n串行\n并行\nAgent\n工作目录\n📎 附件\n📋 选择模板\n按 Enter 发送，Shift + Enter 换行，输入 @ 可指定大臣 · Agent 模式自动拆解任务 · 1/6 角色参与\n🏯 明朝\n朝堂 · 百官进言，圣裁由你\n串行\n0 个会话",
+  "links": [],
+  "buttons": [
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    " 新的会话 ",
+    "",
+    "工作目录",
+    " 📎 附件",
+    ""
+  ],
+  "settings": {
+    "url": "file:///D:/Workspace/ChaoTang/dist/index.html#/settings",
+    "body": "设置\n通用\nLLM 管理\n角色配置\n技能管理\n插件管理\n沙箱安全\n消息集成\n数据洞察\n通用设置\n\n应用外观和基本设置\n\n外观\n主题模式\n切换深色或浅色主题\n消息字体大小\n调整会话中消息正文的字号（15px，默认 15px）\n重置\n摘要模型\n选择摘要模型\n用于会话摘要生成的 LLM 模型\n选择模型\n工具调用\n最大工具调用轮次\n大臣使用工具的最大回合数，超出后要求总结（默认 30）\n上下文压缩阈值\n工具调用过程中消息总字符数超过此值时自动压缩历史（10K~200K，默认 50000）\n朝廷风格\n朝代主题\n选择预设朝代或创建自定义主题\n🏯 明朝\n新建主题\n👑\n丞相\n百官之长\n💰\n户部尚书\n财政大臣\n📚\n太傅\n帝师元老\n⚔️\n大将军\n武官之首\n🔍\n御史\n监察御史\n🏮\n司礼监总管\n内廷心腹\n学习成果管理\n\nGEPA 引擎会从历史朝议中学习决策模式，导入/导出可在不同设备间迁移学习成果\n\n导入学习成果\n从 JSON 文件导入之前导出的 GEPA 学习模式\n导入\n导出学习成果\n将当前学习到的模式导出为 JSON 文件，用于备份或迁移\n导出"
+  },
+  "gepaExport": {
+    "schemaVersion": 1,
+    "patterns": 0
+  },
+  "gepaImport": "导入成功：新增 0 个模式，合并 0 个模式",
+  "messaging": {
+    "body": "设置\n通用\nLLM 管理\n角色配置\n技能管理\n插件管理\n沙箱安全\n消息集成\n数据洞察\n消息平台集成\n\n将朝议结果推送到企业微信等消息平台，支持接收消息触发辩论\n\n💬\n企业微信 Webhook\n已连接\nWebhook URL\n企业微信群机器人的 Webhook 地址\n辩论完成后自动推送\n朝议结束后自动将结果摘要发送到群聊\n保存配置\n测试连接\nWebhook 回调服务器\n\n启动本地 HTTP 服务器接收企业微信的回调消息，实现双向消息交互\n\n回调端口\n本地 HTTP 服务器监听端口，默认 9527\n服务器状态\n已停止\n启动\n\n导出成功\n\n导入成功：新增 0 个模式，合并 0 个模式\n\n消息集成配置已保存\n\n连接成功，已发送测试消息",
+    "received": [
+      {
+        "at": "2026-10-11T09:51:26.305Z",
+        "message": {
+          "msgtype": "markdown",
+          "markdown": {
+            "content": "🏛️ **朝堂** 连接测试成功！\n> 消息集成已就绪"
+          }
+        }
+      },
+      {
+        "at": "2026-10-11T09:53:43.345Z",
+        "message": {
+          "msgtype": "markdown",
+          "markdown": {
+            "content": "🏛️ **朝堂** 连接测试成功！\n> 消息集成已就绪"
+          }
+        }
+      }
+    ]
+  },
+  "inbound": {
+    "status": 200,
+    "response": "{\"errcode\":0,\"errmsg\":\"ok\"}",
+    "body": "设置\n通用\nLLM 管理\n角色配置\n技能管理\n插件管理\n沙箱安全\n消息集成\n数据洞察\n消息平台集成\n\n将朝议结果推送到企业微信等消息平台，支持接收消息触发辩论\n\n💬\n企业微信 Webhook\n已连接\nWebhook URL\n企业微信群机器人的 Webhook 地址\n辩论完成后自动推送\n朝议结束后自动将结果摘要发送到群聊\n保存配置\n测试连接\nWebhook 回调服务器\n\n启动本地 HTTP 服务器接收企业微信的回调消息，实现双向消息交互\n\n回调端口\n本地 HTTP 服务器监听端口，默认 9527\n服务器状态\n运行中\n停止\n\n导出成功\n\n导入成功：新增 0 个模式，合并 0 个模式\n\n消息集成配置已保存\n\n连接成功，已发送测试消息\n\nWebhook 服务器已启动，端口 9527"
+  },
+  "history": {
+    "url": "file:///D:/Workspace/ChaoTang/dist/index.html#/history",
+    "body": "朝议历史\n0 / 0\n\n暂无历史记录\n\n开始朝议\n\n导出成功\n\n导入成功：新增 0 个模式，合并 0 个模式\n\n消息集成配置已保存\n\n连接成功，已发送测试消息\n\nWebhook 服务器已启动，端口 9527"
+  }
+}

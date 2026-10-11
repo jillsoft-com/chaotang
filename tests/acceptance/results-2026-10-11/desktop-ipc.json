@@ -1,0 +1,62 @@
+{
+  "noRoot": {
+    "success": false,
+    "error": "请先在首页选择工作目录"
+  },
+  "selectedRoot": {
+    "canceled": false,
+    "filePaths": [
+      "C:\\Users\\jlj\\AppData\\Local\\Temp\\chaotang-acceptance-D0CHd0"
+    ]
+  },
+  "inside": {
+    "success": true,
+    "content": "<398 characters>"
+  },
+  "outside": {
+    "success": false,
+    "error": "只允许访问已选择的工作目录及其子目录"
+  },
+  "noToken": {
+    "success": false,
+    "error": "缺少文件操作授权令牌"
+  },
+  "readWrongPath": {
+    "success": false,
+    "error": "文件路径与对话框选择的路径不匹配"
+  },
+  "readAuthorized": {
+    "success": true,
+    "content": "<115 characters>"
+  },
+  "readReplay": {
+    "success": false,
+    "error": "文件操作授权无效或已过期"
+  },
+  "commandRejected": {
+    "success": false,
+    "exitCode": -1,
+    "stdout": "",
+    "stderr": "用户拒绝执行命令"
+  },
+  "commandApproved": {
+    "success": true,
+    "exitCode": 0,
+    "stdout": "CT_APPROVED\r\n",
+    "stderr": "",
+    "sandboxed": true
+  },
+  "writeWrongPath": {
+    "success": false,
+    "error": "文件路径与对话框选择的路径不匹配"
+  },
+  "writeAuthorized": {
+    "success": true,
+    "path": "D:\\Workspace\\ChaoTang\\tests\\acceptance\\results-2026-10-11\\token-export.json",
+    "size": 19
+  },
+  "writeReplay": {
+    "success": false,
+    "error": "文件操作授权无效或已过期"
+  }
+}

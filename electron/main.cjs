@@ -2,6 +2,7 @@ const { app, BrowserWindow, ipcMain, dialog, safeStorage, shell } = require('ele
 const path = require('path')
 const { pathToFileURL } = require('url')
 const fs = require('fs')
+const crypto = require('crypto')
 const { exec } = require('child_process')
 const { resolveWithinRoot } = require('./workspace-access.cjs')
 const { executeInSandbox, runTestsInSandbox, checkCommandSafety } = require('./sandbox.cjs')
@@ -9,6 +10,24 @@ const isDev = process.env.NODE_ENV === 'development'
 
 let mainWindow = null
 const authorizedRoots = new Map()
+
+// 一次性文件操作授权令牌（对话框选择 → 读写操作的绑定机制）
+const pendingFileOperations = new Map()
+const FILE_TOKEN_TTL_MS = 5 * 60 * 1000 // 5 分钟过期
+
+function generateFileToken() {
+  return crypto.randomBytes(24).toString('hex')
+}
+
+function cleanupExpiredTokens() {
+  const now = Date.now()
+  for (const [token, op] of pendingFileOperations) {
+    if (op.expiresAt < now) pendingFileOperations.delete(token)
+  }
+}
+
+// 每 2 分钟清理过期令牌
+setInterval(cleanupExpiredTokens, 2 * 60 * 1000).unref?.()
 
 function getAuthorizedRoot(event) {
   const root = authorizedRoots.get(event.sender.id)
@@ -124,6 +143,59 @@ app.whenReady().then(() => {
     return true
   })
 
+  // ============ IPC: 本地键值存储（核心数据持久化到 userData/chaotang-store.json）============
+  const storeFile = path.join(app.getPath('userData'), 'chaotang-store.json')
+  let storeCache = null
+
+  function readStore() {
+    if (storeCache) return storeCache
+    try {
+      if (fs.existsSync(storeFile)) {
+        storeCache = JSON.parse(fs.readFileSync(storeFile, 'utf-8'))
+      } else {
+        storeCache = {}
+      }
+    } catch {
+      storeCache = {}
+    }
+    return storeCache
+  }
+
+  function writeStore(data) {
+    const dir = path.dirname(storeFile)
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+    const tmp = storeFile + '.tmp'
+    fs.writeFileSync(tmp, JSON.stringify(data), { mode: 0o600 })
+    fs.renameSync(tmp, storeFile)
+    storeCache = data
+  }
+
+  ipcMain.handle('store-get', (_event, key) => {
+    if (typeof key !== 'string' || key.length > 200) throw new Error('store key 无效')
+    return readStore()[key] ?? null
+  })
+
+  ipcMain.handle('store-get-all', () => readStore())
+
+  ipcMain.handle('store-set', (_event, key, value) => {
+    if (typeof key !== 'string' || key.length > 200) throw new Error('store key 无效')
+    if (typeof value !== 'string') throw new Error('store value 必须为字符串')
+    const data = readStore()
+    data[key] = value
+    writeStore(data)
+    return true
+  })
+
+  ipcMain.handle('store-delete', (_event, key) => {
+    if (typeof key !== 'string' || key.length > 200) throw new Error('store key 无效')
+    const data = readStore()
+    delete data[key]
+    writeStore(data)
+    return true
+  })
+
+  ipcMain.handle('store-get-path', () => storeFile)
+
   // IPC: 只访问用户明确选择的工作目录
   ipcMain.handle('read-file', async (event, filePath) => {
     try {
@@ -209,7 +281,7 @@ app.whenReady().then(() => {
     }
   })
 
-  // IPC: 打开目录选择对话框
+  // IPC: 打开目录/文件选择对话框
   ipcMain.handle('show-open-dialog', async (event, options) => {
     try {
       const dialogOptions = {
@@ -222,21 +294,42 @@ app.whenReady().then(() => {
       if (dialogOptions.properties.includes('openDirectory') && !result.canceled && result.filePaths.length === 1) {
         authorizedRoots.set(event.sender.id, fs.realpathSync(result.filePaths[0]))
       }
-      return result
+      // 如果选择了文件（非目录），生成一次性读取授权令牌
+      let fileToken = undefined
+      if (!result.canceled && result.filePaths.length > 0 && !dialogOptions.properties.includes('openDirectory')) {
+        fileToken = generateFileToken()
+        pendingFileOperations.set(fileToken, {
+          filePaths: result.filePaths.map(p => path.resolve(p)),
+          operation: 'read',
+          expiresAt: Date.now() + FILE_TOKEN_TTL_MS,
+          senderId: event.sender.id
+        })
+      }
+      return { ...result, fileToken }
     } catch (error) {
       return { canceled: true, filePaths: [], error: error.message }
     }
   })
 
-  // IPC: 保存文件对话框
-  ipcMain.handle('show-save-dialog', async (_event, options) => {
+  // IPC: 保存文件对话框（返回一次性写入授权令牌）
+  ipcMain.handle('show-save-dialog', async (event, options) => {
     try {
       const result = await dialog.showSaveDialog(mainWindow, {
         title: options?.title || '保存文件',
         defaultPath: options?.defaultPath || undefined,
         filters: options?.filters || undefined
       })
-      return { canceled: result.canceled, filePath: result.filePath || undefined }
+      let fileToken = undefined
+      if (!result.canceled && result.filePath) {
+        fileToken = generateFileToken()
+        pendingFileOperations.set(fileToken, {
+          filePath: path.resolve(result.filePath),
+          operation: 'write',
+          expiresAt: Date.now() + FILE_TOKEN_TTL_MS,
+          senderId: event.sender.id
+        })
+      }
+      return { canceled: result.canceled, filePath: result.filePath || undefined, fileToken }
     } catch (error) {
       return { canceled: true, error: error.message }
     }
@@ -374,6 +467,74 @@ app.whenReady().then(() => {
         fileSize: stats.size,
         fileType: ext.replace(/^\./, '')
       }
+    } catch (error) {
+      return { success: false, error: error.message }
+    }
+  })
+
+  // IPC: 读取对话框授权的文件（一次性令牌验证，绑定窗口+路径+过期时间）
+  ipcMain.handle('read-arbitrary-file', async (event, filePath, token) => {
+    try {
+      if (!token) throw new Error('缺少文件操作授权令牌')
+      const op = pendingFileOperations.get(token)
+      if (!op) throw new Error('文件操作授权无效或已过期')
+      if (op.expiresAt < Date.now()) {
+        pendingFileOperations.delete(token)
+        throw new Error('文件操作授权已过期')
+      }
+      if (op.senderId !== undefined && op.senderId !== event.sender.id) {
+        throw new Error('文件操作授权窗口不匹配')
+      }
+      if (op.operation !== 'read') throw new Error('授权类型不匹配：期望读取操作')
+      const resolvedPath = path.resolve(filePath)
+      if (!op.filePaths.includes(resolvedPath)) {
+        throw new Error('文件路径与对话框选择的路径不匹配')
+      }
+      pendingFileOperations.delete(token) // 一次性消费
+      if (!fs.existsSync(filePath)) {
+        throw new Error(`文件不存在: ${filePath}`)
+      }
+      const stats = fs.statSync(filePath)
+      if (stats.size > 10 * 1024 * 1024) {
+        throw new Error('文件过大，最大支持 10MB')
+      }
+      const content = fs.readFileSync(filePath, 'utf-8')
+      return { success: true, content }
+    } catch (error) {
+      return { success: false, error: error.message }
+    }
+  })
+
+  // IPC: 写入对话框授权的文件（一次性令牌验证，绑定窗口+路径+过期时间）
+  ipcMain.handle('write-arbitrary-file', async (event, filePath, content, token) => {
+    try {
+      if (!token) throw new Error('缺少文件操作授权令牌')
+      const op = pendingFileOperations.get(token)
+      if (!op) throw new Error('文件操作授权无效或已过期')
+      if (op.expiresAt < Date.now()) {
+        pendingFileOperations.delete(token)
+        throw new Error('文件操作授权已过期')
+      }
+      if (op.senderId !== undefined && op.senderId !== event.sender.id) {
+        throw new Error('文件操作授权窗口不匹配')
+      }
+      if (op.operation !== 'write') throw new Error('授权类型不匹配：期望写入操作')
+      const resolvedPath = path.resolve(filePath)
+      if (op.filePath !== resolvedPath) {
+        throw new Error('文件路径与对话框选择的路径不匹配')
+      }
+      pendingFileOperations.delete(token) // 一次性消费
+      if (typeof content !== 'string') throw new Error('文件内容必须为文本')
+      if (content.length > 10 * 1024 * 1024) {
+        throw new Error('文件内容过大，最大支持 10MB')
+      }
+      // 自动创建父目录
+      const dir = path.dirname(filePath)
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true })
+      }
+      fs.writeFileSync(filePath, content, 'utf-8')
+      return { success: true, path: filePath, size: content.length }
     } catch (error) {
       return { success: false, error: error.message }
     }

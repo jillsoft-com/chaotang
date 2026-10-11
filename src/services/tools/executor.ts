@@ -149,7 +149,30 @@ export class ToolExecutor {
 
       const duration = Date.now() - startTime
 
-      // 通知：执行完成
+      // 业务失败判定：handler 返回 { success: false } 时视为工具失败
+      if (result && typeof result === 'object' && result.success === false) {
+        const errorMsg = result.error || result.stderr || `命令退出码: ${result.exitCode ?? '未知'}`
+
+        this.emitEvent({
+          toolCallId: toolCall.id,
+          functionName: toolName,
+          status: 'error',
+          displayName: registered.displayName,
+          summary: errorMsg
+        })
+
+        return {
+          toolCallId: toolCall.id,
+          functionName: toolName,
+          arguments: args,
+          result,
+          status: 'error',
+          duration,
+          error: errorMsg
+        }
+      }
+
+      // 正常成功
       const summary = this.buildResultSummary(registered.displayName, result)
       this.emitEvent({
         toolCallId: toolCall.id,

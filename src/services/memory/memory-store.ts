@@ -1,7 +1,7 @@
 /**
  * 持久记忆系统 — 跨会话记住项目知识和用户偏好
  *
- * 存储结构：localStorage key = 'agent_memories'
+ * 存储结构：存储后端 key = 'agent_memories'
  * 每条记忆包含：类型、内容、标签、时间戳、来源会话
  *
  * 使用方式：
@@ -9,6 +9,8 @@
  * 2. 会话启动时自动加载相关记忆注入系统提示词
  * 3. 用户可在设置页查看/删除记忆
  */
+
+import { getStorageBackend } from '@/services/storage'
 
 // ============ 类型定义 ============
 
@@ -32,14 +34,15 @@ const MAX_MEMORIES = 200  // 最多存储 200 条记忆
 
 class MemoryStore {
   private memories: Memory[] = []
+  readonly ready: Promise<void>
 
   constructor() {
-    this.load()
+    this.ready = this.load()
   }
 
-  private load() {
+  private async load(): Promise<void> {
     try {
-      const saved = localStorage.getItem(STORAGE_KEY)
+      const saved = await getStorageBackend().get(STORAGE_KEY)
       if (saved) {
         this.memories = JSON.parse(saved)
       }
@@ -48,20 +51,23 @@ class MemoryStore {
     }
   }
 
-  private save() {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(this.memories))
+  private async save(): Promise<void> {
+    try {
+      await getStorageBackend().set(STORAGE_KEY, JSON.stringify(this.memories))
+    } catch { /* 写入失败不抛错 */ }
   }
 
   /**
    * 添加一条记忆
    */
-  add(params: {
+  async add(params: {
     type: MemoryType
     content: string
     tags?: string[]
     importance?: number
     sessionId?: string
-  }): Memory {
+  }): Promise<Memory> {
+    await this.ready
     const memory: Memory = {
       id: `mem-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
       type: params.type,
@@ -85,30 +91,32 @@ class MemoryStore {
       this.memories = this.memories.slice(0, MAX_MEMORIES)
     }
 
-    this.save()
+    await this.save()
     return memory
   }
 
   /**
    * 更新记忆内容
    */
-  update(id: string, content: string): Memory | null {
+  async update(id: string, content: string): Promise<Memory | null> {
+    await this.ready
     const memory = this.memories.find(m => m.id === id)
     if (!memory) return null
     memory.content = content
     memory.updatedAt = Date.now()
-    this.save()
+    await this.save()
     return memory
   }
 
   /**
    * 删除记忆
    */
-  delete(id: string): boolean {
+  async delete(id: string): Promise<boolean> {
+    await this.ready
     const index = this.memories.findIndex(m => m.id === id)
     if (index === -1) return false
     this.memories.splice(index, 1)
-    this.save()
+    await this.save()
     return true
   }
 
@@ -157,9 +165,9 @@ class MemoryStore {
   /**
    * 清空所有记忆
    */
-  clear() {
+  async clear(): Promise<void> {
     this.memories = []
-    this.save()
+    await this.save()
   }
 
   /**

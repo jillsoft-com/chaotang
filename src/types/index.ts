@@ -87,6 +87,8 @@ export interface Debate {
   workingDirectory?: string   // 会话工作目录，输出产物保存到此目录
   /** 附件列表（合同、文档等，注入朝议上下文） */
   attachments?: Attachment[]
+  /** 任务树快照（Agent 模式下使用，类型为 TaskTreeSnapshot） */
+  taskTreeSnapshot?: any
 }
 
 export interface ChatMessage {

@@ -18,6 +18,8 @@ import type { LoadedPlugin } from '@/services/plugins/types'
 import { getMessagingConfig, saveMessagingConfig, initMessaging, getWeComAdapter, startWebhookServer, stopWebhookServer } from '@/services/messaging'
 import { estimateTokens, estimateCost, formatCost, formatTokens, formatDuration } from '@/utils/token-utils'
 import type { Debate } from '@/types'
+import { gepaEngine } from '@/services/learning'
+import type { GEPAExport } from '@/services/learning/gepa-export'
 
 const router = useRouter()
 const debateStore = useDebateStore()
@@ -869,6 +871,116 @@ function formatDate(ts: number): string {
   const mi = String(d.getMinutes()).padStart(2, '0')
   return `${mm}-${dd} ${hh}:${mi}`
 }
+
+// ============ GEPA 学习成果导入/导出 ============
+
+const importingGEPA = ref(false)
+
+/**
+ * 从文件导入 GEPA 学习成果
+ */
+async function importGEPAData() {
+  importingGEPA.value = true
+  try {
+    // 通过 Electron API 打开文件选择对话框
+    if (!window.electronAPI?.showOpenDialog) {
+      ElMessage.warning('当前环境不支持文件选择（需要 Electron 桌面版）')
+      return
+    }
+
+    const result = await window.electronAPI.showOpenDialog({
+      properties: ['openFile'],
+      filters: [
+        { name: 'GEPA 学习成果', extensions: ['json'] },
+        { name: '所有文件', extensions: ['*'] }
+      ]
+    })
+
+    if (result.canceled || result.filePaths.length === 0) {
+      return // 用户取消
+    }
+
+    if (!result.fileToken) {
+      ElMessage.error('未获取到文件操作授权')
+      return
+    }
+
+    const filePath = result.filePaths[0]
+    const readResult = await window.electronAPI.readArbitraryFile(filePath, result.fileToken)
+
+    if (!readResult.success) {
+      ElMessage.error('读取文件失败：' + (readResult.error || '未知错误'))
+      return
+    }
+
+    // 解析 JSON
+    let gepaData: GEPAExport
+    try {
+      gepaData = JSON.parse(readResult.content || '{}')
+    } catch (e) {
+      ElMessage.error('文件格式错误：无法解析 JSON 数据')
+      return
+    }
+
+    // 验证数据格式
+    if (!gepaData.schemaVersion || !gepaData.patterns || !Array.isArray(gepaData.patterns)) {
+      ElMessage.error('文件格式错误：缺少 schemaVersion 或 patterns 字段')
+      return
+    }
+
+    // 调用引擎导入
+    const importResult = gepaEngine.importGEPAData(gepaData)
+
+    ElMessage.success(
+      `导入成功：新增 ${importResult.addedPatterns} 个模式，合并 ${importResult.mergedPatterns} 个模式`
+    )
+  } catch (error) {
+    ElMessage.error('导入失败：' + (error instanceof Error ? error.message : '未知错误'))
+  } finally {
+    importingGEPA.value = false
+  }
+}
+
+/**
+ * 导出 GEPA 学习成果到文件
+ */
+async function exportGEPAData() {
+  try {
+    const data = gepaEngine.exportGEPA()
+    const jsonStr = JSON.stringify(data, null, 2)
+
+    if (!window.electronAPI?.showSaveDialog) {
+      ElMessage.warning('当前环境不支持文件保存（需要 Electron 桌面版）')
+      return
+    }
+
+    const result = await window.electronAPI.showSaveDialog({
+      defaultPath: `gepa-export-${new Date().toISOString().slice(0, 10)}.json`,
+      filters: [
+        { name: 'GEPA 学习成果', extensions: ['json'] }
+      ]
+    })
+
+    if (result.canceled || !result.filePath) {
+      return // 用户取消
+    }
+
+    if (!result.fileToken) {
+      ElMessage.error('未获取到文件写入授权')
+      return
+    }
+
+    const writeResult = await window.electronAPI.writeArbitraryFile(result.filePath, jsonStr, result.fileToken)
+
+    if (writeResult?.success) {
+      ElMessage.success('导出成功')
+    } else {
+      ElMessage.error('导出失败：' + (writeResult?.error || '未知错误'))
+    }
+  } catch (error) {
+    ElMessage.error('导出失败：' + (error instanceof Error ? error.message : '未知错误'))
+  }
+}
 </script>
 
 <template>
@@ -1089,6 +1201,34 @@ function formatDate(ts: number): string {
                     </div>
                   </div>
                 </div>
+              </div>
+            </el-card>
+
+            <!-- 学习成果管理 -->
+            <el-card shadow="never" class="settings-card">
+              <h3 class="card-title">学习成果管理</h3>
+              <p class="card-desc">GEPA 引擎会从历史朝议中学习决策模式，导入/导出可在不同设备间迁移学习成果</p>
+              <div class="settings-item">
+                <div class="settings-item-info">
+                  <span class="settings-item-label">导入学习成果</span>
+                  <span class="settings-item-desc">从 JSON 文件导入之前导出的 GEPA 学习模式</span>
+                </div>
+                <el-button
+                  :loading="importingGEPA"
+                  @click="importGEPAData"
+                  size="small"
+                >
+                  导入
+                </el-button>
+              </div>
+              <div class="settings-item">
+                <div class="settings-item-info">
+                  <span class="settings-item-label">导出学习成果</span>
+                  <span class="settings-item-desc">将当前学习到的模式导出为 JSON 文件，用于备份或迁移</span>
+                </div>
+                <el-button @click="exportGEPAData" size="small">
+                  导出
+                </el-button>
               </div>
             </el-card>
 

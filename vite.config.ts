@@ -1,3 +1,4 @@
+/// <reference types="vitest" />
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { resolve } from 'path'
@@ -22,6 +23,15 @@ export default defineConfig({
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
       }
+    }
+  },
+  test: {
+    environment: 'happy-dom',
+    globals: true,
+    include: ['tests/unit/**/*.test.ts'],
+    coverage: {
+      provider: 'v8',
+      include: ['src/services/**/*.ts']
     }
   }
 })

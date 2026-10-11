@@ -9,6 +9,8 @@ import { backgroundScheduler } from '@/services/scheduler'
 import { gepaEngine } from '@/services/learning'
 import { parseActionItemsFromReport, parseActionItemsFromDecree, executeActionItems } from '@/services/agent/imperial-executor'
 import type { ExecutionReport } from '@/services/agent/imperial-executor'
+import type { TaskTreeSnapshot, TaskNode } from '@/services/agent/task-tree'
+import { transitionStatus } from '@/services/agent/task-tree'
 import {
   DYNASTY_PRESETS,
   getCurrentDynastyId,
@@ -699,6 +701,100 @@ export const useDebateStore = defineStore('debate', () => {
     return sessions.value.find(s => s.id === id) || null
   }
 
+  /**
+   * 保存任务树快照到朝议记录
+   */
+  function saveTaskTreeSnapshot(debateId: string, tree: TaskTreeSnapshot) {
+    const session = sessions.value.find(s => s.id === debateId)
+    if (session) {
+      session.taskTreeSnapshot = tree
+    }
+    // 同步到历史朝议
+    const existingIdx = debates.value.findIndex(d => d.id === debateId)
+    if (existingIdx !== -1) {
+      debates.value[existingIdx].taskTreeSnapshot = tree
+    } else if (session) {
+      // 新会话尚未进入历史，创建初始记录以确保快照落盘
+      debates.value.unshift({ ...session, speeches: [...session.speeches], taskTreeSnapshot: tree })
+    }
+    saveDebates()
+  }
+
+  /**
+   * 启动时扫描中断的任务树：将 running 节点标记为 interrupted
+   */
+  function markInterruptedTrees() {
+    for (const debate of debates.value) {
+      if (debate.taskTreeSnapshot) {
+        const tree = debate.taskTreeSnapshot
+        let changed = false
+        for (const node of Object.values(tree.nodes) as TaskNode[]) {
+          if (node.status === 'running') {
+            node.status = 'interrupted'
+            node.waitingReason = '应用关闭后状态未知'
+            changed = true
+          }
+        }
+        if (changed) {
+          tree.state = 'interrupted'
+          tree.updatedAt = Date.now()
+          saveDebates()
+        }
+      }
+    }
+    // 同时检查活动会话
+    for (const session of sessions.value) {
+      if (session.taskTreeSnapshot) {
+        const tree = session.taskTreeSnapshot
+        for (const node of Object.values(tree.nodes) as TaskNode[]) {
+          if (node.status === 'running') {
+            node.status = 'interrupted'
+            node.waitingReason = '应用关闭后状态未知'
+          }
+        }
+        if (tree.state === 'running') {
+          tree.state = 'interrupted'
+        }
+      }
+    }
+  }
+
+  /**
+   * 恢复中断的任务树：用户选择“继续”或“终止”
+   */
+  function recoverInterruptedTree(debateId: string, action: 'resume' | 'abort'): boolean {
+    const session = sessions.value.find(s => s.id === debateId)
+    if (!session?.taskTreeSnapshot) return false
+
+    const tree = session.taskTreeSnapshot
+    if (tree.state !== 'interrupted') return false
+
+    if (action === 'resume') {
+      // 将 interrupted 节点标记为 ready，重新执行
+      for (const node of Object.values(tree.nodes) as TaskNode[]) {
+        if (node.status === 'interrupted') {
+          transitionStatus(tree, node.id, 'ready', '用户确认继续')
+        }
+      }
+      tree.state = 'running'
+    } else {
+      // 将 interrupted 节点标记为 cancelled
+      for (const node of Object.values(tree.nodes) as TaskNode[]) {
+        if (node.status === 'interrupted' || node.status === 'ready' || node.status === 'pending') {
+          transitionStatus(tree, node.id, 'cancelled', '用户终止')
+        }
+      }
+      tree.state = 'cancelled'
+    }
+
+    tree.updatedAt = Date.now()
+    saveTaskTreeSnapshot(debateId, tree)
+    return true
+  }
+
+  // 初始化时扫描中断状态
+  markInterruptedTrees()
+
   return {
     ministers,
     sessions,
@@ -740,6 +836,8 @@ export const useDebateStore = defineStore('debate', () => {
     searchDebates,
     scheduleFollowUp,
     scheduleLongDebate,
-    executeImperialDecree
+    executeImperialDecree,
+    saveTaskTreeSnapshot,
+    recoverInterruptedTree
   }
 })

@@ -11,6 +11,7 @@
  */
 
 import type { Debate, DecisionReport } from '@/types'
+import { importGEPA, exportGEPA, type GEPAExport, type ImportResult } from './gepa-export'
 
 // ============ 类型 ============
 
@@ -397,6 +398,31 @@ class GEPAEngine {
       const haystack = `${p.name} ${p.trigger} ${p.solution}`.toLowerCase()
       return keywords.some(k => haystack.includes(k.toLowerCase()))
     })
+  }
+
+  /**
+   * R9: 导入外部 GEPA 数据（合并到引擎并持久化）
+   */
+  importGEPAData(data: GEPAExport): ImportResult {
+    const existing = Array.from(this.patterns.values())
+    const result = importGEPA(existing, data)
+
+    // 将合并后的模式重新加载到 Map
+    for (const p of existing) {
+      const keywords = this.extractKeywords(`${p.trigger} ${p.solution}`)
+      const key = keywords.slice(0, 3).join('_') || p.id
+      this.patterns.set(key, p)
+    }
+    this.saveData()
+    return result
+  }
+
+  /**
+   * 导出 GEPA 学习成果
+   */
+  exportGEPA(): GEPAExport {
+    const patterns = Array.from(this.patterns.values())
+    return exportGEPA(patterns, this.events, 'gepa-engine', true)
   }
 
   // ============ 持久化 ============

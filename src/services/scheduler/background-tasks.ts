@@ -10,6 +10,9 @@
  * Sprint C - #9
  */
 
+import { wakeEventBus } from './wake-event'
+import type { WakeEvent } from './wake-event'
+
 // ============ 类型 ============
 
 export type BackgroundTaskStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
@@ -312,6 +315,20 @@ class BackgroundScheduler {
       task.lastResult = result.slice(0, 500)
       task.lastRunAt = Date.now()
       task.runCount++
+
+      // 如果任务关联了朝议，投递唤醒事件给任务树
+      if (task.debateId) {
+        const wakeEvent: WakeEvent = {
+          sourceId: task.id,
+          targetRunId: task.debateId,
+          triggerType: task.type === 'follow-up' ? 'external_event' : 'time',
+          dedupKey: `bg-${task.id}-${task.runCount}`,
+          authorization: 'auto',
+          timestamp: Date.now(),
+          payload: { taskType: task.type, title: task.title }
+        }
+        wakeEventBus.publish(wakeEvent)
+      }
 
       // 周期任务：安排下次执行
       if (task.type === 'interval' || task.type === 'follow-up' || task.type === 'long-debate') {

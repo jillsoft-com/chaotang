@@ -1,5 +1,8 @@
 import type { LLMConfig, LLMTestResult } from '@/types/llm'
 import { ref } from 'vue'
+import { getStorageBackend } from '@/services/storage'
+
+const STORAGE_KEY = 'llm_configs'
 
 class LLMService {
   private configs = ref<LLMConfig[]>([])
@@ -10,7 +13,8 @@ class LLMService {
   }
 
   private async loadConfigs(): Promise<void> {
-    const saved = localStorage.getItem('llm_configs')
+    const backend = getStorageBackend()
+    const saved = await backend.get(STORAGE_KEY)
     if (saved) {
       try {
         this.configs.value = JSON.parse(saved)
@@ -42,11 +46,13 @@ class LLMService {
     }
   }
 
-  private saveMetadata(): void {
+  private async saveMetadata(): Promise<void> {
     const configs = window.electronAPI
       ? this.configs.value.map(({ apiKey, ...config }) => config)
       : this.configs.value
-    localStorage.setItem('llm_configs', JSON.stringify(configs))
+    try {
+      await getStorageBackend().set(STORAGE_KEY, JSON.stringify(configs))
+    } catch { /* 写入失败不抛错 */ }
   }
 
   private async persistKeys(configs: LLMConfig[]): Promise<void> {

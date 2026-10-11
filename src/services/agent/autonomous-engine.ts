@@ -24,7 +24,9 @@ import type { LLMProvider } from '@/services/llm/types'
 import { createProvider } from '@/services/llm'
 import { llmService } from '@/services/llm-config'
 import { toolExecutor } from '@/services/tools/executor'
-import { compressContext, getCompressThreshold, countMessageChars } from './context-compressor'
+import { compressContext } from './context-compressor'
+import { ContextManager } from './context-manager'
+import { WRITE_TOOLS } from './resource-lock'
 
 // ============ 类型 ============
 
@@ -40,6 +42,10 @@ export interface AutonomousConfig {
   agentsMdHint?: string
   /** 持久记忆（可选） */
   memoryHint?: string
+  /** 模型标识（用于 ContextManager 容量判断） */
+  modelId?: string
+  /** 是否为只读节点（阻止写工具调用） */
+  readOnly?: boolean
 }
 
 export const DEFAULT_AUTONOMOUS_CONFIG: AutonomousConfig = {
@@ -66,6 +72,21 @@ export interface AutonomousEvent {
 
 type AutonomousEventCallback = (event: AutonomousEvent) => void
 
+/** 检查点状态（心跳监护者使用） */
+export interface CheckpointState {
+  round: number
+  toolCallsCount: number
+  goalReached: boolean
+  aborted: boolean
+  lastContent: string
+  /** 最近 5 次工具调用指纹（供监护器循环检测） */
+  recentToolFingerprints: string[]
+  /** 最后一次有效进展时间 */
+  lastProgressAt: number
+  /** 工具证据摘要（简短描述） */
+  evidenceSummary: string
+}
+
 /** 自主执行结果 */
 export interface AutonomousResult {
   /** 最终输出内容 */
@@ -78,6 +99,8 @@ export interface AutonomousResult {
   goalReached: boolean
   /** 总耗时（毫秒） */
   duration: number
+  /** 是否被外部中止 */
+  aborted?: boolean
   /** 总 Token 消耗（估算） */
   tokenEstimate?: {
     promptTokens: number
@@ -190,8 +213,14 @@ export class AutonomousEngine {
     toolDefs: ToolDefinition[]
     onContent: (text: string) => void
     onBeforeToolExecute?: (toolCall: ToolCall) => Promise<boolean>
+    /** 外部中止信号（心跳监护者/用户暂停） */
+    abortSignal?: AbortSignal
+    /** 每轮结束后的检查点回调 */
+    onCheckpoint?: (state: CheckpointState) => void
+    /** 每次工具调用后的回调（用于预算追踪）；返回 false 表示预算耗尽，引擎应中止 */
+    onToolCall?: () => boolean | void
   }): Promise<AutonomousResult> {
-    const { provider, systemPrompt, goal, taskContext, toolDefs, onContent, onBeforeToolExecute } = params
+    const { provider, systemPrompt, goal, taskContext, toolDefs, onContent, onBeforeToolExecute, abortSignal, onCheckpoint, onToolCall } = params
     const startTime = Date.now()
     const allToolCalls: ToolCallResult[] = []
     let finalContent = ''
@@ -215,8 +244,16 @@ export class AutonomousEngine {
     ]
 
     // 自主执行循环
+    let aborted = false
     for (let round = 0; round < this.config.maxIterations; round++) {
       iterations = round + 1
+
+      // 检查外部中止信号
+      if (abortSignal?.aborted) {
+        aborted = true
+        this.emit({ type: 'complete', data: { round: round + 1, aborted: true } })
+        break
+      }
 
       this.emit({ type: 'executing', data: { round: round + 1, maxRounds: this.config.maxIterations } })
 
@@ -262,6 +299,12 @@ export class AutonomousEngine {
 
       // 执行每个工具调用
       for (const tc of pendingToolCalls) {
+        // 每次工具执行前检查中止信号
+        if (abortSignal?.aborted) {
+          aborted = true
+          break
+        }
+
         // 路径解析：工作目录自动拼接
         this.resolveToolPaths(tc, workingDirectory)
 
@@ -306,6 +349,37 @@ export class AutonomousEngine {
           } catch { /* 忽略 */ }
         }
 
+        // P0: 运行时只读授权——在执行前拦截写工具调用
+        if (this.config.readOnly && WRITE_TOOLS.has(tc.function.name)) {
+          allToolCalls.push({
+            toolCallId: tc.id, functionName: tc.function.name, arguments: {},
+            result: { success: false, error: '只读节点不允许调用写工具' },
+            status: 'error', duration: 0, error: '只读权限拦截'
+          })
+          messages.push({
+            role: 'tool',
+            content: JSON.stringify({ success: false, error: '当前任务为只读模式，不允许执行写操作。请改用分析/调研方式完成任务。' }),
+            tool_call_id: tc.id, name: tc.function.name
+          })
+          continue
+        }
+
+        // P1: 执行前原子预留预算额度
+        if (onToolCall) {
+          const reserved = onToolCall()
+          if (reserved === false) {
+            // 预算耗尽：不执行工具，直接中止
+            allToolCalls.push({
+              toolCallId: tc.id, functionName: tc.function.name, arguments: {},
+              result: { success: false, error: '工具调用预算已耗尽' },
+              status: 'error', duration: 0, error: '预算耗尽'
+            })
+            aborted = true
+            this.emit({ type: 'complete', data: { round: round + 1, reason: 'budget_exhausted' } })
+            break
+          }
+        }
+
         // 执行工具
         const result = await toolExecutor.execute(tc)
         allToolCalls.push(result)
@@ -348,6 +422,45 @@ export class AutonomousEngine {
         await this.compressIfNeeded(messages)
       }
 
+      // 检查点回调
+      if (onCheckpoint) {
+        // 计算最近 5 次工具调用指纹
+        const recentFps = allToolCalls.slice(-5).map(tc => {
+          const normArgs = JSON.stringify(tc.arguments, Object.keys(tc.arguments || {}).sort())
+          return `${tc.functionName}:${normArgs}`
+        })
+
+        // 计算最后有效进展时间（成功的写操作/编译/测试）
+        const progressTools = ['write_file', 'execute_command', 'run_tests', 'git_operation']
+        let lastProgress = startTime
+        for (let i = allToolCalls.length - 1; i >= 0; i--) {
+          if (allToolCalls[i].status === 'success' && progressTools.includes(allToolCalls[i].functionName)) {
+            lastProgress = startTime + allToolCalls.slice(0, i + 1).reduce((sum, tc) => sum + tc.duration, 0)
+            break
+          }
+        }
+
+        // 工具证据摘要
+        const evidenceLines = allToolCalls.slice(-3).map(tc => {
+          const status = tc.status === 'success' ? '✅' : '❌'
+          return `${status} ${tc.functionName}`
+        }).join('; ')
+
+        onCheckpoint({
+          round: round + 1,
+          toolCallsCount: allToolCalls.length,
+          goalReached,
+          aborted,
+          lastContent: finalContent,
+          recentToolFingerprints: recentFps,
+          lastProgressAt: lastProgress,
+          evidenceSummary: evidenceLines
+        })
+      }
+
+      // 如果已中止，跳出主循环
+      if (aborted) break
+
       this.emit({ type: 'iterating', data: { nextRound: round + 2 } })
     }
 
@@ -361,7 +474,8 @@ export class AutonomousEngine {
       toolCalls: allToolCalls,
       iterations,
       goalReached,
-      duration
+      duration,
+      aborted: aborted || undefined
     }
   }
 
@@ -427,16 +541,16 @@ export class AutonomousEngine {
   }
 
   /**
-   * 上下文压缩
+   * 上下文压缩（R8：通过 ContextManager 按模型容量管理）
    */
   private async compressIfNeeded(messages: ChatMessage[]): Promise<void> {
-    const threshold = getCompressThreshold()
-    const totalChars = countMessageChars(messages)
-    if (totalChars > threshold) {
+    const ctxMgr = new ContextManager(this.config.modelId || 'unknown')
+    const ctxMessages = messages.map(m => ({ role: m.role as 'system' | 'user' | 'assistant', content: typeof m.content === 'string' ? m.content : '' }))
+    if (ctxMgr.exceedsContextLimit(ctxMessages)) {
       const summaryProvider = this.getSummaryProvider()
       if (summaryProvider) {
         try {
-          const compressed = await compressContext(messages, summaryProvider, threshold)
+          const compressed = await compressContext(messages, summaryProvider, ctxMgr.getAvailableChars())
           messages.splice(0, messages.length, ...compressed)
         } catch (e) {
           console.warn('[AutonomousEngine] 上下文压缩失败:', e)

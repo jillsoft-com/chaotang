@@ -11,6 +11,11 @@ interface ElectronAPI {
   version: string
   loadApiKeys: () => Promise<Record<string, string>>
   saveApiKeys: (keys: Record<string, string>) => Promise<boolean>
+  storeGet: (key: string) => Promise<string | null>
+  storeGetAll: () => Promise<Record<string, string>>
+  storeSet: (key: string, value: string) => Promise<boolean>
+  storeDelete: (key: string) => Promise<boolean>
+  storeGetPath: () => Promise<string>
   readFile: (filePath: string) => Promise<{ success: boolean; content?: string; error?: string }>
   writeFile: (filePath: string, content: string) => Promise<{ success: boolean; path?: string; size?: number; error?: string }>
   createDirectory: (dirPath: string) => Promise<{ success: boolean; path?: string; error?: string }>
@@ -75,12 +80,12 @@ interface ElectronAPI {
     title?: string
     defaultPath?: string
     filters?: Array<{ name: string; extensions: string[] }>
-  }) => Promise<{ canceled: boolean; filePaths: string[]; error?: string }>
+  }) => Promise<{ canceled: boolean; filePaths: string[]; fileToken?: string; error?: string }>
   showSaveDialog: (options: {
     title?: string
     defaultPath?: string
     filters?: Array<{ name: string; extensions: string[] }>
-  }) => Promise<{ canceled: boolean; filePath?: string; error?: string }>
+  }) => Promise<{ canceled: boolean; filePath?: string; fileToken?: string; error?: string }>
 
   // 沙箱配置
   getSandboxConfig: () => Promise<{
@@ -111,6 +116,10 @@ interface ElectronAPI {
     fileType?: string
     error?: string
   }>
+
+  // 任意文件读写（对话框授权的一次性令牌机制）
+  readArbitraryFile: (filePath: string, token: string) => Promise<{ success: boolean; content?: string; error?: string }>
+  writeArbitraryFile: (filePath: string, content: string, token: string) => Promise<{ success: boolean; path?: string; size?: number; error?: string }>
 
   // 浏览器自动化
   browserAction: (params: {

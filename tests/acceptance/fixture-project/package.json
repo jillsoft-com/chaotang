@@ -1,0 +1,7 @@
+{
+  "name": "chaotang-acceptance-fixture",
+  "private": true,
+  "scripts": {
+    "test": "node --test test/pricing.test.cjs"
+  }
+}

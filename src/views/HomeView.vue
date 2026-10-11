@@ -20,6 +20,9 @@ const showSidebar = ref(true)
 const selectedMinisters = ref<Set<string>>(new Set(['chancellor']))
 
 function toggleMinisterSelection(ministerId: string) {
+  // 丞相为必选角色，不可取消
+  if (ministerId === 'chancellor') return
+
   const newSet = new Set(selectedMinisters.value)
   if (newSet.has(ministerId)) {
     newSet.delete(ministerId)
@@ -238,6 +241,10 @@ function startDebate() {
     // 始终传递复选框选中的角色列表
     ministersForSession = Array.from(selectedMinisters.value)
   }
+  // 丞相始终参与（无论通过 @ 还是复选框选择）
+  if (!ministersForSession.includes('chancellor')) {
+    ministersForSession.unshift('chancellor')
+  }
   const dir = workingDirectory.value.trim() || undefined
   const atts = attachments.value.length > 0 ? [...attachments.value] : undefined
   debateStore.startDebate(topic.value, 'court', ministersForSession, dir, atts)
@@ -411,6 +418,8 @@ function doApplyTemplate(tpl: TopicTemplate, values: Record<string, string>) {
         ministerSet.add(id)
       }
     }
+    // 丞相始终保留在选中列表中
+    ministerSet.add('chancellor')
     // 保留已选中的角色，同时加入模板推荐的角色
     for (const id of selectedMinisters.value) {
       ministerSet.add(id)
@@ -710,16 +719,18 @@ onUnmounted(() => {
                 :key="minister.id"
                 shadow="hover"
                 class="minister-card"
-                :class="{ selected: selectedMinisters.has(minister.id) }"
+                :class="{ selected: selectedMinisters.has(minister.id), 'minister-required': minister.id === 'chancellor' }"
                 :body-style="{ padding: '20px', display: 'flex', alignItems: 'center', gap: '16px' }"
                 @click="summonMinister(minister.id)"
               >
                 <div class="minister-checkbox" @click.stop>
                   <el-checkbox
                     :model-value="selectedMinisters.has(minister.id)"
+                    :disabled="minister.id === 'chancellor'"
                     @change="toggleMinisterSelection(minister.id)"
                   />
                 </div>
+                <span v-if="minister.id === 'chancellor'" class="minister-required-badge">必选</span>
                 <div class="minister-avatar">{{ minister.avatar }}</div>
                 <div class="minister-info">
                   <div class="minister-name">{{ minister.name }}</div>
@@ -1644,6 +1655,20 @@ onUnmounted(() => {
   position: absolute;
   top: 8px;
   right: 8px;
+  z-index: 1;
+}
+
+.minister-required-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  font-size: 10px;
+  color: var(--ct-accent);
+  background: rgba(212, 175, 55, 0.12);
+  border: 1px solid var(--ct-accent);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-weight: 600;
   z-index: 1;
 }
 

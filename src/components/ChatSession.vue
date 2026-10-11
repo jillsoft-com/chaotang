@@ -10,6 +10,7 @@ import { estimateTokens } from '@/utils/token-utils'
 import { exportDebateToMarkdown } from '@/utils/export-markdown'
 import type { Speech, LLMConfig, ToolCall, Attachment } from '@/types'
 import { CoordinatorAgent } from '@/services/agent'
+import { taskScheduler } from '@/services/agent'
 import { compressContext, getCompressThreshold, countMessageChars } from '@/services/agent/context-compressor'
 import { memoryStore } from '@/services/memory'
 import { skillRegistry } from '@/services/skills'
@@ -182,6 +183,51 @@ async function exportToMarkdown() {
     }
   } else {
     // 浏览器环境：下载
+    const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = fileName
+    a.click()
+    URL.revokeObjectURL(url)
+    ElMessage.success('已下载')
+  }
+}
+
+// ============ 导出事件日志 ============
+
+/** 导出当前会话的任务树事件日志 */
+async function exportEventLog() {
+  if (!session.value) return
+  const snapshot = session.value.taskTreeSnapshot
+  if (!snapshot) {
+    ElMessage.warning('该会话没有任务树记录')
+    return
+  }
+
+  const runId = snapshot.runId
+  const md = taskScheduler.exportEventLog(runId, 'markdown')
+  const fileName = `event-log-${session.value.topic?.slice(0, 20) || runId}.md`
+
+  if (window.electronAPI?.showSaveDialog) {
+    try {
+      const result = await window.electronAPI.showSaveDialog({
+        title: '导出事件日志',
+        defaultPath: fileName,
+        filters: [{ name: 'Markdown', extensions: ['md'] }]
+      })
+      if (!result.canceled && result.filePath) {
+        const writeResult = await window.electronAPI.writeFile(result.filePath, md)
+        if (writeResult?.success) {
+          ElMessage.success('事件日志已导出')
+        } else {
+          ElMessage.error('导出失败：' + (writeResult?.error || '未知错误'))
+        }
+      }
+    } catch (err) {
+      ElMessage.error('导出失败')
+    }
+  } else {
     const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -645,9 +691,6 @@ async function retrySpeech(speech: Speech) {
 
 // 朝议模式：从 store 读取（全局共享）
 const debateMode = computed(() => debateStore.debateMode)
-
-// 自主执行模式（Agent 模式子选项，每个 Worker 可自主迭代：执行→验证→修正）
-const autonomousMode = ref(false)
 
 // 智能自动滚动：用户手动上滚后不再强制拉回底部
 let lastScrollTime = 0
@@ -1314,25 +1357,32 @@ async function runAgentDebate() {
 
   const agent = new CoordinatorAgent({
     planMode: true,
-    autonomousMode: autonomousMode.value,
     autonomousMaxIterations: 10
   })
 
   // Plan Mode 确认回调
-  const onPlanReady = async () => {
-    try {
-      await ElMessageBox.confirm(
-        '丞相已拆解完成，是否批准执行？',
-        '📋 执行计划确认',
-        {
-          confirmButtonText: '批准执行',
-          cancelButtonText: '取消',
-          type: 'info'
+  const onPlanReady = async (_plan: any) => {
+    while (true) {
+      try {
+        await ElMessageBox.confirm(
+          '丞相已拆解完成，是否批准执行？',
+          '📋 执行计划确认',
+          {
+            confirmButtonText: '批准执行',
+            cancelButtonText: '取消',
+            distinguishCancelAndClose: true,
+            type: 'info'
+          }
+        )
+        return true
+      } catch (action) {
+        if (action === 'cancel') {
+          // 用户点击取消
+          return false
         }
-      )
-      return true
-    } catch {
-      return false
+        // ESC 关闭也返回 false
+        return false
+      }
     }
   }
 
@@ -1344,7 +1394,7 @@ async function runAgentDebate() {
 
   // 监听 Agent 事件，自动滚动
   agent.onEvent((event) => {
-    if (['worker-start', 'worker-done', 'synthesizing', 'complete'].includes(event.type)) {
+    if (['worker-start', 'worker-done', 'node-completed', 'node-failed', 'tree-created', 'tree-completed', 'tree-failed', 'guardian-alert', 'synthesizing', 'complete'].includes(event.type)) {
       nextTick(() => {
         isNearBottom = true
         scrollToBottom()
@@ -1362,8 +1412,52 @@ async function runAgentDebate() {
       getReactiveSpeech: (speechId) => session.value!.speeches.find(s => s.id === speechId)!,
       shouldContinue: () => !!session.value && session.value.status === 'running',
       workingDirectory: session.value.workingDirectory,
+      debateId: session.value.id,
       onPlanReady,
-      onBeforeToolExecute
+      onBeforeToolExecute,
+      saveSnapshot: (tree: any) => {
+        if (session.value) {
+          session.value.taskTreeSnapshot = tree
+          debateStore.saveTaskTreeSnapshot(session.value.id, tree)
+        }
+      },
+      onRetryNode: async (_nodeId: string, reason: string) => {
+        try {
+          await ElMessageBox.confirm(
+            `监护器检测到问题：${reason}\n\n是否重试该节点？`,
+            '🛡️ 执行监护报警',
+            {
+              confirmButtonText: '重试',
+              cancelButtonText: '跳过',
+              distinguishCancelAndClose: true,
+              type: 'warning'
+            }
+          )
+          return true
+        } catch {
+          return false
+        }
+      },
+      onRecoverInterrupted: async () => {
+        const session_val = session.value
+        if (!session_val?.taskTreeSnapshot || session_val.taskTreeSnapshot.state !== 'interrupted') return { choice: 'restart' as const }
+        try {
+          await ElMessageBox.confirm(
+            '检测到上次中断的任务树，是否继续执行？',
+            '🔄 恢复中断任务',
+            {
+              confirmButtonText: '继续执行',
+              cancelButtonText: '重新开始',
+              distinguishCancelAndClose: true,
+              type: 'warning'
+            }
+          )
+          return { choice: 'resume' as const, tree: session_val.taskTreeSnapshot }
+        } catch (action) {
+          if (action === 'cancel') return { choice: 'restart' as const }
+          return { choice: null } // ESC 关闭 = 取消
+        }
+      }
     })
   } catch (error) {
     console.error('[Agent] 协作流程失败:', error)
@@ -1519,25 +1613,28 @@ async function sendCourtMessage() {
     if (chancellor && workers.length > 0) {
       const agent = new CoordinatorAgent({
         planMode: true,
-        autonomousMode: autonomousMode.value,
         autonomousMaxIterations: 10
       })
 
       // Plan Mode 确认回调
-      const onPlanReady = async () => {
-        try {
-          await ElMessageBox.confirm(
-            '丞相已拆解完成，是否批准执行？',
-            '📋 执行计划确认',
-            {
-              confirmButtonText: '批准执行',
-              cancelButtonText: '取消',
-              type: 'info'
-            }
-          )
-          return true
-        } catch {
-          return false
+      const onPlanReady = async (_plan: any) => {
+        while (true) {
+          try {
+            await ElMessageBox.confirm(
+              '丞相已拆解完成，是否批准执行？',
+              '📋 执行计划确认',
+              {
+                confirmButtonText: '批准执行',
+                cancelButtonText: '取消',
+                distinguishCancelAndClose: true,
+                type: 'info'
+              }
+            )
+            return true
+          } catch (action) {
+            if (action === 'cancel') return false
+            return false
+          }
         }
       }
 
@@ -1548,7 +1645,7 @@ async function sendCourtMessage() {
       }
 
       agent.onEvent((event) => {
-        if (['worker-start', 'worker-done', 'synthesizing', 'complete'].includes(event.type)) {
+        if (['worker-start', 'worker-done', 'node-completed', 'node-failed', 'tree-created', 'tree-completed', 'tree-failed', 'guardian-alert', 'synthesizing', 'complete'].includes(event.type)) {
           nextTick(() => { isNearBottom = true; scrollToBottom() })
         }
       })
@@ -1563,8 +1660,52 @@ async function sendCourtMessage() {
           getReactiveSpeech: (speechId) => session.value!.speeches.find(s => s.id === speechId)!,
           shouldContinue: () => !!session.value && session.value.status === 'running',
           workingDirectory: session.value!.workingDirectory,
+          debateId: session.value!.id,
           onPlanReady,
-          onBeforeToolExecute
+          onBeforeToolExecute,
+          saveSnapshot: (tree: any) => {
+            if (session.value) {
+              session.value.taskTreeSnapshot = tree
+              debateStore.saveTaskTreeSnapshot(session.value.id, tree)
+            }
+          },
+          onRetryNode: async (_nodeId: string, reason: string) => {
+            try {
+              await ElMessageBox.confirm(
+                `监护器检测到问题：${reason}\n\n是否重试该节点？`,
+                '🛡️ 执行监护报警',
+                {
+                  confirmButtonText: '重试',
+                  cancelButtonText: '跳过',
+                  distinguishCancelAndClose: true,
+                  type: 'warning'
+                }
+              )
+              return true
+            } catch {
+              return false
+            }
+          },
+          onRecoverInterrupted: async () => {
+            const session_val = session.value
+            if (!session_val?.taskTreeSnapshot || session_val.taskTreeSnapshot.state !== 'interrupted') return { choice: 'restart' as const }
+            try {
+              await ElMessageBox.confirm(
+                '检测到上次中断的任务树，是否继续执行？',
+                '🔄 恢复中断任务',
+                {
+                  confirmButtonText: '继续执行',
+                  cancelButtonText: '重新开始',
+                  distinguishCancelAndClose: true,
+                  type: 'warning'
+                }
+              )
+              return { choice: 'resume' as const, tree: session_val.taskTreeSnapshot }
+            } catch (action) {
+              if (action === 'cancel') return { choice: 'restart' as const }
+              return { choice: null }
+            }
+          }
         })
       } catch (error) {
         console.error('[Agent] 协作流程失败:', error)
@@ -2101,6 +2242,11 @@ function renderMarkdown(content: string): string {
                 <el-icon><Download /></el-icon>
               </el-button>
             </el-tooltip>
+            <el-tooltip v-if="session?.taskTreeSnapshot" content="导出任务树事件日志" placement="top">
+              <el-button size="small" circle @click="exportEventLog" class="toolbar-icon-btn">
+                📋
+              </el-button>
+            </el-tooltip>
           </div>
           <div class="toolbar-right">
             <!-- 工作目录（只读展示） -->
@@ -2179,9 +2325,6 @@ function renderMarkdown(content: string): string {
               <el-radio-button value="parallel">并行</el-radio-button>
               <el-radio-button value="agent">Agent</el-radio-button>
             </el-radio-group>
-            <el-tooltip v-if="debateStore.debateMode === 'agent'" content="自主执行：每个角色可自主迭代（写→跑→验证→修复）" placement="top">
-              <el-switch v-model="autonomousMode" size="small" class="autonomous-switch" />
-            </el-tooltip>
             <el-tooltip content="添加附件" placement="top">
               <el-button size="small" circle :loading="attachingSessionFile" @click="addSessionAttachment" class="toolbar-icon-btn">
                 <template v-if="!attachingSessionFile">📎</template>
@@ -3471,11 +3614,5 @@ function renderMarkdown(content: string): string {
 @keyframes fadeIn {
   from { opacity: 0; }
   to { opacity: 1; }
-}
-
-/* 自主执行开关 */
-.autonomous-switch {
-  margin-left: 6px;
-  --el-switch-on-color: var(--ct-accent);
 }
 </style>

@@ -1,0 +1,7 @@
+{
+  "url": "file:///D:/Workspace/ChaoTang/dist/index.html#/",
+  "body": "朝堂\n新的会话\n历史朝议\n🏛️\nCT_NO_MODEL_42：请讨论此事\n🐲\n圣上\n圣谕\n\nCT_NO_MODEL_42：请讨论此事\n\n📋 复制\n👑\n丞相\n百官之长\ngpt-4o-mini\n错误\n\n进言失败：Failed to fetch\n\n⚖️ 众大臣已进言完毕，请圣上定夺\n拍板\n退朝\n串行\n并行\nAgent\n📎\n📂\n📋\n🔍\n🏯 明朝\n🏛️ CT_NO_MODEL_42：请讨论此事\n串行\n1 个会话",
+  "blockedRequests": [
+    "https://api.openai.com/v1/chat/completions"
+  ]
+}

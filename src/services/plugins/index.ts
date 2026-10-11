@@ -15,3 +15,13 @@ export {
 } from './plugin-manager'
 export { pluginMarketplace } from './marketplace'
 export type { MarketplacePlugin, InstallResult } from './marketplace'
+export {
+  compileInSandbox,
+  createSandboxContext,
+  getPluginGrants,
+  grantPlugin,
+  revokePlugin,
+  isPluginGranted,
+  isSensitiveTool
+} from './sandbox'
+export type { PluginGrant, PluginTrustLevel } from './sandbox'
