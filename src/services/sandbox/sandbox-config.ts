@@ -1,3 +1,4 @@
+import { appStorage } from '@/services/storage'
 /**
  * SandboxConfig — 沙箱配置管理
  *
@@ -12,7 +13,7 @@ const STORAGE_KEY = 'sandbox_config'
 /** 获取沙箱配置 */
 export function getSandboxConfig(): SandboxConfig {
   try {
-    const saved = localStorage.getItem(STORAGE_KEY)
+    const saved = appStorage.getItem(STORAGE_KEY)
     if (saved) {
       const parsed = JSON.parse(saved)
       return { ...DEFAULT_SANDBOX_CONFIG, ...parsed }
@@ -30,10 +31,10 @@ export function saveSandboxConfig(config: Partial<SandboxConfig>): void {
   // 校验值域
   merged.maxMemoryMB = Math.max(128, Math.min(2048, merged.maxMemoryMB))
   merged.maxTimeout = Math.max(10000, Math.min(300000, merged.maxTimeout))
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(merged))
+  appStorage.setItem(STORAGE_KEY, JSON.stringify(merged))
 }
 
 /** 重置为默认配置 */
 export function resetSandboxConfig(): void {
-  localStorage.removeItem(STORAGE_KEY)
+  appStorage.removeItem(STORAGE_KEY)
 }

@@ -145,18 +145,44 @@ app.whenReady().then(() => {
 
   // ============ IPC: 本地键值存储（核心数据持久化到 userData/chaotang-store.json）============
   const storeFile = path.join(app.getPath('userData'), 'chaotang-store.json')
+  const storeBackupFile = storeFile + '.bak'
   let storeCache = null
+  let recoveredFromBackup = false
+
+  function parseStore(file) {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf-8'))
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) ||
+        Object.values(parsed).some(value => typeof value !== 'string')) {
+      throw new Error('本地存储文件格式无效')
+    }
+    return parsed
+  }
 
   function readStore() {
     if (storeCache) return storeCache
-    try {
-      if (fs.existsSync(storeFile)) {
-        storeCache = JSON.parse(fs.readFileSync(storeFile, 'utf-8'))
+    if (!fs.existsSync(storeFile)) {
+      if (fs.existsSync(storeBackupFile)) {
+        storeCache = parseStore(storeBackupFile)
+        recoveredFromBackup = true
+        console.error('[Storage] 主文件缺失，已从备份读取')
       } else {
         storeCache = {}
       }
-    } catch {
-      storeCache = {}
+      return storeCache
+    }
+    try {
+      storeCache = parseStore(storeFile)
+    } catch (error) {
+      if (!fs.existsSync(storeBackupFile)) {
+        throw new Error(`本地存储损坏且无备份：${error.message}`)
+      }
+      try {
+        storeCache = parseStore(storeBackupFile)
+        recoveredFromBackup = true
+        console.error('[Storage] 主文件损坏，已从备份读取；请检查最近一次写入')
+      } catch (backupError) {
+        throw new Error(`本地存储及备份均损坏：${backupError.message}`)
+      }
     }
     return storeCache
   }
@@ -166,32 +192,50 @@ app.whenReady().then(() => {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
     const tmp = storeFile + '.tmp'
     fs.writeFileSync(tmp, JSON.stringify(data), { mode: 0o600 })
+    if (fs.existsSync(storeFile) && !recoveredFromBackup) {
+      fs.copyFileSync(storeFile, storeBackupFile)
+    }
     fs.renameSync(tmp, storeFile)
     storeCache = data
+    recoveredFromBackup = false
+  }
+
+  function validateStoreKey(key) {
+    if (typeof key !== 'string' || !key || key.length > 200) throw new Error('store key 无效')
+  }
+
+  function setStoreValue(key, value) {
+    validateStoreKey(key)
+    if (typeof value !== 'string') throw new Error('store value 必须为字符串')
+    const data = { ...readStore(), [key]: value }
+    writeStore(data)
+    return true
+  }
+
+  function deleteStoreValue(key) {
+    validateStoreKey(key)
+    const data = { ...readStore() }
+    delete data[key]
+    writeStore(data)
+    return true
   }
 
   ipcMain.handle('store-get', (_event, key) => {
-    if (typeof key !== 'string' || key.length > 200) throw new Error('store key 无效')
+    validateStoreKey(key)
     return readStore()[key] ?? null
   })
 
   ipcMain.handle('store-get-all', () => readStore())
 
-  ipcMain.handle('store-set', (_event, key, value) => {
-    if (typeof key !== 'string' || key.length > 200) throw new Error('store key 无效')
-    if (typeof value !== 'string') throw new Error('store value 必须为字符串')
-    const data = readStore()
-    data[key] = value
-    writeStore(data)
-    return true
+  ipcMain.handle('store-set', (_event, key, value) => setStoreValue(key, value))
+  ipcMain.handle('store-delete', (_event, key) => deleteStoreValue(key))
+  ipcMain.on('store-set-sync', (event, key, value) => {
+    try { event.returnValue = { success: setStoreValue(key, value) } }
+    catch (error) { event.returnValue = { success: false, error: error.message } }
   })
-
-  ipcMain.handle('store-delete', (_event, key) => {
-    if (typeof key !== 'string' || key.length > 200) throw new Error('store key 无效')
-    const data = readStore()
-    delete data[key]
-    writeStore(data)
-    return true
+  ipcMain.on('store-delete-sync', (event, key) => {
+    try { event.returnValue = { success: deleteStoreValue(key) } }
+    catch (error) { event.returnValue = { success: false, error: error.message } }
   })
 
   ipcMain.handle('store-get-path', () => storeFile)

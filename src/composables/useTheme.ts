@@ -1,3 +1,4 @@
+import { appStorage } from '@/services/storage'
 import { ref, watch } from 'vue'
 
 const THEME_KEY = 'chaotang_theme'
@@ -5,7 +6,7 @@ const THEME_KEY = 'chaotang_theme'
 const isDark = ref(false)
 
 function initTheme() {
-  const saved = localStorage.getItem(THEME_KEY)
+  const saved = appStorage.getItem(THEME_KEY)
   if (saved !== null) {
     isDark.value = saved === 'dark'
   } else {
@@ -33,7 +34,7 @@ function setTheme(dark: boolean) {
 }
 
 watch(isDark, () => {
-  localStorage.setItem(THEME_KEY, isDark.value ? 'dark' : 'light')
+  appStorage.setItem(THEME_KEY, isDark.value ? 'dark' : 'light')
   applyTheme()
 })
 

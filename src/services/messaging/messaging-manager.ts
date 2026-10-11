@@ -1,3 +1,4 @@
+import { appStorage } from '@/services/storage'
 /**
  * MessagingManager — 消息集成管理器
  *
@@ -26,7 +27,7 @@ let serverRunning = false
  */
 export function getMessagingConfig(): MessagingConfig {
   try {
-    const saved = localStorage.getItem(CONFIG_KEY)
+    const saved = appStorage.getItem(CONFIG_KEY)
     if (saved) {
       return { ...DEFAULT_MESSAGING_CONFIG, ...JSON.parse(saved) }
     }
@@ -42,7 +43,7 @@ export function getMessagingConfig(): MessagingConfig {
 export function saveMessagingConfig(config: Partial<MessagingConfig>): void {
   const current = getMessagingConfig()
   const merged = { ...current, ...config }
-  localStorage.setItem(CONFIG_KEY, JSON.stringify(merged))
+  appStorage.setItem(CONFIG_KEY, JSON.stringify(merged))
 }
 
 /**

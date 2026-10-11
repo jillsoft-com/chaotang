@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { appStorage } from '@/services/storage'
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useDebateStore } from '@/stores/debate'
@@ -98,11 +99,11 @@ const contextCompressThreshold = ref(50000)
 // 字体大小
 const MIN_FONT = 12
 const MAX_FONT = 22
-const messageFontSize = ref(parseInt(localStorage.getItem('message_font_size') || '15', 10))
+const messageFontSize = ref(parseInt(appStorage.getItem('message_font_size') || '15', 10))
 
 function saveFontSize(val: number) {
   messageFontSize.value = val
-  localStorage.setItem('message_font_size', String(val))
+  appStorage.setItem('message_font_size', String(val))
 }
 
 // 朝代主题
@@ -351,16 +352,16 @@ onMounted(() => {
 })
 
 function loadSummaryModel() {
-  summaryModelId.value = localStorage.getItem('summary_model_id') || ''
+  summaryModelId.value = appStorage.getItem('summary_model_id') || ''
 }
 
 function saveSummaryModel() {
-  localStorage.setItem('summary_model_id', summaryModelId.value)
+  appStorage.setItem('summary_model_id', summaryModelId.value)
   ElMessage.success('摘要模型已保存')
 }
 
 function loadMaxToolRounds() {
-  const saved = localStorage.getItem('max_tool_rounds')
+  const saved = appStorage.getItem('max_tool_rounds')
   if (saved) {
     const val = parseInt(saved, 10)
     if (val > 0 && val <= 100) maxToolRounds.value = val
@@ -368,12 +369,12 @@ function loadMaxToolRounds() {
 }
 
 function saveMaxToolRounds() {
-  localStorage.setItem('max_tool_rounds', String(maxToolRounds.value))
+  appStorage.setItem('max_tool_rounds', String(maxToolRounds.value))
   ElMessage.success('工具调用轮次已保存')
 }
 
 function loadCompressThreshold() {
-  const saved = localStorage.getItem('context_compress_threshold')
+  const saved = appStorage.getItem('context_compress_threshold')
   if (saved) {
     const val = parseInt(saved, 10)
     if (val > 10000 && val <= 200000) contextCompressThreshold.value = val
@@ -381,12 +382,12 @@ function loadCompressThreshold() {
 }
 
 function saveCompressThreshold() {
-  localStorage.setItem('context_compress_threshold', String(contextCompressThreshold.value))
+  appStorage.setItem('context_compress_threshold', String(contextCompressThreshold.value))
   ElMessage.success('压缩阈值已保存')
 }
 
 function loadMinisterLLMMap() {
-  const saved = localStorage.getItem('minister_llm_map')
+  const saved = appStorage.getItem('minister_llm_map')
   if (saved) {
     ministerLLMMap.value = JSON.parse(saved)
   } else {
@@ -401,7 +402,7 @@ function loadMinisterLLMMap() {
 }
 
 function saveMinisterLLMMap() {
-  localStorage.setItem('minister_llm_map', JSON.stringify(ministerLLMMap.value))
+  appStorage.setItem('minister_llm_map', JSON.stringify(ministerLLMMap.value))
 }
 
 function openAddLLMDialog() {
@@ -521,9 +522,13 @@ async function deleteLLMConfig(id: string) {
   }
 }
 
-function setDefaultLLM(id: string) {
-  llmService.setDefault(id)
-  ElMessage.success('已设为默认')
+async function setDefaultLLM(id: string) {
+  try {
+    await llmService.setDefault(id)
+    ElMessage.success('已设为默认')
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '保存失败')
+  }
 }
 
 function saveMinisterConfig(ministerId: string) {

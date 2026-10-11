@@ -15,6 +15,8 @@ interface ElectronAPI {
   storeGetAll: () => Promise<Record<string, string>>
   storeSet: (key: string, value: string) => Promise<boolean>
   storeDelete: (key: string) => Promise<boolean>
+  storeSetSync: (key: string, value: string) => void
+  storeDeleteSync: (key: string) => void
   storeGetPath: () => Promise<string>
   readFile: (filePath: string) => Promise<{ success: boolean; content?: string; error?: string }>
   writeFile: (filePath: string, content: string) => Promise<{ success: boolean; path?: string; size?: number; error?: string }>

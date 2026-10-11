@@ -42,19 +42,17 @@ export class IndexedDBBackend implements StorageBackend {
       const tx = db.transaction(STORE_NAME, mode)
       const store = tx.objectStore(STORE_NAME)
       const request = fn(store)
-
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(new Error(`IndexedDB 操作失败: ${request.error?.message}`))
+      let result: T
+      request.onsuccess = () => { result = request.result }
+      tx.oncomplete = () => resolve(result)
+      tx.onerror = () => reject(new Error(`IndexedDB 操作失败: ${tx.error?.message}`))
+      tx.onabort = () => reject(new Error(`IndexedDB 事务中止: ${tx.error?.message}`))
     })
   }
 
   async get(key: string): Promise<string | null> {
-    try {
-      const result = await this.withStore('readonly', store => store.get(key))
-      return typeof result === 'string' ? result : null
-    } catch {
-      return null
-    }
+    const result = await this.withStore('readonly', store => store.get(key))
+    return typeof result === 'string' ? result : null
   }
 
   async set(key: string, value: string): Promise<void> {

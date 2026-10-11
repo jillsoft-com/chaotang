@@ -29,13 +29,9 @@ export class FileStorageBackend implements StorageBackend {
   }
 
   private async doLoad(): Promise<void> {
-    try {
-      const result = await window.electronAPI!.storeGetAll()
-      this.store = new Map(Object.entries(result || {}))
-      this.filePath = await window.electronAPI!.storeGetPath?.() ?? null
-    } catch {
-      this.store = new Map()
-    }
+    const result = await window.electronAPI!.storeGetAll()
+    this.store = new Map(Object.entries(result || {}))
+    this.filePath = await window.electronAPI!.storeGetPath?.() ?? null
   }
 
   async get(key: string): Promise<string | null> {
@@ -45,14 +41,25 @@ export class FileStorageBackend implements StorageBackend {
 
   async set(key: string, value: string): Promise<void> {
     await this.ensureLoaded()
-    this.store!.set(key, value)
     await window.electronAPI!.storeSet(key, value)
+    this.store!.set(key, value)
   }
 
   async delete(key: string): Promise<void> {
     await this.ensureLoaded()
-    this.store!.delete(key)
     await window.electronAPI!.storeDelete(key)
+    this.store!.delete(key)
+  }
+
+  /** 同步提交关键业务数据，确保关闭窗口前已落盘。 */
+  setSync(key: string, value: string): void {
+    window.electronAPI!.storeSetSync(key, value)
+    this.store?.set(key, value)
+  }
+
+  deleteSync(key: string): void {
+    window.electronAPI!.storeDeleteSync(key)
+    this.store?.delete(key)
   }
 
   async keys(prefix?: string): Promise<string[]> {

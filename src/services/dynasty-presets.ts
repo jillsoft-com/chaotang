@@ -1,3 +1,4 @@
+import { appStorage } from '@/services/storage'
 /**
  * 朝代官职称预设
  *
@@ -207,14 +208,14 @@ const OLD_CUSTOM_NAMES_KEY = 'dynasty_custom_names' // 旧版兼容
  * 获取当前选中的朝代 ID
  */
 export function getCurrentDynastyId(): string {
-  return localStorage.getItem(DYNASTY_STORAGE_KEY) || 'ming'
+  return appStorage.getItem(DYNASTY_STORAGE_KEY) || 'ming'
 }
 
 /**
  * 设置当前朝代
  */
 export function setCurrentDynastyId(dynastyId: string): void {
-  localStorage.setItem(DYNASTY_STORAGE_KEY, dynastyId)
+  appStorage.setItem(DYNASTY_STORAGE_KEY, dynastyId)
 }
 
 // ============================================================
@@ -227,7 +228,7 @@ export function setCurrentDynastyId(dynastyId: string): void {
 export function getCustomThemes(): DynastyPreset[] {
   // 首次调用时做旧数据迁移
   migrateOldCustomNames()
-  const saved = localStorage.getItem(CUSTOM_THEMES_KEY)
+  const saved = appStorage.getItem(CUSTOM_THEMES_KEY)
   if (saved) {
     try {
       return JSON.parse(saved)
@@ -242,7 +243,7 @@ export function getCustomThemes(): DynastyPreset[] {
  * 保存所有自定义主题
  */
 export function saveCustomThemes(themes: DynastyPreset[]): void {
-  localStorage.setItem(CUSTOM_THEMES_KEY, JSON.stringify(themes))
+  appStorage.setItem(CUSTOM_THEMES_KEY, JSON.stringify(themes))
 }
 
 /**
@@ -336,7 +337,7 @@ function migrateOldCustomNames(): void {
   if (_migrated) return
   _migrated = true
 
-  const oldData = localStorage.getItem(OLD_CUSTOM_NAMES_KEY)
+  const oldData = appStorage.getItem(OLD_CUSTOM_NAMES_KEY)
   if (!oldData) return
 
   try {
@@ -357,7 +358,7 @@ function migrateOldCustomNames(): void {
   } catch {
     // ignore
   }
-  localStorage.removeItem(OLD_CUSTOM_NAMES_KEY)
+  appStorage.removeItem(OLD_CUSTOM_NAMES_KEY)
 }
 
 // ============================================================

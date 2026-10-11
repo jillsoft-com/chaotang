@@ -9,6 +9,9 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { LocalStorageBackend } from '@/services/storage/local-storage'
+import { setStorageBackend, resetStorageBackend } from '@/services/storage/factory'
+import { initializeAppStorage, flushAppStorage, resetAppStorageForTest } from '@/services/storage/app-storage'
 import {
   compileInSandbox,
   createSandboxContext,
@@ -20,11 +23,17 @@ import {
 } from '@/services/plugins/sandbox'
 
 describe('插件沙箱', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     localStorage.clear()
+    resetAppStorageForTest()
+    setStorageBackend(new LocalStorageBackend(''))
+    await initializeAppStorage()
   })
 
-  afterEach(() => {
+  afterEach(async () => {
+    await flushAppStorage()
+    resetAppStorageForTest()
+    resetStorageBackend()
     localStorage.clear()
   })
 
@@ -116,12 +125,14 @@ describe('插件沙箱', () => {
       expect(isPluginGranted('plugin-1', 'write_file')).toBe(false)
     })
 
-    it('授权记录持久化到 localStorage', () => {
+    it('授权记录持久化到所选存储后端', async () => {
       grantPlugin('plugin-1', ['write_file'])
+      await flushAppStorage()
       const grants = getPluginGrants()
       expect(grants).toHaveLength(1)
       expect(grants[0].pluginId).toBe('plugin-1')
       expect(grants[0].grantedTools).toContain('write_file')
+      expect(localStorage.getItem('ct_plugin_grants')).toContain('plugin-1')
     })
 
     it('合并已有授权', () => {

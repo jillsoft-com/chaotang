@@ -34,6 +34,7 @@ const MAX_MEMORIES = 200  // 最多存储 200 条记忆
 
 class MemoryStore {
   private memories: Memory[] = []
+  private writeQueue: Promise<void> = Promise.resolve()
   readonly ready: Promise<void>
 
   constructor() {
@@ -41,20 +42,18 @@ class MemoryStore {
   }
 
   private async load(): Promise<void> {
-    try {
-      const saved = await getStorageBackend().get(STORAGE_KEY)
-      if (saved) {
-        this.memories = JSON.parse(saved)
-      }
-    } catch {
-      this.memories = []
-    }
+    const saved = await getStorageBackend().get(STORAGE_KEY)
+    if (saved) this.memories = JSON.parse(saved)
   }
 
-  private async save(): Promise<void> {
-    try {
-      await getStorageBackend().set(STORAGE_KEY, JSON.stringify(this.memories))
-    } catch { /* 写入失败不抛错 */ }
+  private async save(values: Memory[]): Promise<void> {
+    await getStorageBackend().set(STORAGE_KEY, JSON.stringify(values))
+  }
+
+  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.writeQueue.then(operation)
+    this.writeQueue = result.then(() => {}, () => {})
+    return result
   }
 
   /**
@@ -68,6 +67,7 @@ class MemoryStore {
     sessionId?: string
   }): Promise<Memory> {
     await this.ready
+    return this.enqueue(async () => {
     const memory: Memory = {
       id: `mem-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
       type: params.type,
@@ -79,20 +79,22 @@ class MemoryStore {
       importance: params.importance || 3
     }
 
-    this.memories.push(memory)
+    let next = [...this.memories, memory]
 
     // 超出上限时删除最旧的记忆（按 importance 和 updatedAt 排序）
-    if (this.memories.length > MAX_MEMORIES) {
-      this.memories.sort((a, b) => {
+    if (next.length > MAX_MEMORIES) {
+      next.sort((a, b) => {
         // 先按 importance 降序，再按 updatedAt 降序
         if (b.importance !== a.importance) return b.importance - a.importance
         return b.updatedAt - a.updatedAt
       })
-      this.memories = this.memories.slice(0, MAX_MEMORIES)
+      next = next.slice(0, MAX_MEMORIES)
     }
 
-    await this.save()
+    await this.save(next)
+    this.memories = next
     return memory
+    })
   }
 
   /**
@@ -100,12 +102,15 @@ class MemoryStore {
    */
   async update(id: string, content: string): Promise<Memory | null> {
     await this.ready
+    return this.enqueue(async () => {
     const memory = this.memories.find(m => m.id === id)
     if (!memory) return null
-    memory.content = content
-    memory.updatedAt = Date.now()
-    await this.save()
-    return memory
+    const updated = { ...memory, content, updatedAt: Date.now() }
+    const next = this.memories.map(item => item.id === id ? updated : item)
+    await this.save(next)
+    this.memories = next
+    return updated
+    })
   }
 
   /**
@@ -113,11 +118,14 @@ class MemoryStore {
    */
   async delete(id: string): Promise<boolean> {
     await this.ready
+    return this.enqueue(async () => {
     const index = this.memories.findIndex(m => m.id === id)
     if (index === -1) return false
-    this.memories.splice(index, 1)
-    await this.save()
+    const next = this.memories.filter(m => m.id !== id)
+    await this.save(next)
+    this.memories = next
     return true
+    })
   }
 
   /**
@@ -166,8 +174,11 @@ class MemoryStore {
    * 清空所有记忆
    */
   async clear(): Promise<void> {
-    this.memories = []
-    await this.save()
+    await this.ready
+    return this.enqueue(async () => {
+      await this.save([])
+      this.memories = []
+    })
   }
 
   /**

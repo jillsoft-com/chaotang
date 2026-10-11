@@ -40,7 +40,7 @@ export function getStorageBackend(): StorageBackend {
     _backend = new IndexedDBBackend()
     console.log('[Storage] 使用 IndexedDB 后端')
   } else {
-    _backend = new LocalStorageBackend()
+    _backend = new LocalStorageBackend('')
     console.log('[Storage] 降级使用 localStorage')
   }
 

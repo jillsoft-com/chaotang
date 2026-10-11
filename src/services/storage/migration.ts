@@ -7,19 +7,10 @@
  * 3. 迁移成功后标记完成（保留旧数据作为备份）
  * 4. 失败回滚：保留旧数据 + 记录状态
  *
- * 迁移状态记录在 localStorage（`ct_migration_status`）
+ * 迁移状态记录在 localStorage（`ct_migration_status_v2`）
  */
 
 import type { StorageBackend } from './types'
-
-/** 需要迁移的键列表 */
-const MIGRATION_KEYS = [
-  'debates_history',
-  'debate_mode',
-  'llm_configs',
-  'background_tasks',
-  'plugin_grants'
-]
 
 /** 迁移状态 */
 export interface MigrationStatus {
@@ -30,7 +21,34 @@ export interface MigrationStatus {
   migratedKeys: string[]
 }
 
-const STATUS_KEY = 'ct_migration_status'
+const STATUS_KEY = 'ct_migration_status_v2'
+const BACKEND_MARKER = '__legacy_migration_v2'
+
+async function prepareValue(key: string, value: string): Promise<string> {
+  if (key !== 'llm_configs' || !window.electronAPI) return value
+  let configs: Array<Record<string, unknown>>
+  try {
+    const parsed = JSON.parse(value)
+    if (!Array.isArray(parsed)) throw new Error('格式不是数组')
+    configs = parsed
+  } catch { throw new Error('旧模型配置格式无效，已保留原数据，未写入新存储') }
+
+  const legacyKeys: Record<string, string> = {}
+  const metadata = configs.map(config => {
+    const { apiKey, ...rest } = config
+    if (typeof apiKey === 'string' && apiKey && typeof config.id === 'string') {
+      legacyKeys[config.id] = apiKey
+    }
+    return rest
+  })
+  if (Object.keys(legacyKeys).length > 0) {
+    const existing = await window.electronAPI.loadApiKeys()
+    if (!await window.electronAPI.saveApiKeys({ ...legacyKeys, ...existing })) {
+      throw new Error('旧版 API Key 加密保存失败')
+    }
+  }
+  return JSON.stringify(metadata)
+}
 
 /**
  * 获取迁移状态
@@ -59,8 +77,8 @@ function saveMigrationStatus(status: MigrationStatus): void {
 export async function migrateData(backend: StorageBackend): Promise<MigrationStatus> {
   const status = getMigrationStatus()
 
-  // 已完成迁移，跳过
-  if (status.state === 'completed') {
+  // 以目标后端标记为准；浏览器存储中的旧标记不能证明目标数据仍存在。
+  if (status.state === 'completed' && await backend.get(BACKEND_MARKER) === 'completed') {
     return status
   }
 
@@ -73,14 +91,35 @@ export async function migrateData(backend: StorageBackend): Promise<MigrationSta
   saveMigrationStatus(newStatus)
 
   try {
-    for (const key of MIGRATION_KEYS) {
+    const keys: string[] = []
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i)
+      if (key && key !== STATUS_KEY && key !== 'ct_migration_status') keys.push(key)
+    }
+    for (const key of keys) {
       const value = localStorage.getItem(key)
       if (value === null) continue
-
-      // 写入新后端
-      await backend.set(key, value)
-      newStatus.migratedKeys.push(key)
+      // 即便配置元数据已进入新后端，也要补迁旧版明文 API Key。
+      // prepareValue 会先保存到 Electron 的加密密钥文件，再去掉元数据中的明文。
+      const prepared = await prepareValue(key, value)
+      // 已写入文件的较新值优先；重试迁移也不能覆盖它。
+      const existing = await backend.get(key)
+      if (existing === null) {
+        await backend.set(key, prepared)
+        if (await backend.get(key) !== prepared) throw new Error(`迁移校验失败: ${key}`)
+        newStatus.migratedKeys.push(key)
+      } else if (key === 'llm_configs') {
+        const sanitized = await prepareValue(key, existing)
+        if (sanitized !== existing) {
+          await backend.set(key, sanitized)
+          if (await backend.get(key) !== sanitized) throw new Error(`迁移校验失败: ${key}`)
+        }
+      }
+      // 已确认加密密钥保存成功且目标元数据可读，清除旧浏览器副本中的明文密钥。
+      if (key === 'llm_configs' && prepared !== value) localStorage.setItem(key, prepared)
     }
+
+    await backend.set(BACKEND_MARKER, 'completed')
 
     // 标记完成
     newStatus.state = 'completed'

@@ -1,3 +1,4 @@
+import { appStorage } from '@/services/storage'
 /**
  * 角色-Skill 默认绑定配置
  *
@@ -317,26 +318,26 @@ export function initializeSkills(): void {
   }
 
   // 2. 建立默认绑定（仅在首次初始化时，版本控制确保新技能能补绑）
-  const initialized = localStorage.getItem('skills_initialized_v10')
+  const initialized = appStorage.getItem('skills_initialized_v10')
   if (!initialized) {
     // 清除旧版本标记
-    localStorage.removeItem('skills_initialized')
-    localStorage.removeItem('skills_initialized_v2')
-    localStorage.removeItem('skills_initialized_v3')
-    localStorage.removeItem('skills_initialized_v4')
-    localStorage.removeItem('skills_initialized_v5')
-    localStorage.removeItem('skills_initialized_v6')
-    localStorage.removeItem('skills_initialized_v7')
-    localStorage.removeItem('skills_initialized_v8')
-    localStorage.removeItem('skills_initialized_v9')
-    localStorage.removeItem('minister_skill_bindings')
+    appStorage.removeItem('skills_initialized')
+    appStorage.removeItem('skills_initialized_v2')
+    appStorage.removeItem('skills_initialized_v3')
+    appStorage.removeItem('skills_initialized_v4')
+    appStorage.removeItem('skills_initialized_v5')
+    appStorage.removeItem('skills_initialized_v6')
+    appStorage.removeItem('skills_initialized_v7')
+    appStorage.removeItem('skills_initialized_v8')
+    appStorage.removeItem('skills_initialized_v9')
+    appStorage.removeItem('minister_skill_bindings')
     // 重新加载绑定（清除后为空）
     for (const [ministerId, skillIds] of Object.entries(defaultMinisterSkills)) {
       for (const skillId of skillIds) {
         skillRegistry.bindSkillToMinister(skillId, ministerId)
       }
     }
-    localStorage.setItem('skills_initialized_v10', 'true')
+    appStorage.setItem('skills_initialized_v10', 'true')
   }
 
   // 3. 加载自定义插件

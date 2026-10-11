@@ -1,3 +1,4 @@
+import { appStorage } from '@/services/storage'
 import { defineStore } from 'pinia'
 import { ref, computed, watch } from 'vue'
 import type { Minister, Debate, Speech, DebateMode, DecisionReport, LLMConfig, Attachment } from '@/types'
@@ -34,12 +35,12 @@ export const useDebateStore = defineStore('debate', () => {
 
   // 朝议执行模式（全局偏好，所有朝议共享）
   const debateMode = ref<DebateMode>(
-    (localStorage.getItem('debate_mode') as DebateMode) || 'serial'
+    (appStorage.getItem('debate_mode') as DebateMode) || 'serial'
   )
 
   // 加载历史朝议
   function loadDebates() {
-    const saved = localStorage.getItem('debates_history')
+    const saved = appStorage.getItem('debates_history')
     if (saved) {
       try {
         debates.value = JSON.parse(saved)
@@ -50,7 +51,7 @@ export const useDebateStore = defineStore('debate', () => {
   }
 
   function saveDebates() {
-    localStorage.setItem('debates_history', JSON.stringify(debates.value))
+    appStorage.setItem('debates_history', JSON.stringify(debates.value))
   }
 
   // 初始化时加载
@@ -68,7 +69,7 @@ export const useDebateStore = defineStore('debate', () => {
   )
 
   function initializeMinisters() {
-    const savedConfig = localStorage.getItem('minister_llm_config')
+    const savedConfig = appStorage.getItem('minister_llm_config')
     const customConfig = savedConfig ? JSON.parse(savedConfig) : {}
 
     const ministerDefs = [
@@ -84,7 +85,7 @@ export const useDebateStore = defineStore('debate', () => {
     applyDynastyTheme(ministerDefs)
 
     // 应用自定义头像覆盖
-    const customAvatars = JSON.parse(localStorage.getItem('minister_custom_avatars') || '{}') as Record<string, string>
+    const customAvatars = JSON.parse(appStorage.getItem('minister_custom_avatars') || '{}') as Record<string, string>
 
     ministers.value = ministerDefs.map(def => {
       const promptConfig = promptService.getPrompt(def.id)
@@ -113,13 +114,13 @@ export const useDebateStore = defineStore('debate', () => {
 
   // 设置角色自定义头像
   function setMinisterAvatar(ministerId: string, avatar: string): void {
-    const saved = JSON.parse(localStorage.getItem('minister_custom_avatars') || '{}') as Record<string, string>
+    const saved = JSON.parse(appStorage.getItem('minister_custom_avatars') || '{}') as Record<string, string>
     if (avatar) {
       saved[ministerId] = avatar
     } else {
       delete saved[ministerId]
     }
-    localStorage.setItem('minister_custom_avatars', JSON.stringify(saved))
+    appStorage.setItem('minister_custom_avatars', JSON.stringify(saved))
     // 更新当前内存中的大臣对象
     const minister = ministers.value.find(m => m.id === ministerId)
     if (minister) {
@@ -195,7 +196,7 @@ export const useDebateStore = defineStore('debate', () => {
 
   // 监听模式变化，持久化到 localStorage
   watch(debateMode, (mode) => {
-    localStorage.setItem('debate_mode', mode)
+    appStorage.setItem('debate_mode', mode)
   })
 
   function startDebate(topic: string, mode: 'court' | 'compare' = 'court', mentionedMinisters?: string[], workingDirectory?: string, attachments?: Attachment[]) {
@@ -488,10 +489,10 @@ export const useDebateStore = defineStore('debate', () => {
   }
 
   function saveMinisterLLMConfig(ministerId: string, llmConfig: { provider: LLMProviderType; model: string; llmId?: string }) {
-    const savedConfig = localStorage.getItem('minister_llm_config')
+    const savedConfig = appStorage.getItem('minister_llm_config')
     const config = savedConfig ? JSON.parse(savedConfig) : {}
     config[ministerId] = llmConfig
-    localStorage.setItem('minister_llm_config', JSON.stringify(config))
+    appStorage.setItem('minister_llm_config', JSON.stringify(config))
 
     const minister = ministers.value.find(m => m.id === ministerId)
     if (minister) {
@@ -500,7 +501,7 @@ export const useDebateStore = defineStore('debate', () => {
   }
 
   function resetMinisterLLMConfig() {
-    localStorage.removeItem('minister_llm_config')
+    appStorage.removeItem('minister_llm_config')
     initializeMinisters()
   }
 

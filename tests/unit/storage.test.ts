@@ -7,9 +7,12 @@
  * - 工厂自动选择
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { LocalStorageBackend } from '@/services/storage/local-storage'
 import { migrateData, getMigrationStatus, cleanupMigratedData } from '@/services/storage/migration'
+import { FileStorageBackend } from '@/services/storage/file-storage'
+import { setStorageBackend, resetStorageBackend } from '@/services/storage/factory'
+import { appStorage, flushAppStorage, initializeAppStorage, resetAppStorageForTest } from '@/services/storage/app-storage'
 import type { StorageBackend } from '@/services/storage/types'
 
 describe('LocalStorageBackend', () => {
@@ -67,9 +70,10 @@ describe('数据迁移', () => {
   beforeEach(() => {
     localStorage.clear()
     store.clear()
+    delete (window as { electronAPI?: unknown }).electronAPI
     backend = {
       name: 'mock',
-      get: async (key) => store.get(key) || null,
+      get: async (key) => store.get(key) ?? null,
       set: async (key, value) => { store.set(key, value) },
       delete: async (key) => { store.delete(key) },
       keys: async () => Array.from(store.keys()),
@@ -94,16 +98,71 @@ describe('数据迁移', () => {
     expect(store.get('debates_history')).toBe('[{"id":"1"}]')
   })
 
-  it('已完成的迁移不重复执行', async () => {
+  it('目标数据丢失时重新迁移旧数据', async () => {
     localStorage.setItem('debates_history', '[{"id":"1"}]')
 
     await migrateData(backend)
-    store.clear() // 模拟后端已持久化
+    store.clear() // 模拟目标文件丢失，旧数据仍在
 
     const result = await migrateData(backend)
     expect(result.state).toBe('completed')
-    // 不应重新写入
-    expect(store.size).toBe(0)
+    expect(store.get('debates_history')).toBe('[{"id":"1"}]')
+  })
+
+  it('迁移全部旧键，并保留旧数据', async () => {
+    const keys = ['debates_history', 'agent_memories', 'gepa_patterns', 'background_tasks', 'theme', 'custom_key']
+    keys.forEach((key, i) => localStorage.setItem(key, `value-${i}`))
+    const result = await migrateData(backend)
+    expect(result.state).toBe('completed')
+    keys.forEach((key, i) => {
+      expect(store.get(key)).toBe(`value-${i}`)
+      expect(localStorage.getItem(key)).toBe(`value-${i}`)
+    })
+  })
+
+  it('重试不会覆盖目标中较新的数据', async () => {
+    localStorage.setItem('debates_history', 'old')
+    store.set('debates_history', 'new')
+    const result = await migrateData(backend)
+    expect(result.state).toBe('completed')
+    expect(store.get('debates_history')).toBe('new')
+  })
+
+  it('迁移 Electron 旧版明文 API Key，目标已有元数据时也补迁密钥', async () => {
+    const loadApiKeys = vi.fn(async () => ({}))
+    const saveApiKeys = vi.fn(async () => true)
+    Object.defineProperty(window, 'electronAPI', {
+      configurable: true,
+      value: { loadApiKeys, saveApiKeys }
+    })
+    localStorage.setItem('llm_configs', JSON.stringify([{ id: 'model-1', model: 'example', apiKey: 'secret-value' }]))
+    store.set('llm_configs', JSON.stringify([{ id: 'model-1', model: 'newer' }]))
+    await migrateData(backend)
+    expect(saveApiKeys).toHaveBeenCalledWith({ 'model-1': 'secret-value' })
+    expect(store.get('llm_configs')).not.toContain('secret-value')
+    expect(localStorage.getItem('llm_configs')).not.toContain('secret-value')
+  })
+
+  it('迁移首次写入的 Electron 元数据不含明文 API Key', async () => {
+    Object.defineProperty(window, 'electronAPI', {
+      configurable: true,
+      value: { loadApiKeys: async () => ({}), saveApiKeys: async () => true }
+    })
+    localStorage.setItem('llm_configs', JSON.stringify([{ id: 'model-1', apiKey: 'secret-value' }]))
+    expect((await migrateData(backend)).state).toBe('completed')
+    expect(store.get('llm_configs')).toBe('[{"id":"model-1"}]')
+    expect(localStorage.getItem('llm_configs')).toBe('[{"id":"model-1"}]')
+  })
+
+  it('加密保存失败时保留旧 API Key 且不写入新文件', async () => {
+    Object.defineProperty(window, 'electronAPI', {
+      configurable: true,
+      value: { loadApiKeys: async () => ({}), saveApiKeys: async () => false }
+    })
+    localStorage.setItem('llm_configs', JSON.stringify([{ id: 'model-1', apiKey: 'secret-value' }]))
+    expect((await migrateData(backend)).state).toBe('failed')
+    expect(localStorage.getItem('llm_configs')).toContain('secret-value')
+    expect(store.has('llm_configs')).toBe(false)
   })
 
   it('无旧数据时迁移成功（空迁移）', async () => {
@@ -157,5 +216,100 @@ describe('数据迁移', () => {
     status = getMigrationStatus()
     expect(status.state).toBe('completed')
     expect(status.completedAt).toBeTruthy()
+  })
+})
+
+describe('Electron 文件存储业务接入', () => {
+  const file = new Map<string, string>()
+
+  beforeEach(() => {
+    localStorage.clear()
+    file.clear()
+    resetAppStorageForTest()
+    resetStorageBackend()
+    Object.defineProperty(window, 'electronAPI', {
+      configurable: true,
+      value: {
+        storeGetAll: async () => Object.fromEntries(file),
+        storeGetPath: async () => 'test/chaotang-store.json',
+        storeSet: async (key: string, value: string) => { file.set(key, value); return true },
+        storeDelete: async (key: string) => { file.delete(key); return true },
+        storeSetSync: (key: string, value: string) => { file.set(key, value) },
+        storeDeleteSync: (key: string) => { file.delete(key) },
+        loadApiKeys: async () => ({}),
+        saveApiKeys: async () => true
+      }
+    })
+  })
+
+  afterEach(() => {
+    resetAppStorageForTest()
+    resetStorageBackend()
+    delete (window as { electronAPI?: unknown }).electronAPI
+    localStorage.clear()
+  })
+
+  it('启动迁移旧数据，业务写入立即落盘，重新加载后读回', async () => {
+    localStorage.setItem('debates_history', '[{"id":"old"}]')
+    setStorageBackend(new FileStorageBackend())
+    await initializeAppStorage()
+    expect(appStorage.getItem('debates_history')).toBe('[{"id":"old"}]')
+
+    appStorage.setItem('debates_history', '[{"id":"new"}]')
+    expect(file.get('debates_history')).toBe('[{"id":"new"}]')
+
+    resetAppStorageForTest()
+    setStorageBackend(new FileStorageBackend())
+    await initializeAppStorage()
+    expect(appStorage.getItem('debates_history')).toBe('[{"id":"new"}]')
+  })
+
+  it('同步写入失败时业务缓存保持旧值', async () => {
+    setStorageBackend(new FileStorageBackend())
+    await initializeAppStorage()
+    appStorage.setItem('key', 'old')
+    const api = window.electronAPI!
+    api.storeSetSync = () => { throw new Error('磁盘满') }
+    expect(() => appStorage.setItem('key', 'new')).toThrow('磁盘满')
+    expect(appStorage.getItem('key')).toBe('old')
+  })
+})
+
+describe('浏览器异步写入', () => {
+  beforeEach(() => {
+    localStorage.clear()
+    resetAppStorageForTest()
+    resetStorageBackend()
+    delete (window as { electronAPI?: unknown }).electronAPI
+  })
+
+  afterEach(() => {
+    resetAppStorageForTest()
+    resetStorageBackend()
+    localStorage.clear()
+  })
+
+  it('写入失败时恢复缓存并让调用方可检查错误', async () => {
+    const file = new Map<string, string>()
+    file.set('key', 'old')
+    const backend: StorageBackend = {
+      name: 'indexedDB',
+      get: async key => file.get(key) ?? null,
+      set: async (key, value) => {
+        if (key === 'key') throw new Error('配额不足')
+        file.set(key, value)
+      },
+      delete: async key => { file.delete(key) },
+      keys: async () => Array.from(file.keys()),
+      size: async () => 0
+    }
+    setStorageBackend(backend)
+    await initializeAppStorage()
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    appStorage.setItem('key', 'new')
+    await expect(flushAppStorage()).rejects.toThrow('配额不足')
+    expect(appStorage.getItem('key')).toBe('old')
+    expect(file.get('key')).toBe('old')
+    spy.mockRestore()
   })
 })

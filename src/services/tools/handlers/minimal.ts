@@ -1,3 +1,4 @@
+import { appStorage } from '@/services/storage'
 /**
  * 最小工具集 — 8 个基础工具的实现
  *
@@ -478,7 +479,7 @@ export const knowledgeQueryHandler: ToolHandler = async (args) => {
   const { question, context } = args
 
   // 初期：从 localStorage 的知识库中检索
-  const knowledgeBase = JSON.parse(localStorage.getItem('knowledge_base') || '[]')
+  const knowledgeBase = JSON.parse(appStorage.getItem('knowledge_base') || '[]')
 
   if (knowledgeBase.length === 0) {
     return {
@@ -925,7 +926,7 @@ export const saveMemoryTool: ToolDefinition = {
 
 export const saveMemoryHandler: ToolHandler = async (args) => {
   const { type, content, tags, importance } = args
-  const memory = memoryStore.add({
+    const memory = await memoryStore.add({
     type: type || 'fact',
     content,
     tags: tags || [],
@@ -1301,7 +1302,7 @@ export const historySearchHandler: ToolHandler = async (args) => {
 
   let debates: any[] = []
   try {
-    const raw = localStorage.getItem('debates_history')
+    const raw = appStorage.getItem('debates_history')
     debates = raw ? JSON.parse(raw) : []
   } catch {
     debates = []

@@ -1,3 +1,4 @@
+import { appStorage } from '@/services/storage'
 /**
  * SkillRegistry — 技能注册中心
  *
@@ -147,14 +148,14 @@ export class SkillRegistry {
     for (const [ministerId, skillIds] of this.bindings) {
       data[ministerId] = Array.from(skillIds)
     }
-    localStorage.setItem('minister_skill_bindings', JSON.stringify(data))
+    appStorage.setItem('minister_skill_bindings', JSON.stringify(data))
   }
 
   /**
    * 加载绑定配置
    */
   private loadBindings(): void {
-    const saved = localStorage.getItem('minister_skill_bindings')
+    const saved = appStorage.getItem('minister_skill_bindings')
     if (saved) {
       try {
         const data: Record<string, string[]> = JSON.parse(saved)

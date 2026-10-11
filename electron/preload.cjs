@@ -10,6 +10,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
   storeGetAll: () => ipcRenderer.invoke('store-get-all'),
   storeSet: (key, value) => ipcRenderer.invoke('store-set', key, value),
   storeDelete: (key) => ipcRenderer.invoke('store-delete', key),
+  storeSetSync: (key, value) => {
+    const result = ipcRenderer.sendSync('store-set-sync', key, value)
+    if (!result?.success) throw new Error(result?.error || '本地存储写入失败')
+  },
+  storeDeleteSync: (key) => {
+    const result = ipcRenderer.sendSync('store-delete-sync', key)
+    if (!result?.success) throw new Error(result?.error || '本地存储删除失败')
+  },
   storeGetPath: () => ipcRenderer.invoke('store-get-path'),
   // 文件操作通道
   readFile: (filePath) => ipcRenderer.invoke('read-file', filePath),

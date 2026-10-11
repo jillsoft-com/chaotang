@@ -1,3 +1,4 @@
+import { appStorage } from '@/services/storage'
 /**
  * 上下文压缩器 — 防止多轮工具调用后 token 爆炸
  *
@@ -34,7 +35,7 @@ export function countMessageChars(messages: ChatMessage[]): number {
  * 获取压缩阈值（从 localStorage 读取）
  */
 export function getCompressThreshold(): number {
-  const saved = localStorage.getItem('context_compress_threshold')
+  const saved = appStorage.getItem('context_compress_threshold')
   if (saved) {
     const val = parseInt(saved, 10)
     if (val > 10000 && val <= 200000) return val

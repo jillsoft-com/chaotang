@@ -1,3 +1,4 @@
+import { appStorage } from '@/services/storage'
 import { getCurrentThemePrompts } from '@/services/dynasty-presets'
 
 /**
@@ -77,7 +78,7 @@ class PromptService {
    * 获取所有已保存的自定义 Prompt
    */
   getAllCustom(): Record<string, { systemPrompt: string; description?: string }> {
-    const saved = localStorage.getItem(this.storageKey)
+    const saved = appStorage.getItem(this.storageKey)
     return saved ? JSON.parse(saved) : {}
   }
 
@@ -132,7 +133,7 @@ class PromptService {
       systemPrompt,
       description: description || defaultDescriptions[ministerId] || ''
     }
-    localStorage.setItem(this.storageKey, JSON.stringify(all))
+    appStorage.setItem(this.storageKey, JSON.stringify(all))
   }
 
   /**
@@ -141,14 +142,14 @@ class PromptService {
   removeCustom(ministerId: string) {
     const all = this.getAllCustom()
     delete all[ministerId]
-    localStorage.setItem(this.storageKey, JSON.stringify(all))
+    appStorage.setItem(this.storageKey, JSON.stringify(all))
   }
 
   /**
    * 重置所有自定义 Prompt
    */
   resetAll() {
-    localStorage.removeItem(this.storageKey)
+    appStorage.removeItem(this.storageKey)
   }
 
   /**

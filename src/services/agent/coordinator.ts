@@ -1,3 +1,4 @@
+import { appStorage } from '@/services/storage'
 /**
  * Coordinator Agent — 多 Agent 协作编排器
  *
@@ -156,7 +157,7 @@ export class CoordinatorAgent {
    * 获取摘要模型 provider（用于上下文压缩）
    */
   private getSummaryProvider(): LLMProvider | null {
-    const summaryId = localStorage.getItem('summary_model_id')
+    const summaryId = appStorage.getItem('summary_model_id')
     if (summaryId) {
       const cfg = llmService.getById(summaryId)
       if (cfg) return createProvider({ provider: cfg.provider, model: cfg.model, apiKey: cfg.apiKey, baseURL: cfg.baseURL })

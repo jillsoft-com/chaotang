@@ -1,3 +1,4 @@
+import { appStorage } from '@/services/storage'
 /**
  * 后台任务调度器 — 退朝后持续运行
  *
@@ -430,7 +431,7 @@ class BackgroundScheduler {
 
   private loadTasks(): void {
     try {
-      const saved = localStorage.getItem('background_tasks')
+      const saved = appStorage.getItem('background_tasks')
       if (saved) {
         const arr: BackgroundTask[] = JSON.parse(saved)
         for (const task of arr) {
@@ -442,7 +443,7 @@ class BackgroundScheduler {
 
   private saveTasks(): void {
     const arr = Array.from(this.tasks.values())
-    localStorage.setItem('background_tasks', JSON.stringify(arr))
+    appStorage.setItem('background_tasks', JSON.stringify(arr))
   }
 }
 

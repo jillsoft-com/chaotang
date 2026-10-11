@@ -1,3 +1,4 @@
+import { appStorage } from '@/services/storage'
 /**
  * A2A (Agent-to-Agent) 协议 — 跨 Agent 任务派发
  *
@@ -352,7 +353,7 @@ class A2AService {
 
   private loadRemoteAgents(): void {
     try {
-      const saved = localStorage.getItem('a2a_remote_agents')
+      const saved = appStorage.getItem('a2a_remote_agents')
       if (saved) {
         const arr: RemoteAgent[] = JSON.parse(saved)
         for (const agent of arr) {
@@ -365,12 +366,12 @@ class A2AService {
 
   private saveRemoteAgents(): void {
     const arr = Array.from(this.remoteAgents.values())
-    localStorage.setItem('a2a_remote_agents', JSON.stringify(arr))
+    appStorage.setItem('a2a_remote_agents', JSON.stringify(arr))
   }
 
   private loadTasks(): void {
     try {
-      const saved = localStorage.getItem('a2a_tasks')
+      const saved = appStorage.getItem('a2a_tasks')
       if (saved) {
         const arr: A2ATask[] = JSON.parse(saved)
         for (const task of arr) {
@@ -382,7 +383,7 @@ class A2AService {
 
   private saveTasks(): void {
     const arr = Array.from(this.tasks.values())
-    localStorage.setItem('a2a_tasks', JSON.stringify(arr))
+    appStorage.setItem('a2a_tasks', JSON.stringify(arr))
   }
 }
 

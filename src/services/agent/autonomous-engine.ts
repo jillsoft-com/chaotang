@@ -1,3 +1,4 @@
+import { appStorage } from '@/services/storage'
 /**
  * 自主执行引擎 — 通用 "规划→执行→验证→迭代" 闭环
  *
@@ -184,7 +185,7 @@ export class AutonomousEngine {
    * 获取摘要模型 provider（用于上下文压缩）
    */
   private getSummaryProvider(): LLMProvider | null {
-    const summaryId = localStorage.getItem('summary_model_id')
+    const summaryId = appStorage.getItem('summary_model_id')
     if (summaryId) {
       const cfg = llmService.getById(summaryId)
       if (cfg) return createProvider({ provider: cfg.provider, model: cfg.model, apiKey: cfg.apiKey, baseURL: cfg.baseURL })

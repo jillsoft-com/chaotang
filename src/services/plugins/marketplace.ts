@@ -1,3 +1,4 @@
+import { appStorage } from '@/services/storage'
 /**
  * 插件市场 — 搜索、发现、安装和管理社区插件
  *
@@ -417,7 +418,7 @@ class PluginMarketplace {
     for (const p of this.registry) {
       if (p.installedVersion) status[p.id] = p.installedVersion
     }
-    localStorage.setItem('marketplace_installed', JSON.stringify(status))
+    appStorage.setItem('marketplace_installed', JSON.stringify(status))
   }
 }
 

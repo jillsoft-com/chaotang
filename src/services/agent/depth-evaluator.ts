@@ -1,3 +1,4 @@
+import { appStorage } from '@/services/storage'
 /**
  * 树深度评估 — 用真实任务评估三层是否足够
  *
@@ -197,7 +198,7 @@ export class DepthEvaluator {
 
   private loadFromStorage(): void {
     try {
-      const saved = localStorage.getItem(STORAGE_KEY)
+      const saved = appStorage.getItem(STORAGE_KEY)
       if (saved) {
         const data = JSON.parse(saved)
         if (Array.isArray(data)) {
@@ -209,7 +210,7 @@ export class DepthEvaluator {
 
   private saveToStorage(): void {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(this.cases))
+      appStorage.setItem(STORAGE_KEY, JSON.stringify(this.cases))
     } catch { /* 保存失败不抛错 */ }
   }
 }

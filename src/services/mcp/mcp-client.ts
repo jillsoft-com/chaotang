@@ -1,3 +1,4 @@
+import { appStorage } from '@/services/storage'
 /**
  * MCP (Model Context Protocol) Client 服务
  *
@@ -426,7 +427,7 @@ class MCPService {
 
   private loadConfigs(): void {
     try {
-      const saved = localStorage.getItem('mcp_servers')
+      const saved = appStorage.getItem('mcp_servers')
       if (saved) {
         this.configs = JSON.parse(saved)
       }
@@ -434,7 +435,7 @@ class MCPService {
   }
 
   private saveConfigs(): void {
-    localStorage.setItem('mcp_servers', JSON.stringify(this.configs))
+    appStorage.setItem('mcp_servers', JSON.stringify(this.configs))
   }
 }
 

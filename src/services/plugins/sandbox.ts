@@ -1,3 +1,4 @@
+import { appStorage } from '@/services/storage'
 /**
  * 插件沙箱 — 受限执行环境
  *
@@ -44,7 +45,7 @@ const GRANTS_KEY = 'ct_plugin_grants'
 /** 获取所有插件授权记录 */
 export function getPluginGrants(): PluginGrant[] {
   try {
-    const raw = localStorage.getItem(GRANTS_KEY)
+    const raw = appStorage.getItem(GRANTS_KEY)
     if (raw) return JSON.parse(raw)
   } catch { /* 忽略 */ }
   return []
@@ -52,7 +53,7 @@ export function getPluginGrants(): PluginGrant[] {
 
 /** 保存插件授权记录 */
 function savePluginGrants(grants: PluginGrant[]): void {
-  localStorage.setItem(GRANTS_KEY, JSON.stringify(grants))
+  appStorage.setItem(GRANTS_KEY, JSON.stringify(grants))
 }
 
 /** 检查插件是否已授权 */

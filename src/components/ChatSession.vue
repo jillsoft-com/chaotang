@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { appStorage } from '@/services/storage'
 import { ref, nextTick, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useDebateStore } from '@/stores/debate'
 import { createProvider } from '@/services/llm'
@@ -86,7 +87,7 @@ const isSending = ref(false)
 const hasStartedCourt = ref(false)
 
 // 消息字体大小（从 localStorage 读取，在设置页面中调节）
-const messageFontSize = ref(parseInt(localStorage.getItem('message_font_size') || '15', 10))
+const messageFontSize = ref(parseInt(appStorage.getItem('message_font_size') || '15', 10))
 
 // ============ Token 跟踪 ============
 
@@ -761,7 +762,7 @@ function resolveLLMConfig(ministerLLM: LLMConfig): LLMConfig {
 
 /** 获取摘要模型 provider（用于上下文压缩） */
 function getSummaryProvider() {
-  const summaryId = localStorage.getItem('summary_model_id')
+  const summaryId = appStorage.getItem('summary_model_id')
   if (summaryId) {
     const cfg = llmService.getById(summaryId)
     if (cfg) return createProvider({ provider: cfg.provider, model: cfg.model, apiKey: cfg.apiKey, baseURL: cfg.baseURL })
@@ -961,7 +962,7 @@ async function runMinisterTurn(params: {
     { role: 'user', content: userMessage }
   ]
 
-  const MAX_ROUNDS = parseInt(localStorage.getItem('max_tool_rounds') || '30', 10)
+  const MAX_ROUNDS = parseInt(appStorage.getItem('max_tool_rounds') || '30', 10)
   let finalContent = ''
   let accumulatedContent = ''
 

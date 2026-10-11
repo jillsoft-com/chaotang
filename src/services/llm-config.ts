@@ -40,25 +40,23 @@ class LLMService {
         config.apiKey = config.apiKey || storedKeys[config.id]
       }
       if (needsMigration) await this.persistKeys(this.configs.value)
-      this.saveMetadata()
+      await this.saveMetadata(this.configs.value)
     } else if (!saved) {
-      this.saveMetadata()
+      await this.saveMetadata(this.configs.value)
     }
   }
 
-  private async saveMetadata(): Promise<void> {
+  private async saveMetadata(values: LLMConfig[]): Promise<void> {
     const configs = window.electronAPI
-      ? this.configs.value.map(({ apiKey, ...config }) => config)
-      : this.configs.value
-    try {
-      await getStorageBackend().set(STORAGE_KEY, JSON.stringify(configs))
-    } catch { /* 写入失败不抛错 */ }
+      ? values.map(({ apiKey, ...config }) => config)
+      : values
+    await getStorageBackend().set(STORAGE_KEY, JSON.stringify(configs))
   }
 
   private async persistKeys(configs: LLMConfig[]): Promise<void> {
     if (!window.electronAPI) return
     const keys = Object.fromEntries(configs.filter(c => c.apiKey).map(c => [c.id, c.apiKey!]))
-    await window.electronAPI.saveApiKeys(keys)
+    if (!await window.electronAPI.saveApiKeys(keys)) throw new Error('API Key 保存失败')
   }
 
   getAll(): LLMConfig[] {
@@ -70,40 +68,43 @@ class LLMService {
   }
 
   async add(config: Omit<LLMConfig, 'id'>): Promise<LLMConfig> {
+    await this.ready
     const newConfig: LLMConfig = {
       ...config,
       id: `llm-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
     }
     const next = [...this.configs.value, newConfig]
     await this.persistKeys(next)
+    await this.saveMetadata(next)
     this.configs.value = next
-    this.saveMetadata()
     return newConfig
   }
 
   async update(id: string, config: Partial<LLMConfig>): Promise<void> {
+    await this.ready
     const index = this.configs.value.findIndex(c => c.id === id)
     if (index !== -1) {
       const next = [...this.configs.value]
       next[index] = { ...next[index], ...config }
       await this.persistKeys(next)
+      await this.saveMetadata(next)
       this.configs.value = next
-      this.saveMetadata()
     }
   }
 
   async delete(id: string): Promise<void> {
+    await this.ready
     const next = this.configs.value.filter(c => c.id !== id)
+    await this.saveMetadata(next)
     await this.persistKeys(next)
     this.configs.value = next
-    this.saveMetadata()
   }
 
-  setDefault(id: string): void {
-    this.configs.value.forEach(c => {
-      c.isDefault = c.id === id
-    })
-    this.saveMetadata()
+  async setDefault(id: string): Promise<void> {
+    await this.ready
+    const next = this.configs.value.map(config => ({ ...config, isDefault: config.id === id }))
+    await this.saveMetadata(next)
+    this.configs.value = next
   }
 
   async fetchModels(config: Pick<LLMConfig, 'provider' | 'apiKey' | 'baseURL'>): Promise<{ success: boolean; models: string[]; message: string }> {

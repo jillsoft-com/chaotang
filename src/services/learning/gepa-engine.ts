@@ -1,3 +1,4 @@
+import { appStorage } from '@/services/storage'
 /**
  * GEPA 自学习引擎 — Generative Embedded Policy Architecture
  *
@@ -328,14 +329,14 @@ class GEPAEngine {
         this.saveData()
 
         // 保存到持久记忆（使用 localStorage 作为简化存储）
-        const gepaMemories = JSON.parse(localStorage.getItem('gepa_promoted_skills') || '[]')
+        const gepaMemories = JSON.parse(appStorage.getItem('gepa_promoted_skills') || '[]')
         gepaMemories.push({
           name: pattern.name,
           trigger: pattern.trigger,
           solution: pattern.solution,
           promotedAt: Date.now()
         })
-        localStorage.setItem('gepa_promoted_skills', JSON.stringify(gepaMemories))
+        appStorage.setItem('gepa_promoted_skills', JSON.stringify(gepaMemories))
 
         return event
       }
@@ -429,7 +430,7 @@ class GEPAEngine {
 
   private loadData(): void {
     try {
-      const savedPatterns = localStorage.getItem('gepa_patterns')
+      const savedPatterns = appStorage.getItem('gepa_patterns')
       if (savedPatterns) {
         const arr: LearningPattern[] = JSON.parse(savedPatterns)
         for (const p of arr) {
@@ -440,7 +441,7 @@ class GEPAEngine {
         }
       }
 
-      const savedEvents = localStorage.getItem('gepa_events')
+      const savedEvents = appStorage.getItem('gepa_events')
       if (savedEvents) {
         this.events = JSON.parse(savedEvents)
       }
@@ -449,8 +450,8 @@ class GEPAEngine {
 
   private saveData(): void {
     const patternsArr = Array.from(this.patterns.values())
-    localStorage.setItem('gepa_patterns', JSON.stringify(patternsArr))
-    localStorage.setItem('gepa_events', JSON.stringify(this.events))
+    appStorage.setItem('gepa_patterns', JSON.stringify(patternsArr))
+    appStorage.setItem('gepa_events', JSON.stringify(this.events))
   }
 }
 
