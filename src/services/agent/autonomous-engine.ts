@@ -420,7 +420,7 @@ export class AutonomousEngine {
 
       // 上下文压缩（防止超长对话）
       if (round < this.config.maxIterations - 1) {
-        await this.compressIfNeeded(messages)
+        await this.compressIfNeeded(messages, goal)
       }
 
       // 检查点回调
@@ -544,19 +544,28 @@ export class AutonomousEngine {
   /**
    * 上下文压缩（R8：通过 ContextManager 按模型容量管理）
    */
-  private async compressIfNeeded(messages: ChatMessage[]): Promise<void> {
+  private async compressIfNeeded(messages: ChatMessage[], taskGoal?: string): Promise<void> {
     const ctxMgr = new ContextManager(this.config.modelId || 'unknown')
     const ctxMessages = messages.map(m => ({ role: m.role as 'system' | 'user' | 'assistant', content: typeof m.content === 'string' ? m.content : '' }))
     if (ctxMgr.exceedsContextLimit(ctxMessages)) {
       const summaryProvider = this.getSummaryProvider()
-      if (summaryProvider) {
-        try {
-          const compressed = await compressContext(messages, summaryProvider, ctxMgr.getAvailableChars())
-          messages.splice(0, messages.length, ...compressed)
-        } catch (e) {
-          console.warn('[AutonomousEngine] 上下文压缩失败:', e)
-        }
+      if (!summaryProvider) {
+        // 无摘要模型但上下文超限 → 终止执行
+        throw new Error('上下文已超模型容量但未配置摘要模型，无法压缩。建议开启新会话。')
       }
+      let compressed
+      try {
+        compressed = await compressContext(messages, summaryProvider, ctxMgr.getAvailableChars(), undefined, taskGoal, `auto-${Date.now()}`)
+      } catch (e) {
+        // 压缩过程出错 → 终止执行（上下文已超限，不能继续）
+        const errMsg = e instanceof Error ? e.message : String(e)
+        throw new Error(`上下文压缩失败: ${errMsg}。上下文已超模型容量，建议开启新会话。`)
+      }
+      // safe 检查：不安全时抛错，向上传播终止执行
+      if (!compressed.safe) {
+        throw new Error(compressed.warning || '上下文无法安全压缩，建议开启新会话')
+      }
+      messages.splice(0, messages.length, ...compressed.messages)
     }
   }
 

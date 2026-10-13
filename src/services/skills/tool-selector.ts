@@ -27,7 +27,7 @@ import type { Skill } from '@/types'
 import { skillRegistry } from '@/services/skills/registry'
 import { estimateTokens } from '@/utils/token-utils'
 import { appStorage } from '@/services/storage'
-import { analyzeAndRecommend, parseAdvisorResponse } from '@/services/skills/llm-advisor'
+import { analyzeAndRecommend } from '@/services/skills/llm-advisor'
 import type { AdvisorMetrics, AdvisorResult } from '@/services/skills/llm-advisor'
 
 // ============ 配置 ============
@@ -150,7 +150,6 @@ function recallByKeywords(
  */
 function selectByKeyword(
   allSkills: Skill[],
-  allToolDefs: ToolDefinition[],
   keywords: string[],
   maxTools: number
 ): ToolDefinition[] {
@@ -174,11 +173,10 @@ function selectByKeyword(
   const selected: ToolDefinition[] = []
   const selectedNames = new Set<string>()
 
-  // 1. 添加核心工具（优先，但受绝对硬顶保护）
-  const absoluteCap = maxTools * 2
+  // 1. 先添加核心工具（优先，但计入上限）
   for (const skill of coreSkills) {
     for (const tool of skill.tools) {
-      if (selected.length >= absoluteCap) break
+      if (selected.length >= maxTools) break
       if (!selectedNames.has(tool.function.name)) {
         selected.push(tool)
         selectedNames.add(tool.function.name)
@@ -191,20 +189,6 @@ function selectByKeyword(
     if (selected.length >= maxTools) break
     for (const tool of skill.tools) {
       if (selected.length >= maxTools) break
-      if (!selectedNames.has(tool.function.name)) {
-        selected.push(tool)
-        selectedNames.add(tool.function.name)
-      }
-    }
-  }
-
-  // 3. 如果还有剩余预算，把得分 > 0 的也加上（软上限）
-  const softLimit = Math.ceil(maxTools * 1.5)
-  for (const { skill, score } of scored) {
-    if (selected.length >= softLimit) break
-    if (score <= 0) continue
-    for (const tool of skill.tools) {
-      if (selected.length >= softLimit) break
       if (!selectedNames.has(tool.function.name)) {
         selected.push(tool)
         selectedNames.add(tool.function.name)
@@ -230,8 +214,6 @@ function applyAdvisorRecommendations(
   advisorResult: AdvisorResult,
   maxTools: number
 ): ToolDefinition[] {
-  const absoluteCap = maxTools * 2
-
   // 构建 skillId → Skill 映射
   const skillMap = new Map<string, Skill>()
   for (const s of allSkills) skillMap.set(s.id, s)
@@ -252,14 +234,14 @@ function applyAdvisorRecommendations(
     .sort((a, b) => priorityOrder[a.priority] - priorityOrder[b.priority])
     .map(r => r.skillId)
 
-  // 构建结果
+  // 构建结果：maxTools 为绝对上限
   const selected: ToolDefinition[] = []
   const selectedNames = new Set<string>()
 
-  // 1. 添加核心工具（受绝对硬顶保护）
+  // 1. 先添加核心工具（优先，但计入上限）
   for (const skill of coreSkills) {
     for (const tool of skill.tools) {
-      if (selected.length >= absoluteCap) break
+      if (selected.length >= maxTools) break
       if (!selectedNames.has(tool.function.name)) {
         selected.push(tool)
         selectedNames.add(tool.function.name)
@@ -277,26 +259,6 @@ function applyAdvisorRecommendations(
 
     for (const tool of skill.tools) {
       if (selected.length >= maxTools) break
-      if (!selectedNames.has(tool.function.name)) {
-        selected.push(tool)
-        selectedNames.add(tool.function.name)
-      }
-    }
-  }
-
-  // 3. 幕僚未推荐但得分 > 0 的 Skill 补充（软上限）
-  const softLimit = Math.ceil(maxTools * 1.5)
-  const recommendedSet = new Set(recommendedSkillIds)
-  const keywords = extractKeywords(advisorResult.intent.goal || '')
-  const scored = recallByKeywords(
-    allSkills.filter(s => !coreSkillIds.has(s.id) && !recommendedSet.has(s.id)),
-    keywords
-  )
-  for (const { skill, score } of scored) {
-    if (selected.length >= softLimit) break
-    if (score <= 0) continue
-    for (const tool of skill.tools) {
-      if (selected.length >= softLimit) break
       if (!selectedNames.has(tool.function.name)) {
         selected.push(tool)
         selectedNames.add(tool.function.name)
@@ -407,7 +369,7 @@ export async function selectToolsForTopic(
   }
 
   // 兜底：关键词匹配
-  return selectByKeyword(allSkills, allToolDefs, keywords, maxTools)
+  return selectByKeyword(allSkills, keywords, maxTools)
 }
 
 /**

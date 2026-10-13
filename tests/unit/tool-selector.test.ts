@@ -132,8 +132,8 @@ describe('动态工具选择器', () => {
 
     // 设置一个很小的上限
     const tools = await selectToolsForTopic('chancellor', '搜索网络并执行命令运行测试检查代码质量', 5)
-    // 核心工具 + 最多 5 个，绝对硬顶 5 * 2 = 10
-    expect(tools.length).toBeLessThanOrEqual(10)
+    // maxTools 为绝对上限
+    expect(tools.length).toBeLessThanOrEqual(5)
   })
 
   it('角色无绑定时返回空', async () => {

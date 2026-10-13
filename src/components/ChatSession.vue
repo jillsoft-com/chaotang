@@ -1141,27 +1141,94 @@ async function runMinisterTurn(params: {
       const totalChars = countMessageChars(messages as any)
       if (totalChars > threshold) {
         const summaryProvider = getSummaryProvider()
-        if (summaryProvider) {
-          console.log(`[runMinisterTurn] 上下文超过阈值 (${totalChars} > ${threshold})，开始压缩...`)
-          try {
-            const compressed = await compressContext(messages as any, summaryProvider, threshold)
-            // 替换 messages 数组内容
-            messages.splice(0, messages.length, ...compressed as any)
-            console.log(`[runMinisterTurn] 压缩完成, 消息数: ${messages.length}, 字符: ${countMessageChars(messages as any)}`)
-          } catch (e) {
-            console.warn('[runMinisterTurn] 压缩失败，继续执行:', e)
-          }
+        if (!summaryProvider) {
+          // 无摘要模型但上下文超限 → 终止大臣进言
+          throw new Error('上下文已超模型容量但未配置摘要模型，无法压缩。建议开启新会话。')
         }
+        console.log(`[runMinisterTurn] 上下文超过阈值 (${totalChars} > ${threshold})，开始压缩...`)
+        let compressed
+        try {
+          compressed = await compressContext(messages as any, summaryProvider, threshold, undefined, topic, props.sessionId)
+        } catch (e) {
+          // 压缩过程出错 → 终止大臣进言（上下文已超限，不能继续）
+          const errMsg = e instanceof Error ? e.message : String(e)
+          throw new Error(`上下文压缩失败: ${errMsg}。上下文已超模型容量，建议开启新会话。`)
+        }
+        // safe 检查：不安全时抛错，向上传播终止大臣进言
+        if (!compressed.safe) {
+          throw new Error(compressed.warning || '上下文无法安全压缩，建议开启新会话')
+        }
+        // 替换 messages 数组内容
+        messages.splice(0, messages.length, ...compressed.messages as any)
+        console.log(`[runMinisterTurn] 压缩完成, 消息数: ${messages.length}, 字符: ${countMessageChars(messages as any)}`)
       }
     }
 
     // 最后一轮仍有工具调用，追加一条提示让模型总结
     if (round === MAX_ROUNDS - 1) {
       console.log('[runMinisterTurn] 达到最大轮次，要求模型总结...')
+
+      // 先检查容量并压缩（不追加总结提示）
+      const finalThreshold = getCompressThreshold()
+      const finalTotalChars = countMessageChars(messages as any)
+      if (finalTotalChars > finalThreshold) {
+        const summaryProvider = getSummaryProvider()
+        if (!summaryProvider) {
+          throw new Error('最终总结前上下文已超模型容量但未配置摘要模型，无法压缩。建议开启新会话。')
+        }
+        console.log(`[runMinisterTurn] 最终总结前上下文超限 (${finalTotalChars} > ${finalThreshold})，尝试压缩...`)
+        let compressed
+        try {
+          compressed = await compressContext(messages as any, summaryProvider, finalThreshold, undefined, topic, props.sessionId)
+        } catch (e) {
+          const errMsg = e instanceof Error ? e.message : String(e)
+          throw new Error(`最终总结前上下文压缩失败: ${errMsg}。建议开启新会话。`)
+        }
+        if (!compressed.safe) {
+          throw new Error(compressed.warning || '最终总结前上下文无法安全压缩，建议开启新会话')
+        }
+        messages.splice(0, messages.length, ...compressed.messages as any)
+        console.log(`[runMinisterTurn] 最终总结前压缩完成`)
+      }
+
+      // 压缩后（或无需压缩）追加总结提示（只追加一次）
       messages.push({
         role: 'user',
         content: '请基于你已经收集到的所有信息，直接给出最终分析和回复，不要再调用工具。'
       })
+
+      // 最终校验：追加提示后检查是否超限
+      const afterAppendChars = countMessageChars(messages as any)
+      if (afterAppendChars > finalThreshold) {
+        console.warn(`[runMinisterTurn] 追加总结提示后超限 (${afterAppendChars} > ${finalThreshold})，尝试再次压缩...`)
+        const summaryProvider = getSummaryProvider()
+        if (!summaryProvider) {
+          throw new Error('追加总结提示后上下文超限但未配置摘要模型，无法压缩。建议开启新会话。')
+        }
+        let compressed
+        try {
+          compressed = await compressContext(messages as any, summaryProvider, finalThreshold, undefined, topic, props.sessionId)
+        } catch (e) {
+          const errMsg = e instanceof Error ? e.message : String(e)
+          throw new Error(`追加总结提示后压缩失败: ${errMsg}。建议开启新会话。`)
+        }
+        if (!compressed.safe) {
+          throw new Error(compressed.warning || '追加总结提示后无法安全压缩，建议开启新会话')
+        }
+        // 压缩后重新追加总结提示（先检查压缩保留的最近消息中是否已包含）
+        messages.splice(0, messages.length, ...compressed.messages as any)
+        const SUMMARY_PROMPT = '请基于你已经收集到的所有信息，直接给出最终分析和回复，不要再调用工具。'
+        const lastMsg = messages[messages.length - 1]
+        if (!(lastMsg && lastMsg.role === 'user' && lastMsg.content === SUMMARY_PROMPT)) {
+          messages.push({ role: 'user', content: SUMMARY_PROMPT })
+        }
+        // 再次校验
+        const finalCheckChars = countMessageChars(messages as any)
+        if (finalCheckChars > finalThreshold) {
+          throw new Error(`追加总结提示后压缩仍超限 (${finalCheckChars} > ${finalThreshold})，建议开启新会话。`)
+        }
+      }
+
       const finalReply = await provider.chatStreamWithTools(
         messages,
         (text) => { onContent(accumulatedContent ? accumulatedContent + '\n\n' + text : text) },
@@ -1465,6 +1532,16 @@ async function runAgentDebate() {
     })
   } catch (error) {
     console.error('[Agent] 协作流程失败:', error)
+    // 显示错误信息给用户
+    const errorMsg = error instanceof Error ? error.message : '未知错误'
+    const errorSpeech: Speech = {
+      id: `agent-error-${Date.now()}`,
+      ministerId: 'chancellor',
+      content: `❌ **协作流程失败**\n\n${errorMsg}\n\n> 建议开启新会话或检查配置后重试。`,
+      timestamp: Date.now(),
+      status: 'error'
+    }
+    debateStore.addSpeech(errorSpeech, props.sessionId)
   }
 
   isNearBottom = true

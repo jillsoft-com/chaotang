@@ -18,7 +18,7 @@ import { createProvider } from '@/services/llm'
 import { llmService } from '@/services/llm-config'
 import { compressContext, countMessageChars } from './context-compressor'
 import { memoryStore } from '@/services/memory'
-import { skillRegistry, selectToolsForTopic, attributeError, checkReport } from '@/services/skills'
+import { selectToolsForTopic, attributeError, checkReport } from '@/services/skills'
 import { toolExecutor } from '@/services/tools/executor'
 import { findPresetById, getCurrentDynastyId } from '@/services/dynasty-presets'
 import { AutonomousEngine } from './autonomous-engine'
@@ -464,6 +464,11 @@ export class CoordinatorAgent {
 
       const reactiveSummary = getReactiveSpeech(summarySpeechId)
 
+      // 提前计算失败清单（无论汇总成功或失败都追加）
+      const failedTasks = workerResults
+        .filter(wr => wr.status === 'error')
+        .map(wr => ({ task: wr.task, error: wr.content.slice(0, 200) }))
+
       try {
         // 成本归因摘要（任务树模式）
         let costTable = ''
@@ -490,23 +495,80 @@ export class CoordinatorAgent {
         reactiveSummary.content = (costTable ? costTable + '\n\n' : '') + summary
         reactiveSummary.status = 'completed'
 
-        // 三期：汇报检查（幕僚检查是否漏答目标）
+        // 失败清单始终追加（独立于汇报检查，不依赖幕僚开关或模型诚实）
+        if (failedTasks.length > 0) {
+          let failSection = '\n\n---\n**以下任务执行失败（程序确认，非模型生成）**：\n'
+          for (const ft of failedTasks) {
+            failSection += `- ❌ **${ft.task}**：${ft.error}\n`
+          }
+          reactiveSummary.content += failSection
+        }
+
+        // 三期：汇报检查（幕僚检查是否漏答目标，仅负责补写遗漏）
         if (appStorage.getItem('enable_report_check') !== 'false') {
           try {
+            const requirements: string[] = [
+              topic,
+              ...workerResults.map(wr => wr.task).filter(Boolean)
+            ]
             const reportCheck = await checkReport({
               goal: topic,
-              requirements: [],
+              requirements,
               reportContent: summary
             })
             if (reportCheck.missingPoints.length > 0 || reportCheck.suggestions.length > 0) {
-              let checkNote = '\n\n---\n**幕僚汇报检查**：'
-              if (reportCheck.missingPoints.length > 0) {
-                checkNote += '\n遗漏要点：' + reportCheck.missingPoints.join('；')
+              const suggestionText = reportCheck.suggestions.join('；')
+
+              // 仅针对遗漏要点（非失败任务）让丞相补写
+              const nonFailedMissing = reportCheck.missingPoints.filter(mp =>
+                !failedTasks.some(ft => mp.includes(ft.task) || ft.task.includes(mp))
+              )
+              if (nonFailedMissing.length > 0 || reportCheck.suggestions.length > 0) {
+                const nonFailedMissingText = nonFailedMissing.join('；')
+                try {
+                  const supplementMessages: ChatMessage[] = [
+                    {
+                      role: 'system',
+                      content: `你是丞相。你的汇报中存在遗漏或不足，请针对以下情况进行补充。
+
+原始目标：${topic}
+遗漏要点（汇报中未涉及但应该覆盖的内容）：${nonFailedMissingText || '无'}
+改进建议：${suggestionText || '无'}
+
+规则：
+1. 请补充回答遗漏要点
+2. 不要重复已有汇报内容
+3. 保持简洁、针对性强`
+                    },
+                    {
+                      role: 'user',
+                      content: `已有汇报摘要：\n${summary.slice(0, 3000)}\n\n请针对遗漏要点进行补充。`
+                    }
+                  ]
+                  const supplement = await chancellorLLM.chat(supplementMessages) as string
+                  if (supplement && supplement.trim().length > 0) {
+                    reactiveSummary.content += `\n\n---\n**幕僚汇报检查 — 补充回答**：\n${supplement.trim()}`
+                  } else {
+                    let checkNote = '\n\n---\n**幕僚汇报检查**：'
+                    if (nonFailedMissing.length > 0) {
+                      checkNote += '\n遗漏要点：' + nonFailedMissingText
+                    }
+                    if (reportCheck.suggestions.length > 0) {
+                      checkNote += '\n改进建议：' + suggestionText
+                    }
+                    reactiveSummary.content += checkNote
+                  }
+                } catch {
+                  let checkNote = '\n\n---\n**幕僚汇报检查**：'
+                  if (nonFailedMissing.length > 0) {
+                    checkNote += '\n遗漏要点：' + nonFailedMissingText
+                  }
+                  if (reportCheck.suggestions.length > 0) {
+                    checkNote += '\n改进建议：' + suggestionText
+                  }
+                  reactiveSummary.content += checkNote
+                }
               }
-              if (reportCheck.suggestions.length > 0) {
-                checkNote += '\n改进建议：' + reportCheck.suggestions.join('；')
-              }
-              reactiveSummary.content += checkNote
             }
           } catch {
             // 静默失败
@@ -515,6 +577,14 @@ export class CoordinatorAgent {
       } catch (error) {
         reactiveSummary.content = `汇总失败：${error instanceof Error ? error.message : '未知错误'}`
         reactiveSummary.status = 'error'
+        // 汇总失败时仍追加失败清单
+        if (failedTasks.length > 0) {
+          let failSection = '\n\n---\n**以下任务执行失败（程序确认，非模型生成）**：\n'
+          for (const ft of failedTasks) {
+            failSection += `- ❌ **${ft.task}**：${ft.error}\n`
+          }
+          reactiveSummary.content += failSection
+        }
       }
     }
 
@@ -999,22 +1069,54 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
         const ctxMessages = messages.map(m => ({ role: m.role as 'system' | 'user' | 'assistant', content: typeof m.content === 'string' ? m.content : '' }))
         if (ctxMgr.exceedsContextLimit(ctxMessages)) {
           const summaryProvider = this.getSummaryProvider()
-          if (summaryProvider) {
-            console.log(`[Agent] 上下文超出模型容量 (${ctxMgr.estimateTokens(ctxMessages.reduce((s, m) => s + m.content, ''))} tokens > ${ctxMgr.getBudget().maxTokens})，开始压缩...`)
-            try {
-              const compressed = await compressContext(messages, summaryProvider, ctxMgr.getAvailableChars(), undefined, topic)
-              const afterChars = countMessageChars(compressed)
-              messages.splice(0, messages.length, ...compressed)
-              console.log(`[Agent] 压缩完成, 消息数: ${messages.length}, 字符: ${afterChars}`)
-            } catch (e) {
-              console.warn('[Agent] 压缩失败，继续执行:', e)
-            }
+          if (!summaryProvider) {
+            // 无摘要模型但上下文超限 → 终止 Worker
+            throw new Error(`[${minister.name}] 上下文已超模型容量但未配置摘要模型，无法压缩。建议开启新会话。`)
           }
+          console.log(`[Agent] 上下文超出模型容量 (${ctxMgr.estimateTokens(ctxMessages.reduce((s, m) => s + m.content, ''))} tokens > ${ctxMgr.getBudget().maxTokens})，开始压缩...`)
+          let compressed
+          try {
+            compressed = await compressContext(messages, summaryProvider, ctxMgr.getAvailableChars(), undefined, topic, `coord-${Date.now()}`)
+          } catch (e) {
+            // 压缩过程出错 → 终止 Worker（上下文已超限，不能继续）
+            const errMsg = e instanceof Error ? e.message : String(e)
+            throw new Error(`[${minister.name}] 上下文压缩失败: ${errMsg}。上下文已超模型容量，建议开启新会话。`)
+          }
+          // safe 检查：不安全时抛错，向上传播终止 Worker
+          if (!compressed.safe) {
+            throw new Error(`[${minister.name}] ${compressed.warning || '上下文无法安全压缩，建议开启新会话'}`)
+          }
+          const afterChars = countMessageChars(compressed.messages)
+          messages.splice(0, messages.length, ...compressed.messages)
+          console.log(`[Agent] 压缩完成, 消息数: ${messages.length}, 字符: ${afterChars}`)
         }
       }
 
       // 如果这是最后一轮，获取最终回复
       if (round === MAX_TOOL_ROUNDS - 1) {
+        // 最终总结前再做一次容量检查（最后一轮工具结果可能使上下文超限）
+        const ctxMgr = new ContextManager(minister.llm?.model || 'unknown')
+        const ctxMessages = messages.map(m => ({ role: m.role as 'system' | 'user' | 'assistant', content: typeof m.content === 'string' ? m.content : '' }))
+        if (ctxMgr.exceedsContextLimit(ctxMessages)) {
+          const summaryProvider = this.getSummaryProvider()
+          if (!summaryProvider) {
+            throw new Error(`[${minister.name}] 最终总结前上下文已超模型容量但未配置摘要模型，无法压缩。建议开启新会话。`)
+          }
+          console.log(`[Agent] 最终总结前上下文超限，尝试压缩...`)
+          let compressed
+          try {
+            compressed = await compressContext(messages, summaryProvider, ctxMgr.getAvailableChars(), undefined, topic, `coord-final-${Date.now()}`)
+          } catch (e) {
+            const errMsg = e instanceof Error ? e.message : String(e)
+            throw new Error(`[${minister.name}] 最终总结前上下文压缩失败: ${errMsg}。建议开启新会话。`)
+          }
+          if (!compressed.safe) {
+            throw new Error(`[${minister.name}] ${compressed.warning || '最终总结前上下文无法安全压缩，建议开启新会话'}`)
+          }
+          messages.splice(0, messages.length, ...compressed.messages)
+          console.log(`[Agent] 最终总结前压缩完成`)
+        }
+
         const finalReply = await provider.chatStream(
           messages,
           (text) => {
@@ -1275,18 +1377,48 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
       return true
     }
 
+    // 收集任务树节点的异步归因 Promise，确保树结束前全部完成
+    const pendingAttributions: Promise<void>[] = []
+
     const schedulerListener = (evt: any) => {
       if (evt.type === 'node-completed' || evt.type === 'node-failed') {
         const node = tree.nodes[evt.nodeId]
         if (node && node.assigneeId) {
           const worker = workers.find(w => w.id === node.assigneeId)
           this.emit({ type: evt.type === 'node-completed' ? 'node-completed' : 'node-failed', ministerId: node.assigneeId, data: evt.data })
+          const resultContent = node.resultSummary || ''
+          const resultStatus = evt.type === 'node-completed' ? 'success' : 'error'
           workerResults.push({
             ministerId: node.assigneeId, ministerName: worker?.name || node.assigneeId,
-            task: node.title, content: node.resultSummary || '', toolCalls: [], duration: 0,
-            status: evt.type === 'node-completed' ? 'success' : 'error'
+            task: node.title, content: resultContent, toolCalls: [], duration: 0,
+            status: resultStatus
           })
           this.emit({ type: 'worker-done', ministerId: node.assigneeId })
+
+          // 三期：任务树节点失败时进行异常归因（收集 Promise，树结束前等待）
+          if (evt.type === 'node-failed' && appStorage.getItem('enable_error_attribution') !== 'false') {
+            const errMsg = resultContent || '任务节点执行失败'
+            const lastIdx = workerResults.length - 1
+            const nodeId = evt.nodeId
+            const attributionPromise = attributeError({
+              taskDescription: node.title,
+              failedToolCalls: [],
+              errorMessage: errMsg
+            }).then(attribution => {
+              const attrNote = `\n\n---\n**幕僚异常归因**：${attribution.category} — ${attribution.summary}\n根因：${attribution.rootCause}`
+              // 写入 workerResults
+              if (workerResults[lastIdx]) {
+                workerResults[lastIdx].content += attrNote
+              }
+              // 写入节点快照（resultSummary），供丞相汇总时读取
+              if (tree.nodes[nodeId]) {
+                tree.nodes[nodeId].resultSummary = (tree.nodes[nodeId].resultSummary || '') + attrNote
+              }
+              // 归因写入后立即保存快照，防止崩溃丢失
+              try { saveSnapshot?.(tree) } catch { /* 快照保存失败不影响主流程 */ }
+            }).catch(() => { /* 静默失败 */ })
+            pendingAttributions.push(attributionPromise)
+          }
         }
       }
       // 调度器的 budget-update 事件转发给 BudgetTracker（使用实时计数器避免滞后）
@@ -1316,7 +1448,8 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
         if (evt.runId !== tree.runId) return
         if (evt.type === 'tree-completed' || evt.type === 'tree-failed') {
           unsub()
-          resolve()
+          // 等待所有归因完成后再 resolve，确保丞相汇总时能看到归因结果
+          Promise.allSettled(pendingAttributions).then(() => resolve())
         }
       }
       taskScheduler.onEvent(treeDone)

@@ -22,6 +22,8 @@ export interface HierarchicalSummary {
   generatedAt: number
   /** 证据引用列表 */
   evidenceRefs: string[]
+  /** 内部使用：汇总中包含的失败归因节点 ID（用于上层去重） */
+  _failedAttributions?: { nodeId: string; title: string; attribution: string }[]
 }
 
 /**
@@ -56,6 +58,8 @@ export function generateParentSummary(
   }
 
   const evidenceRefs: string[] = []
+  // 收集失败节点的归因内容（确保深层归因也能穿透到丞相）
+  const failedAttributions: { nodeId: string; title: string; attribution: string }[] = []
 
   for (const childId of parent.childIds) {
     const child = tree.nodes[childId]
@@ -68,6 +72,10 @@ export function generateParentSummary(
         break
       case 'failed':
         summary.failed.push(child.title)
+        // 收集失败节点的归因内容
+        if (child.resultSummary && child.resultSummary.includes('幕僚异常归因')) {
+          failedAttributions.push({ nodeId: childId, title: child.title, attribution: child.resultSummary })
+        }
         break
       case 'blocked':
         summary.blocked.push(child.title)
@@ -81,6 +89,13 @@ export function generateParentSummary(
         evidenceRefs.push(...child.evidenceRefs)
         break
     }
+  }
+
+  // 递归检查展开子树中的失败叶子归因
+  for (const childId of parent.childIds) {
+    const child = tree.nodes[childId]
+    if (!child || child.decomposition !== 'expanded' || child.childIds.length === 0) continue
+    collectDeepAttributions(tree, childId, failedAttributions)
   }
 
   // 检测冲突：完成和失败的任务之间可能有冲突
@@ -97,7 +112,7 @@ export function generateParentSummary(
   }
 
   // 生成文本描述
-  const summaryText = renderSummaryText(parent, summary)
+  const summaryText = renderSummaryText(parent, summary, failedAttributions)
 
   return {
     parentId,
@@ -105,14 +120,15 @@ export function generateParentSummary(
     summary,
     summaryText,
     generatedAt: Date.now(),
-    evidenceRefs: [...new Set(evidenceRefs)]
+    evidenceRefs: [...new Set(evidenceRefs)],
+    _failedAttributions: failedAttributions
   }
 }
 
 /**
  * 将 ParentSummary 渲染为可读文本
  */
-function renderSummaryText(parent: TaskNode, summary: ParentSummary): string {
+function renderSummaryText(parent: TaskNode, summary: ParentSummary, failedAttributions: { nodeId: string; title: string; attribution: string }[] = []): string {
   const parts: string[] = []
   const total = summary.completed.length + summary.failed.length +
     summary.blocked.length + summary.skipped.length + summary.partial.length
@@ -128,6 +144,11 @@ function renderSummaryText(parent: TaskNode, summary: ParentSummary): string {
   }
   if (summary.failed.length > 0) {
     parts.push(`❌ 失败 (${summary.failed.length}): ${summary.failed.join(', ')}`)
+  }
+  // 附加失败节点的归因内容（确保丞相能看到深层归因）
+  for (const fa of failedAttributions) {
+    parts.push(`\n#### ❌ ${fa.title} — 异常归因`)
+    parts.push(fa.attribution)
   }
   if (summary.blocked.length > 0) {
     parts.push(`🚫 被阻塞 (${summary.blocked.length}): ${summary.blocked.join(', ')}`)
@@ -181,8 +202,10 @@ export function buildRootContext(tree: TaskTreeSnapshot, rootId: string): string
       default: statusIcon = '⏳'
     }
 
+    // 归因内容不截断（确保丞相能看到完整归因）
+    const hasAttribution = child.resultSummary && child.resultSummary.includes('幕僚异常归因')
     const resultSnippet = child.resultSummary
-      ? truncateText(child.resultSummary, 200)
+      ? (hasAttribution ? child.resultSummary : truncateText(child.resultSummary, 200))
       : '(无结果摘要)'
 
     parts.push(`${statusIcon} ${child.title}: ${resultSnippet}`)
@@ -194,6 +217,8 @@ export function buildRootContext(tree: TaskTreeSnapshot, rootId: string): string
   }
 
   // 如果有更深层的子树，为每个展开的子节点附加汇总
+  // 同时记录子树汇总中已包含的归因标题（用于后续去重）
+  const alreadyShownAttributionNodeIds = new Set<string>()
   for (const childId of root.childIds) {
     const child = tree.nodes[childId]
     if (!child || child.decomposition !== 'expanded' || child.childIds.length === 0) continue
@@ -204,6 +229,37 @@ export function buildRootContext(tree: TaskTreeSnapshot, rootId: string): string
       parts.push(childSummary.summaryText)
       // 收集子树汇总中的证据引用
       allEvidenceRefs.push(...childSummary.evidenceRefs)
+      // 记录子树汇总中已展示的归因标题
+      for (const fa of childSummary._failedAttributions || []) {
+        alreadyShownAttributionNodeIds.add(fa.nodeId)
+      }
+    }
+  }
+
+  // 递归扫描深层失败叶子的归因（确保即使中间节点未标记失败，叶子归因也能穿透到丞相）
+  const deepAttributions: { nodeId: string; title: string; attribution: string }[] = []
+  for (const childId of root.childIds) {
+    const child = tree.nodes[childId]
+    if (!child || child.childIds.length === 0) continue
+    if (child.decomposition !== 'expanded') continue
+    collectDeepAttributions(tree, childId, deepAttributions)
+  }
+  // 去重：排除已在直接子节点 resultSummary 或子树汇总中展示过的归因（按节点 ID）
+  const directChildAttributionNodeIds = new Set(
+    root.childIds
+      .filter(id => {
+        const n = tree.nodes[id]
+        return n && n.resultSummary && n.resultSummary.includes('幕僚异常归因')
+      })
+  )
+  const newDeepAttributions = deepAttributions.filter(
+    a => !directChildAttributionNodeIds.has(a.nodeId) && !alreadyShownAttributionNodeIds.has(a.nodeId)
+  )
+  if (newDeepAttributions.length > 0) {
+    parts.push('\n### 深层失败任务归因')
+    for (const da of newDeepAttributions) {
+      parts.push(`\n#### ❌ ${da.title} — 异常归因`)
+      parts.push(da.attribution)
     }
   }
 
@@ -247,6 +303,27 @@ export function buildSiblingContext(
 }
 
 // ============ 辅助函数 ============
+
+/**
+ * 递归收集深层失败节点的归因内容
+ */
+function collectDeepAttributions(
+  tree: TaskTreeSnapshot,
+  nodeId: string,
+  out: { nodeId: string; title: string; attribution: string }[]
+): void {
+  const node = tree.nodes[nodeId]
+  if (!node) return
+  // 当前节点是失败叶子且有归因
+  if (node.childIds.length === 0 && node.status === 'failed' &&
+      node.resultSummary && node.resultSummary.includes('幕僚异常归因')) {
+    out.push({ nodeId, title: node.title, attribution: node.resultSummary })
+  }
+  // 递归检查子节点
+  for (const childId of node.childIds) {
+    collectDeepAttributions(tree, childId, out)
+  }
+}
 
 function isTerminalStatus(status: string): boolean {
   return ['completed', 'failed', 'skipped', 'cancelled', 'partial', 'blocked'].includes(status)

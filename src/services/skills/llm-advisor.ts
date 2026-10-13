@@ -78,7 +78,7 @@ function getAdvisorProvider(): { provider: LLMProvider; modelId: string } | null
   const summaryId = appStorage.getItem('summary_model_id')
   if (summaryId) {
     const cfg = llmService.getById(summaryId)
-    if (cfg?.apiKey) {
+    if (cfg && (cfg.apiKey || cfg.provider === 'ollama')) {
       return {
         provider: createProvider({ provider: cfg.provider, model: cfg.model, apiKey: cfg.apiKey, baseURL: cfg.baseURL }),
         modelId: `${cfg.provider}/${cfg.model}`
@@ -87,7 +87,7 @@ function getAdvisorProvider(): { provider: LLMProvider; modelId: string } | null
   }
   // 回退到默认模型
   const defaultCfg = llmService.getAll().find(c => c.isDefault) || llmService.getAll()[0]
-  if (defaultCfg?.apiKey) {
+  if (defaultCfg && (defaultCfg.apiKey || defaultCfg.provider === 'ollama')) {
     return {
       provider: createProvider({ provider: defaultCfg.provider, model: defaultCfg.model, apiKey: defaultCfg.apiKey, baseURL: defaultCfg.baseURL }),
       modelId: `${defaultCfg.provider}/${defaultCfg.model}`
@@ -181,7 +181,7 @@ export async function analyzeAndRecommend(params: {
   availableSkills: Skill[]
   topic: string
 }): Promise<AdvisorResult> {
-  const { ministerId, userMessage, availableSkills, topic } = params
+  const { ministerId: _ministerId, userMessage, availableSkills, topic } = params
 
   if (availableSkills.length === 0) {
     throw new Error('无可用 Skill')

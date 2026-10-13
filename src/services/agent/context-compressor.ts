@@ -23,6 +23,18 @@ const MAX_TOOL_RESULT_LEN = 2000
 /** 压缩后保留的最近消息数（不含 system + 首条 user） */
 const KEEP_RECENT = 6
 
+// ============ 类型 ============
+
+/** 压缩结果 */
+export interface CompressResult {
+  /** 压缩后的消息数组 */
+  messages: ChatMessage[]
+  /** 是否可以安全送入模型（false 表示无法压缩到阈值以下） */
+  safe: boolean
+  /** 给用户的提示信息（safe=false 时说明原因） */
+  warning?: string
+}
+
 // ============ 工具函数 ============
 
 /**
@@ -73,27 +85,28 @@ export function truncateToolResults(messages: ChatMessage[], maxLen = MAX_TOOL_R
  * @param provider 用于生成摘要的 LLM provider（通常是摘要模型）
  * @param threshold 压缩阈值（字符数）
  * @param onProgress 压缩进行中回调（可选，用于显示进度）
- * @returns 压缩后的消息数组
+ * @returns CompressResult，包含消息数组和安全标志
  */
 export async function compressContext(
   messages: ChatMessage[],
   provider: LLMProvider,
   threshold: number = getCompressThreshold(),
   onProgress?: (status: string) => void,
-  taskGoal?: string
-): Promise<ChatMessage[]> {
+  taskGoal?: string,
+  sessionId?: string
+): Promise<CompressResult> {
   // 第一步：截断过长的工具结果
   let result = truncateToolResults(messages)
   let totalChars = countMessageChars(result)
 
   if (totalChars <= threshold) {
-    return result
+    return { messages: result, safe: true }
   }
 
   // 第二步：需要 LLM 压缩旧消息
   // 确保有足够的消息可压缩（至少 system + user + 6 条以上才压缩）
   if (result.length < KEEP_RECENT + 2) {
-    return result  // 消息太少，不压缩
+    return { messages: result, safe: false, warning: '消息数量过少但已超限，无法压缩。建议开启新会话。' }
   }
 
   onProgress?.('正在压缩上下文...')
@@ -104,6 +117,17 @@ export async function compressContext(
   const firstUserMsg = result[1]  // 首条 user
   const recentMessages = result.slice(-KEEP_RECENT)
   const oldMessages = result.slice(2, -KEEP_RECENT)
+
+  // 检查不可压缩的固定部分（system + 首条 user + 最近轮次）是否已超阈值
+  const fixedChars = countMessageChars([systemMsg, firstUserMsg, ...recentMessages])
+  if (fixedChars > threshold) {
+    console.warn(`[ContextCompressor] 固定消息段已超阈值 (${fixedChars} > ${threshold})，无法安全压缩`)
+    return {
+      messages: result,
+      safe: false,
+      warning: `上下文固定部分已超阈值（${fixedChars} > ${threshold}），无法安全压缩。建议开启新会话。`
+    }
+  }
 
   // 构建待压缩内容的文本
   const oldContentText = oldMessages.map(m => {
@@ -122,17 +146,45 @@ export async function compressContext(
     // 尝试结构化交接包（二期）
     if (taskGoal) {
       try {
-        const handover = await buildHandoverPackage({ messages: result, taskGoal })
-        const handoverText = renderHandoverPackage(handover)
+        const { handover, evidenceCount, evidencePreviews } = await buildHandoverPackage({
+          messages: result,
+          originalMessages: messages,  // 传入未截断的原始消息，证据存入独立存储
+          taskGoal,
+          sessionId
+        })
+        const handoverText = renderHandoverPackage(handover, evidencePreviews)
         const compressedMessages: ChatMessage[] = [
           systemMsg,
           firstUserMsg,
           { role: 'user', content: handoverText },
           ...recentMessages
         ]
-        const newTotal = countMessageChars(compressedMessages)
-        console.log(`[ContextCompressor] 交接包压缩: ${totalChars} → ${newTotal} 字符, 原始 ${result.length} → ${compressedMessages.length} 条消息`)
-        return compressedMessages
+        let newTotal = countMessageChars(compressedMessages)
+        console.log(`[ContextCompressor] 交接包压缩: ${totalChars} → ${newTotal} 字符, 原始 ${result.length} → ${compressedMessages.length} 条消息, 证据 ${evidenceCount} 条已存入独立存储`)
+
+        // 压缩后仍超阈值：先尝试去掉证据预览
+        if (newTotal > threshold && evidencePreviews.length > 0) {
+          console.warn(`[ContextCompressor] 交接包超阈值 (${newTotal} > ${threshold})，尝试去掉证据预览`)
+          const leanText = renderHandoverPackage(handover, [])
+          const leanMessages: ChatMessage[] = [
+            systemMsg, firstUserMsg,
+            { role: 'user', content: leanText },
+            ...recentMessages
+          ]
+          newTotal = countMessageChars(leanMessages)
+          if (newTotal <= threshold) {
+            console.log(`[ContextCompressor] 去掉证据预览后达标: ${newTotal} 字符`)
+            return { messages: leanMessages, safe: true }
+          }
+        }
+
+        // 仍超阈值：回退自由格式摘要
+        if (newTotal > threshold) {
+          console.warn(`[ContextCompressor] 交接包仍超阈值 (${newTotal} > ${threshold})，回退自由格式摘要`)
+          // fall through to free-form summary below
+        } else {
+          return { messages: compressedMessages, safe: true }
+        }
       } catch (handoverErr) {
         console.warn('[ContextCompressor] 交接包构建失败，回退自由格式摘要:',
           handoverErr instanceof Error ? handoverErr.message : '未知错误')
@@ -176,12 +228,47 @@ export async function compressContext(
     ]
 
     const newTotal = countMessageChars(compressedMessages)
-    console.log(`[ContextCompressor] 压缩完成: ${totalChars} → ${newTotal} 字符, 原始 ${result.length} → ${compressedMessages.length} 条消息`)
+    console.log(`[ContextCompressor] 自由格式压缩: ${totalChars} → ${newTotal} 字符, 原始 ${result.length} → ${compressedMessages.length} 条消息`)
 
-    return compressedMessages
+    // 出口校验：自由格式摘要仍超阈值
+    if (newTotal > threshold) {
+      console.warn(`[ContextCompressor] 自由格式摘要仍超阈值 (${newTotal} > ${threshold})，尝试更激进截断`)
+      // 进一步截断摘要内容
+      const maxSummaryChars = Math.max(500, threshold - fixedChars - 200)
+      const trimmedSummary = summary.slice(0, maxSummaryChars)
+      const finalMessages: ChatMessage[] = [
+        systemMsg,
+        firstUserMsg,
+        {
+          role: 'user',
+          content: `[以下为之前对话的压缩摘要]\n\n${trimmedSummary}\n\n[摘要结束，以下是最近的对话]`
+        },
+        ...recentMessages
+      ]
+      const finalTotal = countMessageChars(finalMessages)
+      if (finalTotal > threshold) {
+        console.warn(`[ContextCompressor] 激进截断后仍超阈值 (${finalTotal} > ${threshold})`)
+        return {
+          messages: finalMessages,
+          safe: false,
+          warning: `压缩后仍超阈值（${finalTotal} > ${threshold}）。建议开启新会话。`
+        }
+      }
+      return { messages: finalMessages, safe: true }
+    }
+
+    return { messages: compressedMessages, safe: true }
   } catch (error) {
     console.warn('[ContextCompressor] LLM 压缩失败，回退到纯截断模式:', error)
     // 回退：只做截断，不压缩
-    return result
+    const fallbackTotal = countMessageChars(result)
+    if (fallbackTotal > threshold) {
+      return {
+        messages: result,
+        safe: false,
+        warning: `压缩失败且截断后仍超阈值（${fallbackTotal} > ${threshold}）。建议开启新会话。`
+      }
+    }
+    return { messages: result, safe: true }
   }
 }

@@ -13,6 +13,7 @@ import type { LLMProvider } from '@/services/llm/types'
 import { appStorage } from '@/services/storage'
 import { llmService } from '@/services/llm-config'
 import { createProvider } from '@/services/llm'
+import { storeEvidence } from './evidence-store'
 
 // ============ 类型定义 ============
 
@@ -32,11 +33,15 @@ export interface HandoverPackage {
   nextSteps: string[]
 }
 
-/** 构建交接包时的证据提取结果 */
+/**
+ * 构建交接包时的返回结果
+ */
 export interface HandoverWithEvidence {
   handover: HandoverPackage
-  /** 从原始消息中提取的证据列表（编号与交接包中的 [E1] 等对应） */
-  extractedEvidence: string[]
+  /** 存储的证据数量 */
+  evidenceCount: number
+  /** 证据预览列表（编号 + 来源 + 前 300 字预览，内联到渲染文本中供 LLM 直接查看） */
+  evidencePreviews: { id: string; source: string; preview: string }[]
 }
 
 // ============ 配置 ============
@@ -53,7 +58,7 @@ function getHandoverProvider(): { provider: LLMProvider; modelId: string } | nul
   const summaryId = appStorage.getItem('summary_model_id')
   if (summaryId) {
     const cfg = llmService.getById(summaryId)
-    if (cfg?.apiKey) {
+    if (cfg && (cfg.apiKey || cfg.provider === 'ollama')) {
       return {
         provider: createProvider({ provider: cfg.provider, model: cfg.model, apiKey: cfg.apiKey, baseURL: cfg.baseURL }),
         modelId: `${cfg.provider}/${cfg.model}`
@@ -61,7 +66,7 @@ function getHandoverProvider(): { provider: LLMProvider; modelId: string } | nul
     }
   }
   const defaultCfg = llmService.getAll().find(c => c.isDefault) || llmService.getAll()[0]
-  if (defaultCfg?.apiKey) {
+  if (defaultCfg && (defaultCfg.apiKey || defaultCfg.provider === 'ollama')) {
     return {
       provider: createProvider({ provider: defaultCfg.provider, model: defaultCfg.model, apiKey: defaultCfg.apiKey, baseURL: defaultCfg.baseURL }),
       modelId: `${defaultCfg.provider}/${defaultCfg.model}`
@@ -123,9 +128,13 @@ export function parseHandoverResponse(raw: string): HandoverPackage | null {
  */
 export async function buildHandoverPackage(params: {
   messages: ChatMessage[]
+  /** 未截断的原始消息（用于证据提取完整原文） */
+  originalMessages?: ChatMessage[]
   taskGoal?: string
-}): Promise<HandoverPackage> {
-  const { messages, taskGoal } = params
+  /** 会话 ID，用于生成全局唯一证据编号 */
+  sessionId?: string
+}): Promise<HandoverWithEvidence> {
+  const { messages, originalMessages, taskGoal, sessionId = 'default' } = params
 
   if (messages.length < 4) {
     throw new Error('消息数量不足以构建交接包')
@@ -139,15 +148,23 @@ export async function buildHandoverPackage(params: {
 
   // 提取关键信息
   const systemMsg = messages.find(m => m.role === 'system')
-  const firstUserMsg = messages.find(m => m.role === 'user')
+  const allUserMessages = messages.filter(m => m.role === 'user')
   const recentMessages = messages.slice(-4)
 
-  // 收集工具结果作为证据线索
-  const toolEvidence: string[] = []
-  for (const m of messages) {
+  // 从原始消息中提取工具证据（完整原文），存入独立证据存储
+  const evidenceSource = originalMessages || messages
+  const toolEvidence: { text: string; source: string; evidenceId: string }[] = []
+  for (const m of evidenceSource) {
     if (m.role === 'tool' && m.content) {
-      const preview = m.content.slice(0, 200)
-      toolEvidence.push(preview)
+      const source = m.name || 'unknown'
+      // 存入独立证据存储，保留完整原文，返回全局唯一编号
+      const evidenceId = storeEvidence(sessionId, source, m.content)
+      // 给 LLM 的摘要版本（前 2000 字）
+      toolEvidence.push({
+        text: m.content.slice(0, 2000),
+        source,
+        evidenceId
+      })
     }
   }
 
@@ -162,6 +179,15 @@ export async function buildHandoverPackage(params: {
     }
     return `[${roleLabel}]: ${text.slice(0, 2000)}`
   }).join('\n\n')
+
+  // 整份 Prompt 总预算控制（小模型输入容量约 15000 字）
+  const TOTAL_BUDGET = 15000
+  const SYSTEM_PROMPT_CHARS = 200
+  const USER_MSGS_CHARS = 3000
+  const RECENT_CHARS = 1500
+  const OLD_CONTENT_CHARS = 5000
+  // 剩余预算分配给工具证据
+  const evidenceBudget = Math.max(500, TOTAL_BUDGET - SYSTEM_PROMPT_CHARS - USER_MSGS_CHARS - RECENT_CHARS - OLD_CONTENT_CHARS - 1000)
 
   // 构建 Prompt
   const messages_for_llm: ChatMessage[] = [
@@ -181,15 +207,38 @@ export async function buildHandoverPackage(params: {
       content: `任务目标：${taskGoal || '（未明确指定）'}
 
 系统指令摘要：${systemMsg?.content?.slice(0, 500) || '无'}
-首条用户消息：${firstUserMsg?.content?.slice(0, 500) || '无'}
+全部用户消息（含中途追加的要求）：
+${(() => {
+  const MAX_TOTAL = USER_MSGS_CHARS
+  let total = 0
+  return allUserMessages.map((m, i) => {
+    const remaining = MAX_TOTAL - total
+    if (remaining <= 0) return `[用户消息${i + 1}]: ...(已截断)`
+    const text = (m.content || '').slice(0, Math.min(1000, remaining))
+    total += text.length
+    return `[用户消息${i + 1}]: ${text}`
+  }).join('\n')
+})()}
 最近对话：
-${recentMessages.map(m => `[${m.role}]: ${m.content?.slice(0, 500) || ''}`).join('\n')}
+${recentMessages.map(m => `[${m.role}]: ${(m.content || '').slice(0, Math.floor(RECENT_CHARS / recentMessages.length))}`).join('\n')}
 
 待压缩的历史消息：
-${oldContentText.slice(0, 10000)}
+${oldContentText.slice(0, OLD_CONTENT_CHARS)}
 
-工具证据列表：
-${toolEvidence.slice(0, 10).map((e, i) => `[E${i + 1}]: ${e}`).join('\n') || '（无工具证据）'}
+工具证据列表（含来源工具名和证据编号）：
+${(() => {
+  let total = 0
+  const lines: string[] = []
+  for (const e of toolEvidence) {
+    const perItem = Math.min(500, Math.max(100, Math.floor(evidenceBudget / Math.max(1, toolEvidence.length))))
+    const remaining = evidenceBudget - total
+    if (remaining <= 0) { lines.push('...(证据已截断)'); break }
+    const text = e.text.slice(0, Math.min(perItem, remaining))
+    lines.push(`[${e.evidenceId}] (${e.source}): ${text}`)
+    total += text.length
+  }
+  return lines.join('\n') || '（无工具证据）'
+})()}
 
 请输出 JSON：
 {
@@ -209,6 +258,37 @@ ${toolEvidence.slice(0, 10).map((e, i) => `[E${i + 1}]: ${e}`).join('\n') || '�
     10
   )
 
+  // 拼装后实际总长校验：按实际拼装内容计数，超限时逐段裁剪
+  const actualTotal = messages_for_llm.reduce((sum, m) => sum + (m.content?.length || 0), 0)
+  if (actualTotal > TOTAL_BUDGET) {
+    console.warn(`[HandoverPackage] 拼装后总长超限 (${actualTotal} > ${TOTAL_BUDGET})，尝试逐段裁剪`)
+    // 裁剪策略：从最宽松的部分开始裁剪
+    // 1. 先裁剪工具证据到最少
+    const evidenceSection = messages_for_llm[1].content?.split('工具证据列表（含来源工具名和证据编号）：\n')[1]?.split('\n\n请输出 JSON')[0] || ''
+    if (evidenceSection.length > 500) {
+      const trimmedEvidence = evidenceSection.slice(0, 500) + '\n...(证据已裁剪)'
+      messages_for_llm[1].content = messages_for_llm[1].content?.replace(evidenceSection, trimmedEvidence)
+    }
+    // 2. 再裁剪历史消息
+    const oldSection = messages_for_llm[1].content?.split('待压缩的历史消息：\n')[1]?.split('\n\n工具证据列表')[0] || ''
+    if (oldSection.length > 2000) {
+      const trimmedOld = oldSection.slice(0, 2000) + '\n...(历史已裁剪)'
+      messages_for_llm[1].content = messages_for_llm[1].content?.replace(oldSection, trimmedOld)
+    }
+    // 3. 再裁剪用户消息
+    const userSection = messages_for_llm[1].content?.split('全部用户消息（含中途追加的要求）：\n')[1]?.split('\n最近对话：')[0] || ''
+    if (userSection.length > 1500) {
+      const trimmedUser = userSection.slice(0, 1500) + '\n...(用户消息已裁剪)'
+      messages_for_llm[1].content = messages_for_llm[1].content?.replace(userSection, trimmedUser)
+    }
+    // 最终检查
+    const finalTotal = messages_for_llm.reduce((sum, m) => sum + (m.content?.length || 0), 0)
+    if (finalTotal > TOTAL_BUDGET) {
+      throw new Error(`交接包 Prompt 总长超限 (${finalTotal} > ${TOTAL_BUDGET})，无法安全构建`)
+    }
+    console.log(`[HandoverPackage] 裁剪后达标: ${finalTotal} 字符`)
+  }
+
   const callPromise = provider.provider.chat(messages_for_llm)
   const timeoutPromise = new Promise<never>((_, reject) => {
     setTimeout(() => reject(new Error(`交接包构建超时 (${timeoutMs}ms)`)), timeoutMs)
@@ -222,7 +302,134 @@ ${toolEvidence.slice(0, 10).map((e, i) => `[E${i + 1}]: ${e}`).join('\n') || '�
     throw new Error('交接包响应格式错误')
   }
 
-  return result
+  // 必留要求校验：LLM 提取 + 关键词启发式始终合并（不依赖空数组判定）
+  // 1. LLM 提取（能理解普通表述的约束）
+  try {
+    const llmDirectives = await extractDirectivesByLLM(provider.provider, allUserMessages, timeoutMs)
+    for (const directive of llmDirectives) {
+      if (!result.requiredItems.some(r => r.includes(directive) || directive.includes(r))) {
+        result.requiredItems.unshift(directive)
+      }
+    }
+  } catch {
+    // LLM 提取失败时静默，关键词回退始终运行
+  }
+  // 2. 关键词启发式始终运行（捕获 LLM 可能遗漏的显式指令）
+  for (const userMsg of allUserMessages) {
+    if (!userMsg.content) continue
+    const fallbackDirectives = extractUserDirectivesByKeywords(userMsg.content)
+    for (const directive of fallbackDirectives) {
+      if (!result.requiredItems.some(r => r.includes(directive))) {
+        result.requiredItems.unshift(directive)
+      }
+    }
+  }
+
+  // 构建证据预览：完整原文存入独立存储，预览内联到交接包供 LLM 直接查看
+  // 总量上限 3000 字，防止长任务使压缩后反而超限
+  const MAX_PREVIEW_TOTAL_CHARS = 3000
+  const evidencePreviews: { id: string; source: string; preview: string }[] = []
+  let previewTotalChars = 0
+  for (const e of toolEvidence) {
+    const remaining = MAX_PREVIEW_TOTAL_CHARS - previewTotalChars
+    if (remaining <= 0) break
+    const preview = e.text.slice(0, Math.min(300, remaining))
+    evidencePreviews.push({ id: e.evidenceId, source: e.source, preview })
+    previewTotalChars += preview.length
+  }
+  return { handover: result, evidenceCount: toolEvidence.length, evidencePreviews }
+}
+
+/**
+ * 用 LLM 从用户消息中提取所有约束和要求（替代关键词启发式）
+ * 能理解普通表述的约束，如“用 TypeScript 写”“输出格式为 JSON”等
+ */
+async function extractDirectivesByLLM(
+  provider: LLMProvider,
+  userMessages: ChatMessage[],
+  timeoutMs: number
+): Promise<string[]> {
+  // 总量上限 5000 字，防止超长用户消息使小模型超载
+  const MAX_USER_TEXT_CHARS = 5000
+  let userTextTotalChars = 0
+  const userTexts = userMessages
+    .map((m, i) => {
+      const remaining = MAX_USER_TEXT_CHARS - userTextTotalChars
+      if (remaining <= 0) return `[消息${i + 1}]: ...(已截断)`
+      const text = (m.content || '').slice(0, remaining)
+      userTextTotalChars += text.length
+      return `[消息${i + 1}]: ${text}`
+    })
+    .join('\n')
+
+  const messages: ChatMessage[] = [
+    {
+      role: 'system',
+      content: `你是需求提取专家。从用户消息中提取所有明确的约束、要求和指令。
+
+规则：
+1. 包括显式要求（“必须”“不要”）和隐式约束（“用 TypeScript”“输出 JSON”“保持简洁”）
+2. 包括格式要求、技术约束、内容限制、风格偏好
+3. 每条要求用一句话概括，不超过 30 字
+4. 返回 JSON 数组，如 ["要求1", "要求2"]
+5. 如果没有额外要求，返回空数组 []`
+    },
+    {
+      role: 'user',
+      content: `请从以下用户消息中提取所有约束和要求：\n\n${userTexts}\n\n请输出 JSON 数组：`
+    }
+  ]
+
+  const callPromise = provider.chat(messages)
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    setTimeout(() => reject(new Error('LLM 提取要求超时')), timeoutMs)
+  })
+
+  const response = await Promise.race([callPromise, timeoutPromise]) as string
+
+  // 解析 JSON 数组
+  try {
+    let jsonStr = response.trim()
+    const codeBlockMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/)
+    if (codeBlockMatch) jsonStr = codeBlockMatch[1].trim()
+    const bracketStart = jsonStr.indexOf('[')
+    const bracketEnd = jsonStr.lastIndexOf(']')
+    if (bracketStart >= 0 && bracketEnd > bracketStart) {
+      jsonStr = jsonStr.slice(bracketStart, bracketEnd + 1)
+    }
+    const parsed = JSON.parse(jsonStr)
+    if (Array.isArray(parsed)) {
+      return parsed.filter((s: any) => typeof s === 'string' && s.length > 0).slice(0, 10)
+    }
+  } catch { /* 解析失败，返回空数组 */ }
+  return []
+}
+
+/**
+ * 从用户消息中提取关键指令（关键词启发式，作为 LLM 提取失败时的回退）
+ */
+function extractUserDirectivesByKeywords(userMessage: string): string[] {
+  const directives: string[] = []
+  const patterns = [
+    /必须(.{2,60})/g,
+    /不要(.{2,60})/g,
+    /请确保(.{2,60})/g,
+    /一定[要得](.{2,60})/g,
+    /禁止(.{2,60})/g,
+    /remember to (.{2,60})/gi,
+    /make sure to (.{2,60})/gi,
+    /don't (.{2,60})/gi,
+  ]
+  for (const pattern of patterns) {
+    let match
+    while ((match = pattern.exec(userMessage)) !== null) {
+      const directive = match[0].trim()
+      if (directive.length >= 4 && directive.length <= 90) {
+        directives.push(directive)
+      }
+    }
+  }
+  return directives.slice(0, 10) // 最多 10 条
 }
 
 // ============ 渲染 ============
@@ -230,7 +437,7 @@ ${toolEvidence.slice(0, 10).map((e, i) => `[E${i + 1}]: ${e}`).join('\n') || '�
 /**
  * 将交接包渲染为可注入消息历史的文本
  */
-export function renderHandoverPackage(handover: HandoverPackage): string {
+export function renderHandoverPackage(handover: HandoverPackage, evidencePreviews?: { id: string; source: string; preview: string }[]): string {
   const parts: string[] = []
 
   parts.push('[以下为之前对话的结构化交接包]')
@@ -262,6 +469,15 @@ export function renderHandoverPackage(handover: HandoverPackage): string {
     parts.push(`## 证据引用`)
     for (const ref of handover.evidenceRefs) {
       parts.push(`- ${ref}`)
+    }
+    parts.push('')
+  }
+
+  // 内联证据预览（LLM 可直接查看证据内容，无需调用外部接口）
+  if (evidencePreviews && evidencePreviews.length > 0) {
+    parts.push(`## 工具证据预览（共 ${evidencePreviews.length} 条，以下为摘要，完整原文已存入独立存储）`)
+    for (const ev of evidencePreviews) {
+      parts.push(`**[${ev.id}]** (${ev.source}): ${ev.preview}${ev.preview.length >= 300 ? '...' : ''}`)
     }
     parts.push('')
   }
