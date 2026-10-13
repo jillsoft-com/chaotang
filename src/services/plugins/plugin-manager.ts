@@ -8,6 +8,7 @@
 import type { LoadedPlugin, PluginScanResult } from './types'
 import type { Skill } from '@/types'
 import { skillRegistry } from '@/services/skills/registry'
+import { defaultMinisterSkills } from '@/services/skills/defaults'
 import { loadAllPlugins } from './plugin-loader'
 
 /** 已加载的插件集合 */
@@ -65,11 +66,21 @@ function registerPluginSkill(plugin: LoadedPlugin): void {
   // 注册到 SkillRegistry
   skillRegistry.register(skill, handlerMap)
 
-  // 自动绑定到指定角色
+  // 自动绑定到角色
   if (manifest.bindTo && manifest.bindTo.length > 0) {
+    // 明确指定了 bindTo：只绑定到指定角色
     for (const ministerId of manifest.bindTo) {
       skillRegistry.bindSkillToMinister(`plugin_${manifest.id}`, ministerId)
     }
+    console.log(`[Plugins] 插件 ${manifest.id} 已绑定到: ${manifest.bindTo.join(', ')}`)
+  } else {
+    // 未指定 bindTo：绑定到所有角色，导入后立即可用
+    // 动态工具选择器会在运行时按议题智能筛选，不会全量发送
+    const allMinisterIds = Object.keys(defaultMinisterSkills)
+    for (const ministerId of allMinisterIds) {
+      skillRegistry.bindSkillToMinister(`plugin_${manifest.id}`, ministerId)
+    }
+    console.log(`[Plugins] 插件 ${manifest.id} 未指定 bindTo，已绑定到所有角色（${allMinisterIds.length} 个）`)
   }
 }
 

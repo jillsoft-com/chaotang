@@ -10,6 +10,7 @@ import { appStorage } from '@/services/storage'
 
 import type { ChatMessage } from '@/types'
 import type { LLMProvider } from '@/services/llm/types'
+import { buildHandoverPackage, renderHandoverPackage } from './handover-package'
 
 // ============ 配置 ============
 
@@ -78,7 +79,8 @@ export async function compressContext(
   messages: ChatMessage[],
   provider: LLMProvider,
   threshold: number = getCompressThreshold(),
-  onProgress?: (status: string) => void
+  onProgress?: (status: string) => void,
+  taskGoal?: string
 ): Promise<ChatMessage[]> {
   // 第一步：截断过长的工具结果
   let result = truncateToolResults(messages)
@@ -117,6 +119,27 @@ export async function compressContext(
 
   // 用摘要模型生成压缩摘要
   try {
+    // 尝试结构化交接包（二期）
+    if (taskGoal) {
+      try {
+        const handover = await buildHandoverPackage({ messages: result, taskGoal })
+        const handoverText = renderHandoverPackage(handover)
+        const compressedMessages: ChatMessage[] = [
+          systemMsg,
+          firstUserMsg,
+          { role: 'user', content: handoverText },
+          ...recentMessages
+        ]
+        const newTotal = countMessageChars(compressedMessages)
+        console.log(`[ContextCompressor] 交接包压缩: ${totalChars} → ${newTotal} 字符, 原始 ${result.length} → ${compressedMessages.length} 条消息`)
+        return compressedMessages
+      } catch (handoverErr) {
+        console.warn('[ContextCompressor] 交接包构建失败，回退自由格式摘要:',
+          handoverErr instanceof Error ? handoverErr.message : '未知错误')
+        // 继续走下面的自由格式摘要
+      }
+    }
+
     const summaryMessages: ChatMessage[] = [
       {
         role: 'system',

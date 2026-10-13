@@ -14,7 +14,7 @@ import { CoordinatorAgent } from '@/services/agent'
 import { taskScheduler } from '@/services/agent'
 import { compressContext, getCompressThreshold, countMessageChars } from '@/services/agent/context-compressor'
 import { memoryStore } from '@/services/memory'
-import { skillRegistry } from '@/services/skills'
+import { skillRegistry, selectToolsForTopic, estimateToolTokens } from '@/services/skills'
 import { toolExecutor } from '@/services/tools/executor'
 import { getProjectIndex, generateContextHint } from '@/services/agent/repository-context'
 import { mcpService } from '@/services/mcp'
@@ -941,7 +941,10 @@ async function runMinisterTurn(params: {
     console.warn('[runMinisterTurn] 仓库索引构建失败:', err)
   }
 
-  const toolDefs = skillRegistry.getToolDefinitionsForMinister(ministerId)
+  // 动态工具选择：根据议题智能筛选相关工具（避免全量发送导致上下文过长）
+  const maxTools = parseInt(appStorage.getItem('max_tools_per_turn') || '12', 10)
+  const toolDefs = await selectToolsForTopic(ministerId, userMessage, maxTools)
+  console.log(`[runMinisterTurn] 工具选择: ${toolDefs.length} 个 (上限 ${maxTools})，约 ${estimateToolTokens(toolDefs)} tokens`)
   // Sprint B - #5：追加 MCP 工具定义 + 注册处理器
   const mcpDefs = mcpService.getAllToolDefinitions()
   const mcpHandlers = mcpService.getAllHandlers()

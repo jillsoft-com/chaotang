@@ -293,14 +293,14 @@ const allSkills: Array<{ skill: Skill; handlers: Record<string, any> }> = [
  * 定义每个角色初始可用的技能
  */
 export const defaultMinisterSkills: Record<string, string[]> = {
-  // 丞相：全局搜索 + 知识库 + 任务协调 + 文件操作 + 文档解析 + 命令行 + 代码搜索 + Git + 浏览器 + 历史案例 + 代码质量 + 类型检查 + 重构
-  chancellor: ['web_search', 'knowledge_base', 'task_coordinator', 'file_ops', 'document_reader', 'command_executor', 'code_search', 'git_ops', 'test_runner', 'memory', 'browser', 'history_cases', 'code_quality', 'type_safety', 'refactoring'],
+  // 丞相：全局搜索 + 知识库 + 任务协调 + 文件读取 + 文件操作 + 文档解析 + 命令行 + 代码搜索 + Git + 浏览器 + 历史案例 + 代码质量 + 类型检查 + 重构 + 记忆
+  chancellor: ['web_search', 'knowledge_base', 'task_coordinator', 'file_reader', 'file_ops', 'document_reader', 'command_executor', 'code_search', 'git_ops', 'test_runner', 'memory', 'browser', 'history_cases', 'code_quality', 'type_safety', 'refactoring'],
   // 户部尚书：数据计算 + 数据可视化 + 搜索 + 文件读取 + 文件操作 + 文档解析 + 命令行 + Git + 测试 + 记忆
   finance: ['calculator', 'data_visualization', 'web_search', 'file_reader', 'file_ops', 'document_reader', 'command_executor', 'git_ops', 'test_runner', 'memory'],
   // 太傅：知识库 + 搜索 + 历史案例 + 文件读取 + 文件操作 + 文档解析 + 命令行 + 代码搜索 + Git + 测试 + 记忆 + 浏览器
   tutor: ['knowledge_base', 'web_search', 'history_cases', 'file_reader', 'file_ops', 'document_reader', 'command_executor', 'code_search', 'git_ops', 'test_runner', 'memory', 'browser'],
-  // 大将军：搜索 + 知识库 + 命令行 + Git + 代码质量 + 类型检查 + 重构（编码核心角色）
-  general: ['web_search', 'knowledge_base', 'command_executor', 'git_ops', 'memory', 'code_quality', 'type_safety', 'refactoring'],
+  // 大将军：搜索 + 知识库 + 命令行 + Git + 代码质量 + 类型检查 + 重构 + 记忆（编码核心角色）
+  general: ['web_search', 'knowledge_base', 'command_executor', 'git_ops', 'memory', 'code_quality', 'type_safety', 'refactoring', 'file_reader', 'file_ops'],
   // 御史：搜索 + 知识库 + 文档解析 + 代码搜索 + 事实核查（御史专属核心能力） + 代码质量
   censor: ['web_search', 'knowledge_base', 'document_reader', 'code_search', 'memory', 'fact_checking', 'code_quality'],
   // 总管：搜索 + 知识库 + 文件读取 + 文件操作 + 文档解析 + 命令行 + 代码搜索 + Git + 记忆
@@ -318,7 +318,7 @@ export function initializeSkills(): void {
   }
 
   // 2. 建立默认绑定（仅在首次初始化时，版本控制确保新技能能补绑）
-  const initialized = appStorage.getItem('skills_initialized_v10')
+  const initialized = appStorage.getItem('skills_initialized_v11')
   if (!initialized) {
     // 清除旧版本标记
     appStorage.removeItem('skills_initialized')
@@ -330,6 +330,7 @@ export function initializeSkills(): void {
     appStorage.removeItem('skills_initialized_v7')
     appStorage.removeItem('skills_initialized_v8')
     appStorage.removeItem('skills_initialized_v9')
+    appStorage.removeItem('skills_initialized_v10')
     appStorage.removeItem('minister_skill_bindings')
     // 重新加载绑定（清除后为空）
     for (const [ministerId, skillIds] of Object.entries(defaultMinisterSkills)) {
@@ -337,7 +338,7 @@ export function initializeSkills(): void {
         skillRegistry.bindSkillToMinister(skillId, ministerId)
       }
     }
-    appStorage.setItem('skills_initialized_v10', 'true')
+    appStorage.setItem('skills_initialized_v11', 'true')
   }
 
   // 3. 加载自定义插件

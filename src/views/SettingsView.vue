@@ -90,6 +90,12 @@ const llmForm = ref({
 // 摘要模型
 const summaryModelId = ref('')
 
+// 幕僚助理
+const enableLlmAdvisor = ref(true)
+const advisorTimeoutMs = ref(3000)
+const enableErrorAttribution = ref(true)
+const enableReportCheck = ref(true)
+
 // 工具调用最大轮次
 const maxToolRounds = ref(30)
 
@@ -338,6 +344,7 @@ onMounted(() => {
   loadSummaryModel()
   loadMaxToolRounds()
   loadCompressThreshold()
+  loadAdvisorSettings()
   // 如果当前是自定义主题，加载角色数据
   if (isCustomTheme(selectedDynasty.value)) {
     loadCustomThemeRoles(selectedDynasty.value)
@@ -384,6 +391,28 @@ function loadCompressThreshold() {
 function saveCompressThreshold() {
   appStorage.setItem('context_compress_threshold', String(contextCompressThreshold.value))
   ElMessage.success('压缩阈值已保存')
+}
+
+function loadAdvisorSettings() {
+  const enabled = appStorage.getItem('enable_llm_advisor')
+  enableLlmAdvisor.value = enabled !== 'false' // 默认 true
+  const timeout = appStorage.getItem('advisor_timeout_ms')
+  if (timeout) {
+    const val = parseInt(timeout, 10)
+    if (val >= 1000 && val <= 10000) advisorTimeoutMs.value = val
+  }
+  const errAttr = appStorage.getItem('enable_error_attribution')
+  enableErrorAttribution.value = errAttr !== 'false'
+  const rptChk = appStorage.getItem('enable_report_check')
+  enableReportCheck.value = rptChk !== 'false'
+}
+
+function saveAdvisorSettings() {
+  appStorage.setItem('enable_llm_advisor', enableLlmAdvisor.value ? 'true' : 'false')
+  appStorage.setItem('advisor_timeout_ms', String(advisorTimeoutMs.value))
+  appStorage.setItem('enable_error_attribution', enableErrorAttribution.value ? 'true' : 'false')
+  appStorage.setItem('enable_report_check', enableReportCheck.value ? 'true' : 'false')
+  ElMessage.success('幕僚助理设置已保存')
 }
 
 function loadMinisterLLMMap() {
@@ -1046,13 +1075,14 @@ async function exportGEPAData() {
               </div>
             </el-card>
 
-            <!-- 摘要模型设置 -->
+            <!-- 摘要模型 + 幕僚助理 -->
             <el-card shadow="never" class="settings-card">
-              <h3 class="card-title">摘要模型</h3>
+              <h3 class="card-title">摘要与幕僚</h3>
+              <p class="card-desc">摘要模型用于上下文压缩和幕僚助理（意图分析、技能推荐、异常归因、汇报检查）。</p>
               <div class="settings-item">
                 <div class="settings-item-info">
                   <span class="settings-item-label">选择摘要模型</span>
-                  <span class="settings-item-desc">用于会话摘要生成的 LLM 模型</span>
+                  <span class="settings-item-desc">幕僚助理复用此模型，未配置时回退到默认模型</span>
                 </div>
                 <div class="summary-model-select">
                   <el-select
@@ -1069,6 +1099,53 @@ async function exportGEPAData() {
                     />
                   </el-select>
                 </div>
+              </div>
+              <el-divider />
+              <div class="settings-item">
+                <div class="settings-item-info">
+                  <span class="settings-item-label">启用幕僚助理</span>
+                  <span class="settings-item-desc">工具超限时分析意图并推荐技能，失败自动回退关键词匹配</span>
+                </div>
+                <el-switch
+                  v-model="enableLlmAdvisor"
+                  @change="saveAdvisorSettings"
+                />
+              </div>
+              <div class="settings-item">
+                <div class="settings-item-info">
+                  <span class="settings-item-label">助理调用超时</span>
+                  <span class="settings-item-desc">超时后自动回退（1000~10000 毫秒，默认 3000）</span>
+                </div>
+                <div class="max-rounds-control">
+                  <el-input-number
+                    v-model="advisorTimeoutMs"
+                    :min="1000"
+                    :max="10000"
+                    :step="500"
+                    size="small"
+                    @change="saveAdvisorSettings"
+                  />
+                </div>
+              </div>
+              <div class="settings-item">
+                <div class="settings-item-info">
+                  <span class="settings-item-label">异常归因</span>
+                  <span class="settings-item-desc">Worker 失败时分析错误类别和根因，供丞相参考</span>
+                </div>
+                <el-switch
+                  v-model="enableErrorAttribution"
+                  @change="saveAdvisorSettings"
+                />
+              </div>
+              <div class="settings-item">
+                <div class="settings-item-info">
+                  <span class="settings-item-label">汇报检查</span>
+                  <span class="settings-item-desc">汇总后检查是否漏答目标，提示遗漏要点</span>
+                </div>
+                <el-switch
+                  v-model="enableReportCheck"
+                  @change="saveAdvisorSettings"
+                />
               </div>
             </el-card>
 

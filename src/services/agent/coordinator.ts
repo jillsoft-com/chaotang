@@ -18,7 +18,7 @@ import { createProvider } from '@/services/llm'
 import { llmService } from '@/services/llm-config'
 import { compressContext, countMessageChars } from './context-compressor'
 import { memoryStore } from '@/services/memory'
-import { skillRegistry } from '@/services/skills'
+import { skillRegistry, selectToolsForTopic, attributeError, checkReport } from '@/services/skills'
 import { toolExecutor } from '@/services/tools/executor'
 import { findPresetById, getCurrentDynastyId } from '@/services/dynasty-presets'
 import { AutonomousEngine } from './autonomous-engine'
@@ -364,7 +364,9 @@ export class CoordinatorAgent {
 
         const reactiveWorker = getReactiveSpeech(workerSpeechId)
         const workerLLM = createProvider(resolveLLM(worker.llm))
-        const toolDefs = skillRegistry.getToolDefinitionsForMinister(worker.id)
+        // 动态工具选择：根据子任务描述智能筛选相关工具
+        const maxTools = parseInt(appStorage.getItem('max_tools_per_turn') || '12', 10)
+        const toolDefs = await selectToolsForTopic(worker.id, workerTask.task, maxTools)
 
         const previousWorkersSummary = this.buildPreviousWorkersSummary(workerResults)
         const taskContextWithHistory = previousWorkersSummary
@@ -423,6 +425,24 @@ export class CoordinatorAgent {
           reactiveWorker.status = 'error'
           workerResults.push({ ministerId: worker.id, ministerName: worker.name, task: workerTask.task, content: errMsg, toolCalls: [], duration: Date.now() - startTime, status: 'error' })
           this.emit({ type: 'error', ministerId: worker.id, data: { phase: 'worker', error } })
+
+          // 三期：异常归因（幕僚分析错误类别）
+          if (appStorage.getItem('enable_error_attribution') !== 'false') {
+            try {
+              const attribution = await attributeError({
+                taskDescription: workerTask.task,
+                failedToolCalls: [],
+                errorMessage: errMsg
+              })
+              const attrNote = `\n\n---\n**幕僚异常归因**：${attribution.category} — ${attribution.summary}\n根因：${attribution.rootCause}`
+              reactiveWorker.content += attrNote
+              const lastResult = workerResults[workerResults.length - 1]
+              if (lastResult) lastResult.content += attrNote
+            } catch {
+              // 静默失败
+            }
+          }
+
           if (!this.config.continueOnError) break
         }
       }
@@ -469,6 +489,29 @@ export class CoordinatorAgent {
         )
         reactiveSummary.content = (costTable ? costTable + '\n\n' : '') + summary
         reactiveSummary.status = 'completed'
+
+        // 三期：汇报检查（幕僚检查是否漏答目标）
+        if (appStorage.getItem('enable_report_check') !== 'false') {
+          try {
+            const reportCheck = await checkReport({
+              goal: topic,
+              requirements: [],
+              reportContent: summary
+            })
+            if (reportCheck.missingPoints.length > 0 || reportCheck.suggestions.length > 0) {
+              let checkNote = '\n\n---\n**幕僚汇报检查**：'
+              if (reportCheck.missingPoints.length > 0) {
+                checkNote += '\n遗漏要点：' + reportCheck.missingPoints.join('；')
+              }
+              if (reportCheck.suggestions.length > 0) {
+                checkNote += '\n改进建议：' + reportCheck.suggestions.join('；')
+              }
+              reactiveSummary.content += checkNote
+            }
+          } catch {
+            // 静默失败
+          }
+        }
       } catch (error) {
         reactiveSummary.content = `汇总失败：${error instanceof Error ? error.message : '未知错误'}`
         reactiveSummary.status = 'error'
@@ -959,7 +1002,7 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
           if (summaryProvider) {
             console.log(`[Agent] 上下文超出模型容量 (${ctxMgr.estimateTokens(ctxMessages.reduce((s, m) => s + m.content, ''))} tokens > ${ctxMgr.getBudget().maxTokens})，开始压缩...`)
             try {
-              const compressed = await compressContext(messages, summaryProvider, ctxMgr.getAvailableChars())
+              const compressed = await compressContext(messages, summaryProvider, ctxMgr.getAvailableChars(), undefined, topic)
               const afterChars = countMessageChars(compressed)
               messages.splice(0, messages.length, ...compressed)
               console.log(`[Agent] 压缩完成, 消息数: ${messages.length}, 字符: ${afterChars}`)
@@ -1313,8 +1356,9 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
     addSpeech(workerSpeech)
     const reactiveWorker = getReactiveSpeech(workerSpeechId)
     const workerLLM = createProvider(resolveLLM(worker.llm))
-    // 实际工具集：只读节点过滤掉写工具
-    let toolDefs = skillRegistry.getToolDefinitionsForMinister(worker.id)
+    // 动态工具选择：根据任务描述智能筛选相关工具
+    const maxTools = parseInt(appStorage.getItem('max_tools_per_turn') || '12', 10)
+    let toolDefs = await selectToolsForTopic(worker.id, node.description, maxTools)
     if (node.readOnly) {
       toolDefs = filterToolDefinitionsForReadOnlyNode(toolDefs)
     }
