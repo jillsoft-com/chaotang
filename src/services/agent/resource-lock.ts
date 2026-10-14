@@ -36,9 +36,12 @@ export interface LockAcquireResult {
 /** 写操作工具列表：只读节点不应使用这些工具 */
 export const WRITE_TOOLS: ReadonlySet<string> = new Set([
   'write_file',
+  'search_replace',
   'create_directory',
   'execute_command',
   'git_operation',
+  'git_auto_commit',
+  'git_create_branch',
   'run_tests',
   'refactor_rename'
 ])

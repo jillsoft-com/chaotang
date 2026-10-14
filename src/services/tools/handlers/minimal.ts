@@ -14,6 +14,8 @@ import { appStorage } from '@/services/storage'
 
 import type { ToolDefinition, ToolHandler } from '@/types'
 import { memoryStore } from '@/services/memory'
+import { autoCommit, createBranch, getDiffSummary } from '@/services/agent/git-workflow'
+import type { CommandExecutor } from '@/services/agent/acceptance-gate'
 
 // ============ 工具定义（发给 LLM 的 Schema）============
 
@@ -131,7 +133,7 @@ export const writeFileTool: ToolDefinition = {
   type: 'function',
   function: {
     name: 'write_file',
-    description: '将内容写入本地文件。支持文本文件（.txt, .md, .csv, .json 等）。如果父目录不存在会自动创建。适合保存报告、导出数据、记录分析结果等。',
+    description: '创建新文件并写入内容。如果是修改已有文件，请优先使用 search_replace 工具进行精确编辑，避免覆盖其他修改。',
     parameters: {
       type: 'object',
       properties: {
@@ -145,6 +147,50 @@ export const writeFileTool: ToolDefinition = {
         }
       },
       required: ['path', 'content']
+    }
+  }
+}
+
+export const searchReplaceTool: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'search_replace',
+    description: '精确替换文件中的指定文本片段。支持多个替换操作，全部校验通过后才写入。修改已有文件时优先使用此工具而非 write_file。使用前需先用 read_file 读取文件获取 sha256。',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: '文件的完整路径'
+        },
+        expected_sha256: {
+          type: 'string',
+          description: '文件的 SHA-256 哈希值，来自最近一次 read_file 的返回值。用于检测文件是否被外部修改。'
+        },
+        patches: {
+          type: 'array',
+          description: '替换操作列表，按顺序执行。所有 patch 先校验后写入，任一失败则全部不写入。',
+          items: {
+            type: 'object',
+            properties: {
+              old_text: {
+                type: 'string',
+                description: '要被替换的原始文本。默认必须在文件中唯一出现，否则需设置 replace_all=true。'
+              },
+              new_text: {
+                type: 'string',
+                description: '替换后的新文本'
+              },
+              replace_all: {
+                type: 'boolean',
+                description: '是否替换所有匹配项，默认 false（仅替换第一个匹配）'
+              }
+            },
+            required: ['old_text', 'new_text']
+          }
+        }
+      },
+      required: ['path', 'patches']
     }
   }
 }
@@ -313,6 +359,102 @@ export const runTestsTool: ToolDefinition = {
   }
 }
 
+export const gitAutoCommitTool: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'git_auto_commit',
+    description: '自动暂存并提交变更。可指定提交信息和文件范围，不指定则提交所有变更并自动生成提交信息。',
+    parameters: {
+      type: 'object',
+      properties: {
+        cwd: {
+          type: 'string',
+          description: 'Git 仓库目录路径'
+        },
+        message: {
+          type: 'string',
+          description: '提交信息（可选，不填则自动生成）'
+        },
+        files: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '指定提交的文件列表（可选，不填则提交所有变更）'
+        }
+      }
+    }
+  }
+}
+
+export const gitCreateBranchTool: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'git_create_branch',
+    description: '创建并切换到新的 Git 分支。',
+    parameters: {
+      type: 'object',
+      properties: {
+        cwd: {
+          type: 'string',
+          description: 'Git 仓库目录路径'
+        },
+        branch_name: {
+          type: 'string',
+          description: '新分支名称'
+        }
+      },
+      required: ['branch_name']
+    }
+  }
+}
+
+export const gitDiffSummaryTool: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'git_diff_summary',
+    description: '获取 Git diff 摘要，包括变更文件列表、增删行数、最近提交记录。用于交付报告或代码审查。',
+    parameters: {
+      type: 'object',
+      properties: {
+        cwd: {
+          type: 'string',
+          description: 'Git 仓库目录路径'
+        },
+        base: {
+          type: 'string',
+          description: '对比基准（默认 HEAD，可以是 commit hash、分支名或 tag）'
+        }
+      }
+    }
+  }
+}
+
+export const symbolLookupTool: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'symbol_lookup',
+    description: '查找代码符号（函数、类、接口等）的定义位置和引用关系。用于理解代码结构、追踪调用链、定位实现细节。',
+    parameters: {
+      type: 'object',
+      properties: {
+        symbol_name: {
+          type: 'string',
+          description: '要查找的符号名称（函数名、类名、变量名等）'
+        },
+        mode: {
+          type: 'string',
+          enum: ['definition', 'references', 'callers'],
+          description: '查找模式：definition=定义位置，references=所有引用，callers=仅调用者'
+        },
+        cwd: {
+          type: 'string',
+          description: '项目目录路径'
+        }
+      },
+      required: ['symbol_name']
+    }
+  }
+}
+
 // ============ 工具处理器实现 ============
 
 /**
@@ -471,43 +613,46 @@ async function searchDuckDuckGoAPI(
 }
 
 /**
- * knowledge_query — 知识库检索
- * 初期实现：从 localStorage 中读取预存的知识条目，简单关键词匹配
- * 后续可替换为向量数据库 RAG
+ * knowledge_query — 知识库检索（三期 Phase D 升级：向量 RAG）
+ * 使用 memoryStore 的语义搜索（TF-IDF 向量检索）替代简单关键词匹配
  */
 export const knowledgeQueryHandler: ToolHandler = async (args) => {
   const { question, context } = args
 
-  // 初期：从 localStorage 的知识库中检索
-  const knowledgeBase = JSON.parse(appStorage.getItem('knowledge_base') || '[]')
+  // Phase D: 使用 memoryStore 的语义搜索
+  const { memoryStore } = await import('@/services/memory/memory-store')
+  
+  try {
+    const results = await memoryStore.semanticSearch(question, 5)
+    
+    if (results.length === 0) {
+      return {
+        question,
+        message: '知识库中未找到相关信息。',
+        results: []
+      }
+    }
 
-  if (knowledgeBase.length === 0) {
     return {
       question,
-      message: '知识库为空。请在设置中添加知识条目，或等待知识库功能完善。',
+      context: context || '',
+      result_count: results.length,
+      results: results.map(m => ({
+        title: m.tags[0] || m.type,
+        content: m.content,
+        relevance: m.score,
+        type: m.type,
+        importance: m.importance
+      }))
+    }
+  } catch (error) {
+    console.error('[knowledge_query] 语义搜索失败:', error)
+    return {
+      question,
+      message: '知识库检索失败',
+      error: error instanceof Error ? error.message : '未知错误',
       results: []
     }
-  }
-
-  // 简单关键词匹配
-  const keywords = question.toLowerCase().split(/\s+/)
-  const scored = knowledgeBase.map((entry: any) => {
-    const text = `${entry.title || ''} ${entry.content || ''}`.toLowerCase()
-    const score = keywords.filter((kw: string) => text.includes(kw)).length
-    return { ...entry, score }
-  }).filter((e: any) => e.score > 0)
-    .sort((a: any, b: any) => b.score - a.score)
-    .slice(0, 3)
-
-  return {
-    question,
-    context: context || '',
-    result_count: scored.length,
-    results: scored.map((e: any) => ({
-      title: e.title,
-      content: e.content,
-      relevance: e.score
-    }))
   }
 }
 
@@ -565,6 +710,7 @@ export const readFileHandler: ToolHandler = async (args) => {
       return {
         path: filePath,
         size: content.length,
+        sha256: result.sha256,
         content: content.length > 10000 ? content.slice(0, 10000) + '\n... (文件过大，已截断)' : content
       }
     } catch (error) {
@@ -637,6 +783,75 @@ export const writeFileHandler: ToolHandler = async (args) => {
   return {
     path: filePath,
     message: '当前为 Web 模式，无法写入本地文件。请使用 Electron 桌面版。'
+  }
+}
+
+/**
+ * search_replace — 补丁式精确编辑
+ * 通过 Electron IPC 调用主进程的 patch-file 实现
+ * 原子性：所有 patch 先校验后写入，任一失败则全部不写入
+ */
+export const searchReplaceHandler: ToolHandler = async (args) => {
+  const { path: filePath, patches, expected_sha256 } = args
+
+  if (!filePath) {
+    throw new Error('path 不能为空')
+  }
+  if (!Array.isArray(patches) || patches.length === 0) {
+    throw new Error('patches 必须为非空数组')
+  }
+
+  // 转换参数格式：LLM 用 snake_case，IPC 用 camelCase
+  const normalizedPatches = patches.map((p: any) => ({
+    oldText: p.old_text || p.oldText,
+    newText: p.new_text || p.newText,
+    replaceAll: p.replace_all || p.replaceAll || false
+  }))
+
+  if (window.electronAPI?.patchFile) {
+    try {
+      const result = await window.electronAPI.patchFile(filePath, normalizedPatches, expected_sha256)
+      if (!result.success) {
+        // 返回结构化错误信息，供模型决策
+        const errorInfo: Record<string, any> = {
+          success: false,
+          path: filePath,
+          errorCode: result.errorCode,
+          error: result.error,
+          currentSha256: result.currentSha256
+        }
+        if (result.patchIndex !== undefined) errorInfo.patchIndex = result.patchIndex
+        if (result.matchCount !== undefined) errorInfo.matchCount = result.matchCount
+
+        // 给模型的提示
+        if (result.errorCode === 'VERSION_MISMATCH') {
+          errorInfo.hint = '文件已被外部修改，请先用 read_file 重新读取获取最新 sha256'
+        } else if (result.errorCode === 'NOT_FOUND') {
+          errorInfo.hint = 'oldText 在文件中未找到，请检查拼写或用 read_file 重新读取文件内容'
+        } else if (result.errorCode === 'NOT_UNIQUE') {
+          errorInfo.hint = 'oldText 在文件中出现多次，请提供更精确的上下文使其唯一，或设置 replace_all=true'
+        } else if (result.errorCode === 'FILE_NOT_FOUND') {
+          errorInfo.hint = '文件不存在，请检查路径或用 write_file 创建新文件'
+        }
+        return errorInfo
+      }
+      return {
+        success: true,
+        path: filePath,
+        sha256: result.sha256,
+        patchesApplied: result.patchesApplied,
+        matchCounts: result.matchCounts,
+        message: `补丁编辑成功: ${filePath}（${result.patchesApplied} 处替换）`
+      }
+    } catch (error) {
+      throw new Error(`补丁编辑失败: ${error instanceof Error ? error.message : '未知错误'}`)
+    }
+  }
+
+  return {
+    success: false,
+    path: filePath,
+    message: '当前为 Web 模式，无法使用补丁编辑。请使用 Electron 桌面版。'
   }
 }
 
@@ -853,6 +1068,120 @@ export const gitOperationHandler: ToolHandler = async (args) => {
     operation,
     message: '当前为 Web 模式，无法执行 Git 操作。请使用 Electron 桌面版。',
     success: false
+  }
+}
+
+// ============ Git 工作流处理器（Phase 3） ============
+
+/** 构建 CommandExecutor（从 window.electronAPI） */
+function buildCommandExecutor(cwd?: string): CommandExecutor | null {
+  if (!window.electronAPI?.executeCommand) return null
+  return {
+    execute: async (cmd: string, cmdCwd?: string, timeoutMs?: number) => {
+      const result = await window.electronAPI!.executeCommand({
+        command: cmd,
+        cwd: cmdCwd || cwd || '',
+        timeout: timeoutMs || 30000
+      })
+      return {
+        exitCode: result.exitCode ?? (result.success ? 0 : 1),
+        stdout: result.stdout || '',
+        stderr: result.stderr || '',
+        timedOut: result.timedOut || false
+      }
+    },
+    // P0-fix: 提供 writeFile 能力，用于安全传入 commit message
+    writeFile: async (path: string, content: string) => {
+      if (window.electronAPI?.writeFile) {
+        const result = await window.electronAPI.writeFile(path, content)
+        return { success: result?.success ?? false }
+      }
+      return { success: false }
+    },
+    // P1-fix: 提供 readFile 能力，返回内容与 SHA-256，统一哈希读取路径
+    readFile: async (path: string) => {
+      if (window.electronAPI?.readFile) {
+        const result = await window.electronAPI.readFile(path)
+        return {
+          success: result?.success ?? false,
+          content: result?.content,
+          sha256: result?.sha256
+        }
+      }
+      return { success: false }
+    }
+  }
+}
+
+/**
+ * git_auto_commit — 自动提交
+ */
+export const gitAutoCommitHandler: ToolHandler = async (args) => {
+  const { cwd, message, files } = args
+  const executor = buildCommandExecutor(cwd)
+  if (!executor) {
+    return { success: false, message: '当前为 Web 模式，无法执行 Git 操作。请使用 Electron 桌面版。' }
+  }
+
+  try {
+    const result = await autoCommit(cwd || '', executor, message, files)
+    return {
+      success: result.success,
+      commitHash: result.commitHash,
+      filesChanged: result.filesChanged,
+      message: result.message,
+      command: result.command
+    }
+  } catch (error) {
+    throw new Error(`Git 自动提交失败: ${error instanceof Error ? error.message : '未知错误'}`)
+  }
+}
+
+/**
+ * git_create_branch — 创建分支
+ */
+export const gitCreateBranchHandler: ToolHandler = async (args) => {
+  const { cwd, branch_name } = args
+  const executor = buildCommandExecutor(cwd)
+  if (!executor) {
+    return { success: false, message: '当前为 Web 模式，无法执行 Git 操作。请使用 Electron 桌面版。' }
+  }
+
+  try {
+    const result = await createBranch(cwd || '', executor, branch_name)
+    return {
+      success: result.success,
+      branchName: result.branchName,
+      previousBranch: result.previousBranch,
+      message: result.message
+    }
+  } catch (error) {
+    throw new Error(`Git 创建分支失败: ${error instanceof Error ? error.message : '未知错误'}`)
+  }
+}
+
+/**
+ * git_diff_summary — 获取 diff 摘要
+ */
+export const gitDiffSummaryHandler: ToolHandler = async (args) => {
+  const { cwd, base } = args
+  const executor = buildCommandExecutor(cwd)
+  if (!executor) {
+    return { success: false, message: '当前为 Web 模式，无法执行 Git 操作。请使用 Electron 桌面版。' }
+  }
+
+  try {
+    const result = await getDiffSummary(cwd || '', executor, base)
+    return {
+      success: true,
+      filesChanged: result.filesChanged,
+      insertions: result.insertions,
+      deletions: result.deletions,
+      fileDetails: result.fileDetails,
+      commitLog: result.commitLog
+    }
+  } catch (error) {
+    throw new Error(`Git diff 摘要失败: ${error instanceof Error ? error.message : '未知错误'}`)
   }
 }
 
@@ -1682,6 +2011,63 @@ export const refactorRenameHandler: ToolHandler = async (args) => {
 }
 
 /**
+ * symbol_lookup — 符号查找
+ * 通过项目索引查找符号定义和引用关系
+ */
+export const symbolLookupHandler: ToolHandler = async (args) => {
+  const { symbol_name, mode = 'definition', cwd } = args
+
+  // 需要项目索引
+  if (!cwd) {
+    return {
+      success: false,
+      error: '缺少项目目录路径（cwd）'
+    }
+  }
+
+  // 动态导入避免循环依赖
+  const { getProjectIndex, symbolSearch } = await import('@/services/agent/repository-context')
+  const index = await getProjectIndex(cwd)
+
+  if (!index.symbolIndex || index.symbolIndex.size === 0) {
+    return {
+      symbol_name,
+      message: '项目索引未包含符号信息，请先扫描项目代码。',
+      results: []
+    }
+  }
+
+  const results = symbolSearch(index, symbol_name, mode)
+
+  if (results.length === 0) {
+    return {
+      symbol_name,
+      message: `未找到符号 "${symbol_name}"`,
+      results: []
+    }
+  }
+
+  return {
+    symbol_name,
+    mode,
+    match_count: results.length,
+    results: results.map(r => ({
+      name: r.symbol.name,
+      kind: r.symbol.kind,
+      file: r.symbol.filePath,
+      line: r.symbol.startLine,
+      signature: r.symbol.signature,
+      exported: r.symbol.exported,
+      references: r.references?.map(ref => ({
+        file: ref.filePath,
+        line: ref.line,
+        kind: ref.kind
+      }))
+    }))
+  }
+}
+
+/**
  * 所有工具的映射（供注册使用）
  */
 export const MINIMAL_TOOL_HANDLERS: Record<string, ToolHandler> = {
@@ -1690,12 +2076,16 @@ export const MINIMAL_TOOL_HANDLERS: Record<string, ToolHandler> = {
   calculate: calculateHandler,
   read_file: readFileHandler,
   write_file: writeFileHandler,
+  search_replace: searchReplaceHandler,
   create_directory: createDirectoryHandler,
   read_directory: readDirectoryHandler,
   read_document: readDocumentHandler,
   execute_command: executeCommandHandler,
   search_code: searchCodeHandler,
   git_operation: gitOperationHandler,
+  git_auto_commit: gitAutoCommitHandler,
+  git_create_branch: gitCreateBranchHandler,
+  git_diff_summary: gitDiffSummaryHandler,
   run_tests: runTestsHandler,
   save_memory: saveMemoryHandler,
   search_memory: searchMemoryHandler,
@@ -1706,7 +2096,8 @@ export const MINIMAL_TOOL_HANDLERS: Record<string, ToolHandler> = {
   history_search: historySearchHandler,
   lint_check: lintCheckHandler,
   type_check: typeCheckHandler,
-  refactor_rename: refactorRenameHandler
+  refactor_rename: refactorRenameHandler,
+  symbol_lookup: symbolLookupHandler
 }
 
 export const MINIMAL_TOOL_DEFINITIONS: ToolDefinition[] = [
@@ -1715,12 +2106,16 @@ export const MINIMAL_TOOL_DEFINITIONS: ToolDefinition[] = [
   calculateTool,
   readFileTool,
   writeFileTool,
+  searchReplaceTool,
   createDirectoryTool,
   readDirectoryTool,
   readDocumentTool,
   executeCommandTool,
   searchCodeTool,
   gitOperationTool,
+  gitAutoCommitTool,
+  gitCreateBranchTool,
+  gitDiffSummaryTool,
   runTestsTool,
   saveMemoryTool,
   searchMemoryTool,
@@ -1731,5 +2126,6 @@ export const MINIMAL_TOOL_DEFINITIONS: ToolDefinition[] = [
   historySearchTool,
   lintCheckTool,
   typeCheckTool,
-  refactorRenameTool
+  refactorRenameTool,
+  symbolLookupTool
 ]

@@ -118,9 +118,11 @@ describe('动态工具选择器', () => {
     appStorage.setItem('enable_llm_advisor', 'false')
     initializeSkills()
 
-    const tools = await selectToolsForTopic('general', '请查看 git 分支并提交代码', 8)
+    const tools = await selectToolsForTopic('general', '请查看 git 分支并提交代码', 12)
     const toolNames = tools.map((t: any) => t.function.name)
-    expect(toolNames).toContain('git_operation')
+    // 至少包含一个 git 相关工具
+    const gitTools = toolNames.filter((n: string) => n.includes('git'))
+    expect(gitTools.length).toBeGreaterThan(0)
   })
 
   it('maxTools 参数生效', async () => {

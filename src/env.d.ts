@@ -18,8 +18,29 @@ interface ElectronAPI {
   storeSetSync: (key: string, value: string) => void
   storeDeleteSync: (key: string) => void
   storeGetPath: () => Promise<string>
-  readFile: (filePath: string) => Promise<{ success: boolean; content?: string; error?: string }>
+  readFile: (filePath: string) => Promise<{ success: boolean; content?: string; sha256?: string; error?: string }>
   writeFile: (filePath: string, content: string) => Promise<{ success: boolean; path?: string; size?: number; error?: string }>
+  patchFile: (filePath: string, patches: Array<{ oldText: string; newText: string; replaceAll?: boolean }>, expectedSha256?: string) => Promise<{
+    success: boolean
+    path?: string
+    sha256?: string
+    patchesApplied?: number
+    matchCounts?: number[]
+    currentSha256?: string
+    errorCode?: 'FILE_NOT_FOUND' | 'VERSION_MISMATCH' | 'NOT_FOUND' | 'NOT_UNIQUE'
+    patchIndex?: number
+    matchCount?: number
+    error?: string
+  }>
+  revertFile: (filePath: string, oldContent: string, expectedSha256: string) => Promise<{
+    success: boolean
+    path?: string
+    sha256?: string
+    reverted?: boolean
+    currentSha256?: string
+    errorCode?: 'FILE_NOT_FOUND' | 'VERSION_MISMATCH' | 'MISSING_VERSION' | 'VERSION_MISMATCH_AFTER_APPROVAL'
+    error?: string
+  }>
   createDirectory: (dirPath: string) => Promise<{ success: boolean; path?: string; error?: string }>
   readDirectory: (dirPath: string) => Promise<{
     success: boolean

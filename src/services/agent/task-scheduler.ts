@@ -29,7 +29,9 @@ import {
   changePriority,
   moveNode,
   serializeSnapshot,
-  deserializeSnapshot
+  deserializeSnapshot,
+  updateGoalProgress,
+  getGoalSummary
 } from './task-tree'
 import { ExecutionGuardian } from './execution-guardian'
 import type { GuardianConfig, GuardianRecord, NodeCost } from './execution-guardian'
@@ -37,6 +39,7 @@ import { eventLogger } from './event-logger'
 import { ResourceLockManager } from './resource-lock'
 import { generateParentSummary, buildSiblingContext } from './hierarchical-summary'
 import { depthEvaluator } from './depth-evaluator'
+import type { AcceptancePlan } from './acceptance-gate'
 
 // ============ 树编辑类型 ============
 
@@ -86,6 +89,10 @@ export interface LeafResult {
   goalReached?: boolean
   /** LLM 输出中明确表明任务过于复杂需要更深拆解的信号 */
   complexitySignal?: boolean
+  /** 验收结果（P0-B） */
+  acceptance?: AcceptancePlan
+  /** 文件基线记录（P1-C） */
+  fileBaselines?: Record<string, { beforeSha256: string; afterSha256?: string; originalContent?: string }>
 }
 
 /** 执行上下文（由 coordinator 传入） */
@@ -113,6 +120,11 @@ export interface ExecutionContext {
     context: LeafExecContext,
     abortSignal?: AbortSignal
   ) => Promise<LeafResult>
+  /** 三期 Phase B: 请求丞相为长期目标规划新子任务 */
+  requestGoalReplan?: (
+    tree: TaskTreeSnapshot,
+    goalSummary: string
+  ) => Promise<TaskTreeSnapshot>
 }
 
 /** 调度器事件类型 */
@@ -134,6 +146,10 @@ export type SchedulerEventType =
   | 'guardian-warning'
   | 'guardian-retry'
   | 'budget-update'
+  | 'goal-progress'
+  | 'goal-stalled'
+  | 'goal-replan'
+  | 'goal-achieved'
   | 'error'
 
 export interface SchedulerEvent {
@@ -522,6 +538,27 @@ export class TaskScheduler {
       })
     }
 
+    // 三期 Phase B: 长期目标心跳
+    if (entry.tree.longTermGoal && !entry.tree.longTermGoal.achievedAt) {
+      const progress = this.computeGoalProgress(entry.tree)
+      updateGoalProgress(entry.tree, progress)
+      entry.context.saveSnapshot(entry.tree)
+
+      this.emit({
+        type: 'goal-progress',
+        runId,
+        data: { progress, stalled: entry.tree.longTermGoal.stalled, checkCount: entry.tree.longTermGoal.checkCount }
+      })
+
+      if (entry.tree.longTermGoal.stalled) {
+        this.emit({
+          type: 'goal-stalled',
+          runId,
+          data: { goal: entry.tree.longTermGoal }
+        })
+      }
+    }
+
     // 如果当前没有在协调，检查是否有 ready 节点
     const readyNodes = getReadyNodes(entry.tree)
     if (readyNodes.length > 0) {
@@ -582,11 +619,37 @@ export class TaskScheduler {
         this.emit({ type: 'tree-updated', runId, data: { state: newState } })
       }
       if (['completed', 'completed_with_gaps', 'failed', 'cancelled'].includes(newState)) {
+        // 三期 Phase B: 长期目标检查
+        if (tree.longTermGoal && !tree.longTermGoal.achievedAt) {
+          // 树完成但目标未达成 → 触发重新规划
+          if (newState !== 'failed' && newState !== 'cancelled' && context.requestGoalReplan) {
+            const goalSummary = getGoalSummary(tree)
+            this.emit({ type: 'goal-replan', runId, data: { goalSummary, treeState: newState } })
+            try {
+              const updatedTree = await context.requestGoalReplan(tree, goalSummary)
+              // 合并新规划的子任务
+              Object.assign(tree.nodes, updatedTree.nodes)
+              tree.state = 'running' // 继续运行
+              tree.planRevision++
+              context.saveSnapshot(tree)
+              this.emit({ type: 'tree-updated', runId, data: { tree } })
+              // 递归协调新节点
+              setTimeout(() => this.coordinate(runId), 0)
+              return
+            } catch {
+              // 重新规划失败，继续正常完成流程
+            }
+          }
+        }
         this.emit({
           type: newState === 'failed' ? 'tree-failed' : 'tree-completed',
           runId,
           data: { state: newState, usage: tree.usage }
         })
+        // 三期 Phase B: 目标达成事件
+        if (tree.longTermGoal?.achievedAt) {
+          this.emit({ type: 'goal-achieved', runId, data: { goal: tree.longTermGoal } })
+        }
         this.cleanup(runId)
       }
       return
@@ -825,7 +888,34 @@ export class TaskScheduler {
       }
 
       const newStatus: TaskStatus = result.status === 'success' ? 'completed' : 'failed'
-      transitionStatus(tree, node.id, newStatus, result.goalReached === false ? '自主引擎未达成目标' : undefined)
+
+      // P0-B: 验收状态机介入
+      // 将验收结果写入节点
+      if (result.acceptance) {
+        node.acceptanceState = result.acceptance.overallState
+        node.acceptanceChecks = result.acceptance.checks
+      }
+      // P1-C: 文件基线写入节点（用于恢复校验）
+      if (result.fileBaselines) {
+        node.fileBaselines = result.fileBaselines
+      }
+
+      // 验收失败 → 强制标记为 failed
+      if (result.status === 'success' && result.acceptance && result.acceptance.overallState === 'failed') {
+        const failedChecks = result.acceptance.checks.filter(c => c.status === 'failed')
+        const diagnostics = failedChecks.map(c => `[${c.kind}] ${c.command}: ${c.summary}`).join('\n')
+        transitionStatus(tree, node.id, 'failed', `验收失败:\n${diagnostics}`)
+      } else if (result.status === 'success' && result.acceptance && result.acceptance.overallState === 'unverified') {
+        // 未配置自动检查 → 标记为 failed（不是 completed）
+        // 但 analysis 模式允许通过
+        if (node.mode === 'action') {
+          transitionStatus(tree, node.id, 'failed', '未配置自动检查，无法验证完成状态')
+        } else {
+          transitionStatus(tree, node.id, newStatus, result.goalReached === false ? '自主引擎未达成目标' : undefined)
+        }
+      } else {
+        transitionStatus(tree, node.id, newStatus, result.goalReached === false ? '自主引擎未达成目标' : undefined)
+      }
 
       // R10: 仅当 LLM 输出明确表明需要更深拆解时才记录
       // 条件：
@@ -1075,6 +1165,42 @@ export class TaskScheduler {
   getResourceLocks(runId: string): ResourceLockManager | null {
     const entry = this.activeTrees.get(runId)
     return entry ? entry.resourceLocks : null
+  }
+
+  /**
+   * 三期 Phase B: 计算长期目标进度
+   *
+   * 基于叶子节点的完成比例 + 成功标准匹配
+   */
+  private computeGoalProgress(tree: TaskTreeSnapshot): number {
+    if (!tree.longTermGoal) return 0
+
+    const allNodes = Object.values(tree.nodes).filter(n => n.id !== tree.rootId)
+    const completedNodes = allNodes.filter(n => n.status === 'completed')
+
+    if (allNodes.length === 0) return 0
+
+    // 基础进度：已完成节点占比
+    const baseProgress = (completedNodes.length / allNodes.length) * 100
+
+    // 成功标准匹配：检查每个标准是否在某个节点的 resultSummary 中有对应关键词
+    const criteria = tree.longTermGoal.successCriteria
+    if (criteria.length === 0) return Math.round(baseProgress)
+
+    let criteriaMatch = 0
+    for (const criterion of criteria) {
+      const keyword = criterion.toLowerCase()
+      const matched = completedNodes.some(n =>
+        n.resultSummary?.toLowerCase().includes(keyword)
+      )
+      if (matched) criteriaMatch++
+    }
+
+    // 综合进度：60% 基于节点完成比例，40% 基于成功标准匹配
+    const criteriaProgress = criteria.length > 0 ? (criteriaMatch / criteria.length) * 100 : baseProgress
+    const combined = baseProgress * 0.6 + criteriaProgress * 0.4
+
+    return Math.round(Math.min(100, combined))
   }
 }
 

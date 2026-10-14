@@ -26,6 +26,16 @@ function cleanupExpiredTokens() {
   }
 }
 
+function countOccurrences(text, search) {
+  let count = 0
+  let pos = 0
+  while ((pos = text.indexOf(search, pos)) !== -1) {
+    count++
+    pos += search.length
+  }
+  return count
+}
+
 // 每 2 分钟清理过期令牌
 setInterval(cleanupExpiredTokens, 2 * 60 * 1000).unref?.()
 
@@ -271,7 +281,155 @@ app.whenReady().then(() => {
         throw new Error('文件过大，最大支持 10MB')
       }
       const content = fs.readFileSync(filePath, 'utf-8')
-      return { success: true, content }
+      const sha256 = crypto.createHash('sha256').update(content).digest('hex')
+      return { success: true, content, sha256 }
+    } catch (error) {
+      return { success: false, error: error.message }
+    }
+  })
+
+  // IPC: 补丁式编辑（精确替换文件片段，带版本校验和原子性保证）
+  // 并发写锁：同一文件串行化
+  const fileWriteLocks = new Map()
+  function withFileLock(filePath, fn) {
+    const key = filePath.replace(/\\/g, '/').toLowerCase()
+    const existing = fileWriteLocks.get(key) || Promise.resolve()
+    const next = existing.then(fn, fn)
+    fileWriteLocks.set(key, next.catch(() => {}))
+    return next
+  }
+
+  ipcMain.handle('patch-file', async (event, filePath, patches, expectedSha256) => {
+    try {
+      filePath = resolveAuthorizedPath(event, filePath)
+
+      // 安全检查：同 write-file
+      const blockedExts = [
+        '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.svg', '.tiff', '.psd',
+        '.mp3', '.mp4', '.avi', '.mov', '.mkv', '.flv', '.wav', '.flac', '.ogg', '.webm',
+        '.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz',
+        '.exe', '.dll', '.so', '.dylib', '.o', '.obj', '.class', '.pyc', '.wasm',
+        '.db', '.sqlite', '.sqlite3', '.mdb',
+        '.ttf', '.otf', '.woff', '.woff2', '.eot',
+        '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
+      ]
+      const ext = path.extname(filePath).toLowerCase()
+      if (blockedExts.includes(ext)) {
+        throw new Error(`不支持写入二进制/媒体文件: ${ext}`)
+      }
+
+      // 校验 patches 参数
+      if (!Array.isArray(patches) || patches.length === 0) {
+        throw new Error('patches 必须为非空数组')
+      }
+      for (const p of patches) {
+        if (typeof p.oldText !== 'string' || p.oldText.length === 0) {
+          throw new Error('每个 patch 的 oldText 必须为非空字符串')
+        }
+        if (typeof p.newText !== 'string') {
+          throw new Error('每个 patch 的 newText 必须为字符串')
+        }
+      }
+
+      return await withFileLock(filePath, async () => {
+        // 读取当前内容
+        if (!fs.existsSync(filePath)) {
+          return { success: false, errorCode: 'FILE_NOT_FOUND', error: `文件不存在: ${filePath}` }
+        }
+        const currentContent = fs.readFileSync(filePath, 'utf-8')
+        const currentSha256 = crypto.createHash('sha256').update(currentContent).digest('hex')
+
+        // P1-fix: 强制要求 expectedSha256（防止无版本校验的写入）
+        if (!expectedSha256) {
+          return {
+            success: false,
+            errorCode: 'MISSING_VERSION',
+            error: '补丁操作必须提供 expectedSha256 参数',
+            currentSha256
+          }
+        }
+
+        // 版本校验（审批前）
+        if (expectedSha256 !== currentSha256) {
+          return {
+            success: false,
+            errorCode: 'VERSION_MISMATCH',
+            error: `文件版本不匹配（期望 ${expectedSha256.slice(0, 16)}...，实际 ${currentSha256.slice(0, 16)}...）`,
+            currentSha256
+          }
+        }
+
+        // 逐 patch 校验（在虚拟内容上模拟）
+        let virtualContent = currentContent
+        const matchCounts = []
+        for (let i = 0; i < patches.length; i++) {
+          const p = patches[i]
+          const count = countOccurrences(virtualContent, p.oldText)
+          if (count === 0) {
+            return {
+              success: false,
+              errorCode: 'NOT_FOUND',
+              error: `第 ${i + 1} 个 patch 的 oldText 在文件中未找到`,
+              currentSha256,
+              patchIndex: i
+            }
+          }
+          if (!p.replaceAll && count > 1) {
+            return {
+              success: false,
+              errorCode: 'NOT_UNIQUE',
+              error: `第 ${i + 1} 个 patch 的 oldText 在文件中出现 ${count} 次（需唯一）。设置 replaceAll=true 可替换所有匹配`,
+              currentSha256,
+              patchIndex: i,
+              matchCount: count
+            }
+          }
+          matchCounts.push(count)
+          // 在虚拟内容上执行替换
+          if (p.replaceAll) {
+            virtualContent = virtualContent.split(p.oldText).join(p.newText)
+          } else {
+            const idx = virtualContent.indexOf(p.oldText)
+            virtualContent = virtualContent.slice(0, idx) + p.newText + virtualContent.slice(idx + p.oldText.length)
+          }
+        }
+
+        // 审批
+        await approveWrite(filePath, `朝堂请求补丁编辑文件（${patches.length} 处替换）`)
+
+        // P1-fix: 审批后重新校验版本（审批期间文件可能被外部修改）
+        const recheckContent = fs.readFileSync(filePath, 'utf-8')
+        const recheckSha256 = crypto.createHash('sha256').update(recheckContent).digest('hex')
+        if (recheckSha256 !== expectedSha256) {
+          return {
+            success: false,
+            errorCode: 'VERSION_MISMATCH_AFTER_APPROVAL',
+            error: '审批期间文件被外部修改，已取消写入',
+            currentSha256: recheckSha256
+          }
+        }
+
+        // 安全写入：同目录临时文件 → rename
+        const dir = path.dirname(filePath)
+        const tmpFile = path.join(dir, `.patch-tmp-${Date.now()}-${path.basename(filePath)}`)
+        try {
+          fs.writeFileSync(tmpFile, virtualContent, 'utf-8')
+          fs.renameSync(tmpFile, filePath)
+        } catch (writeErr) {
+          // 清理临时文件
+          try { if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile) } catch {}
+          throw writeErr
+        }
+
+        const newSha256 = crypto.createHash('sha256').update(virtualContent).digest('hex')
+        return {
+          success: true,
+          path: filePath,
+          sha256: newSha256,
+          patchesApplied: patches.length,
+          matchCounts
+        }
+      })
     } catch (error) {
       return { success: false, error: error.message }
     }
@@ -308,6 +466,87 @@ app.whenReady().then(() => {
       }
       fs.writeFileSync(filePath, content, 'utf-8')
       return { success: true, path: filePath, size: content.length }
+    } catch (error) {
+      return { success: false, error: error.message }
+    }
+  })
+
+  // P1-fix: IPC: 原子撤销写入（带版本校验，防止覆盖窗口）
+  ipcMain.handle('revert-file', async (event, filePath, oldContent, expectedSha256) => {
+    try {
+      filePath = resolveAuthorizedPath(event, filePath)
+
+      // 安全检查：同 write-file
+      const blockedExts = [
+        '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.svg', '.tiff', '.psd',
+        '.mp3', '.mp4', '.avi', '.mov', '.mkv', '.flv', '.wav', '.flac', '.ogg', '.webm',
+        '.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz',
+        '.exe', '.dll', '.so', '.dylib', '.o', '.obj', '.class', '.pyc', '.wasm',
+        '.db', '.sqlite', '.sqlite3', '.mdb',
+        '.ttf', '.otf', '.woff', '.woff2', '.eot',
+        '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
+      ]
+      const ext = path.extname(filePath).toLowerCase()
+      if (blockedExts.includes(ext)) {
+        throw new Error(`不支持写入二进制/媒体文件: ${ext}`)
+      }
+
+      // 强制要求 expectedSha256
+      if (!expectedSha256) {
+        return { success: false, errorCode: 'MISSING_VERSION', error: '撤销操作必须提供 expectedSha256 参数' }
+      }
+
+      return await withFileLock(filePath, async () => {
+        // 读取当前内容并校验版本
+        if (!fs.existsSync(filePath)) {
+          return { success: false, errorCode: 'FILE_NOT_FOUND', error: `文件不存在: ${filePath}` }
+        }
+        const currentContent = fs.readFileSync(filePath, 'utf-8')
+        const currentSha256 = crypto.createHash('sha256').update(currentContent).digest('hex')
+
+        if (currentSha256 !== expectedSha256) {
+          return {
+            success: false,
+            errorCode: 'VERSION_MISMATCH',
+            error: `文件版本不匹配（期望 ${expectedSha256.slice(0, 16)}...，实际 ${currentSha256.slice(0, 16)}...）`,
+            currentSha256
+          }
+        }
+
+        // 审批
+        await approveWrite(filePath, '朝堂请求撤销文件修改')
+
+        // 审批后重新校验版本
+        const recheckContent = fs.readFileSync(filePath, 'utf-8')
+        const recheckSha256 = crypto.createHash('sha256').update(recheckContent).digest('hex')
+        if (recheckSha256 !== expectedSha256) {
+          return {
+            success: false,
+            errorCode: 'VERSION_MISMATCH_AFTER_APPROVAL',
+            error: '审批期间文件被外部修改，已取消撤销',
+            currentSha256: recheckSha256
+          }
+        }
+
+        // 安全写入：同目录临时文件 → rename
+        const dir = path.dirname(filePath)
+        const tmpFile = path.join(dir, `.revert-tmp-${Date.now()}-${path.basename(filePath)}`)
+        try {
+          fs.writeFileSync(tmpFile, oldContent, 'utf-8')
+          fs.renameSync(tmpFile, filePath)
+        } catch (writeErr) {
+          try { if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile) } catch {}
+          throw writeErr
+        }
+
+        const newSha256 = crypto.createHash('sha256').update(oldContent).digest('hex')
+        return {
+          success: true,
+          path: filePath,
+          sha256: newSha256,
+          reverted: true
+        }
+      })
     } catch (error) {
       return { success: false, error: error.message }
     }

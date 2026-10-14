@@ -28,6 +28,15 @@ import { toolExecutor } from '@/services/tools/executor'
 import { compressContext } from './context-compressor'
 import { ContextManager } from './context-manager'
 import { WRITE_TOOLS } from './resource-lock'
+import { invalidateIndexOnWrite } from './repository-context'
+import { runAcceptance, collectChangedFiles } from './acceptance-gate'
+import type { AcceptancePlan, CommandExecutor, RepairConfig } from './acceptance-gate'
+import { extractRepairDiagnostics, hasNewEvidence, DEFAULT_REPAIR_CONFIG } from './acceptance-gate'
+import { TestLoopEngine } from './test-loop'
+import type { TestLoopResult } from './test-loop'
+import { LintFixEngine } from './lint-fix-loop'
+import type { LintFixResult } from './lint-fix-loop'
+import type { SubAgentProfile } from './subagent-registry'
 
 // ============ 类型 ============
 
@@ -47,6 +56,8 @@ export interface AutonomousConfig {
   modelId?: string
   /** 是否为只读节点（阻止写工具调用） */
   readOnly?: boolean
+  /** 子 Agent 配置（三期 Phase A）— 追加提示词 + 工具过滤 */
+  subAgentProfile?: SubAgentProfile
 }
 
 export const DEFAULT_AUTONOMOUS_CONFIG: AutonomousConfig = {
@@ -107,6 +118,14 @@ export interface AutonomousResult {
     promptTokens: number
     completionTokens: number
   }
+  /** 验收结果（P0-B） */
+  acceptance?: AcceptancePlan
+  /** 文件基线记录（P1-C） */
+  fileBaselines?: Record<string, { beforeSha256: string; afterSha256?: string; originalContent?: string }>
+  /** 测试循环结果（Phase 2） */
+  testLoop?: TestLoopResult
+  /** Lint 修复结果（Phase 4） */
+  lintFix?: LintFixResult
 }
 
 // ============ 自主执行系统提示词 ============
@@ -160,6 +179,8 @@ export const AUTONOMOUS_DEV_PROMPT_SUFFIX = `
 export class AutonomousEngine {
   private config: AutonomousConfig
   private listeners: AutonomousEventCallback[] = []
+  /** P1-C: 本次执行的文件基线记录 */
+  private _fileBaselines?: Record<string, { beforeSha256: string; afterSha256?: string; originalContent?: string }>
 
   constructor(config?: Partial<AutonomousConfig>) {
     this.config = { ...DEFAULT_AUTONOMOUS_CONFIG, ...config }
@@ -229,6 +250,21 @@ export class AutonomousEngine {
     let iterations = 0
 
     const { workingDirectory, agentsMdHint, memoryHint } = this.config
+    this._fileBaselines = undefined
+
+    // 三期 Phase A: 子 Agent 工具过滤
+    let effectiveToolDefs = toolDefs
+    if (this.config.subAgentProfile) {
+      const { subAgentProfile } = this.config
+      if (subAgentProfile.toolWhitelist && subAgentProfile.toolWhitelist.length > 0) {
+        const whitelist = new Set(subAgentProfile.toolWhitelist)
+        effectiveToolDefs = effectiveToolDefs.filter(td => whitelist.has(td.function.name))
+      }
+      if (subAgentProfile.toolBlacklist && subAgentProfile.toolBlacklist.length > 0) {
+        const blacklist = new Set(subAgentProfile.toolBlacklist)
+        effectiveToolDefs = effectiveToolDefs.filter(td => !blacklist.has(td.function.name))
+      }
+    }
 
     // 构建初始消息
     const messages: ChatMessage[] = [
@@ -271,7 +307,7 @@ export class AutonomousEngine {
         (tcs) => {
           pendingToolCalls.push(...tcs)
         },
-        { tools: toolDefs.length > 0 ? toolDefs : undefined }
+        { tools: effectiveToolDefs.length > 0 ? effectiveToolDefs : undefined }
       )
 
       if (content) {
@@ -338,14 +374,18 @@ export class AutonomousEngine {
           }
         }
 
-        // write_file 之前读取旧内容（用于 diff）
+        // write_file / search_replace 之前读取旧内容（用于 diff + 基线）
         let preWriteOldContent: string | null = null
-        if (tc.function.name === 'write_file') {
+        let preWriteSha256: string | undefined
+        if (tc.function.name === 'write_file' || tc.function.name === 'search_replace') {
           try {
             const args = JSON.parse(tc.function.arguments)
             if (args.path && window.electronAPI?.readFile) {
               const readResult = await window.electronAPI.readFile(args.path)
-              if (readResult.success) preWriteOldContent = readResult.content || ''
+              if (readResult.success) {
+                preWriteOldContent = readResult.content || ''
+                preWriteSha256 = readResult.sha256
+              }
             }
           } catch { /* 忽略 */ }
         }
@@ -385,15 +425,50 @@ export class AutonomousEngine {
         const result = await toolExecutor.execute(tc)
         allToolCalls.push(result)
 
-        // write_file 之后捕获 diff
-        if (tc.function.name === 'write_file' && result.status === 'success') {
+        // P1-A: 写后失效索引
+        if (['write_file', 'search_replace', 'create_directory', 'git_operation'].includes(tc.function.name) && result.status === 'success' && workingDirectory) {
+          invalidateIndexOnWrite(workingDirectory)
+        }
+
+        // write_file / search_replace 之后捕获 diff + 文件基线
+        if ((tc.function.name === 'write_file' || tc.function.name === 'search_replace') && result.status === 'success') {
           try {
             const args = JSON.parse(tc.function.arguments)
+            let newContent = args.content || ''
+            let newSha256: string | undefined
+            // search_replace: 读取写入后的文件内容
+            if (tc.function.name === 'search_replace' && window.electronAPI?.readFile) {
+              const postRead = await window.electronAPI.readFile(args.path)
+              if (postRead.success) {
+                newContent = postRead.content || ''
+                newSha256 = postRead.sha256
+              }
+            }
+            // write_file: 从结果中获取 sha256
+            if (tc.function.name === 'write_file' && (result.result as any)?.sha256) {
+              newSha256 = (result.result as any).sha256
+            }
             ;(result as any).diffData = {
               filePath: args.path || '',
               oldContent: preWriteOldContent || '',
-              newContent: args.content || '',
+              newContent,
               isNew: preWriteOldContent === null
+            }
+            // P1-C: 记录文件基线（用于恢复校验）
+            if (args.path && newSha256) {
+              if (!this._fileBaselines) this._fileBaselines = {}
+              const existing = this._fileBaselines[args.path]
+              if (existing) {
+                // 多次修改同一文件：更新 afterSha256
+                existing.afterSha256 = newSha256
+              } else {
+                // 首次写入：记录 before 和 after + 原始内容（用于撤销恢复）
+                this._fileBaselines[args.path] = {
+                  beforeSha256: preWriteSha256 || (preWriteOldContent !== null ? 'unknown' : 'unknown'),
+                  afterSha256: newSha256,
+                  originalContent: preWriteOldContent !== null ? preWriteOldContent : undefined
+                }
+              }
             }
           } catch { /* 忽略 */ }
         }
@@ -432,7 +507,7 @@ export class AutonomousEngine {
         })
 
         // 计算最后有效进展时间（成功的写操作/编译/测试）
-        const progressTools = ['write_file', 'execute_command', 'run_tests', 'git_operation']
+        const progressTools = ['write_file', 'search_replace', 'execute_command', 'run_tests', 'git_operation']
         let lastProgress = startTime
         for (let i = allToolCalls.length - 1; i >= 0; i--) {
           if (allToolCalls[i].status === 'success' && progressTools.includes(allToolCalls[i].functionName)) {
@@ -470,13 +545,537 @@ export class AutonomousEngine {
 
     const duration = Date.now() - startTime
 
+    // P0-B/C: 验收 + 有界修复循环
+    let acceptance: AcceptancePlan | undefined
+    let repairsUsed = 0
+    if (workingDirectory) {
+      const cmdExecutor: CommandExecutor = {
+        execute: async (cmd: string, cwd?: string, timeoutMs?: number) => {
+          if (window.electronAPI?.executeCommand) {
+            const result = await window.electronAPI.executeCommand({
+              command: cmd,
+              cwd: cwd || workingDirectory,
+              timeout: timeoutMs || 120000
+            })
+            return {
+              exitCode: result.exitCode ?? (result.success ? 0 : 1),
+              stdout: result.stdout || '',
+              stderr: result.stderr || '',
+              timedOut: result.timedOut || false
+            }
+          }
+          return { exitCode: 1, stdout: '', stderr: '无命令执行能力', timedOut: false }
+        }
+      }
+
+      // 初始验收
+      const changedFiles = collectChangedFiles(allToolCalls)
+      if (changedFiles.length > 0) {
+        try {
+          acceptance = await runAcceptance(workingDirectory, changedFiles, cmdExecutor)
+        } catch {
+          acceptance = { checks: [], overallState: 'unverified' }
+        }
+
+        // P0-C: 有界修复循环
+        const repairConfig: Required<RepairConfig> = { ...DEFAULT_REPAIR_CONFIG }
+        let prevAcceptance: AcceptancePlan | undefined
+
+        while (
+          acceptance &&
+          acceptance.overallState === 'failed' &&
+          repairsUsed < repairConfig.maxRepairs &&
+          iterations < this.config.maxIterations + repairConfig.maxRepairs &&
+          !abortSignal?.aborted
+        ) {
+          // 检查新证据
+          if (repairConfig.requireNewEvidence && prevAcceptance && !hasNewEvidence(prevAcceptance, acceptance)) {
+            break // 无新证据，停止修复
+          }
+
+          prevAcceptance = acceptance
+          repairsUsed++
+
+          // 注入诊断信息
+          const diagnostics = extractRepairDiagnostics(acceptance)
+          messages.push({
+            role: 'user',
+            content: `\u7b2c ${repairsUsed} \u6b21\u9a8c\u6536\u672a\u901a\u8fc7\uff0c\u8bf7\u4fee\u590d\u4ee5\u4e0a\u95ee\u9898\u540e\u91cd\u65b0\u63d0\u4ea4\u3002${diagnostics}`
+          })
+
+          // 重新执行一轮
+          const repairToolCalls: ToolCall[] = []
+          const repairContent = await provider.chatStreamWithTools(
+            messages,
+            (text) => { finalContent = text; onContent(text) },
+            (tcs) => { repairToolCalls.push(...tcs) },
+            { tools: effectiveToolDefs.length > 0 ? effectiveToolDefs : undefined }
+          )
+          if (repairContent) finalContent = repairContent
+
+          if (repairToolCalls.length === 0) break
+
+          messages.push({ role: 'assistant', content: repairContent || '', tool_calls: repairToolCalls })
+
+          // 执行修复工具调用（接入与主循环相同的执行保护）
+          for (const tc of repairToolCalls) {
+            if (abortSignal?.aborted) break
+            this.resolveToolPaths(tc, workingDirectory)
+
+            // P0-fix: 只读权限拦截
+            if (this.config.readOnly && WRITE_TOOLS.has(tc.function.name)) {
+              allToolCalls.push({
+                toolCallId: tc.id, functionName: tc.function.name, arguments: {},
+                result: { success: false, error: '只读节点不允许调用写工具' },
+                status: 'error', duration: 0, error: '只读权限拦截'
+              })
+              messages.push({
+                role: 'tool',
+                content: JSON.stringify({ success: false, error: '修复轮次中当前为只读模式，不允许执行写操作。' }),
+                tool_call_id: tc.id, name: tc.function.name
+              })
+              continue
+            }
+
+            // P0-fix: 危险命令审批
+            if (onBeforeToolExecute) {
+              const approved = await onBeforeToolExecute(tc)
+              if (!approved) {
+                allToolCalls.push({
+                  toolCallId: tc.id, functionName: tc.function.name, arguments: {},
+                  result: { success: false, error: '用户拒绝执行该危险命令' },
+                  status: 'error', duration: 0, error: '用户拒绝执行危险命令'
+                })
+                messages.push({
+                  role: 'tool',
+                  content: JSON.stringify({ success: false, error: '用户拒绝执行危险命令。请调整方案。' }),
+                  tool_call_id: tc.id, name: tc.function.name
+                })
+                continue
+              }
+            }
+
+            // P0-fix: 预算检查
+            if (onToolCall) {
+              const reserved = onToolCall()
+              if (reserved === false) {
+                allToolCalls.push({
+                  toolCallId: tc.id, functionName: tc.function.name, arguments: {},
+                  result: { success: false, error: '工具调用预算已耗尽' },
+                  status: 'error', duration: 0, error: '预算耗尽'
+                })
+                aborted = true
+                break
+              }
+            }
+
+            // P0-fix: 写前读取旧内容（用于 diff + 基线，与主循环一致）
+            let repairPreWriteOldContent: string | null = null
+            let repairPreWriteSha256: string | undefined
+            if (tc.function.name === 'write_file' || tc.function.name === 'search_replace') {
+              try {
+                const args = JSON.parse(tc.function.arguments)
+                if (args.path && window.electronAPI?.readFile) {
+                  const readResult = await window.electronAPI.readFile(args.path)
+                  if (readResult.success) {
+                    repairPreWriteOldContent = readResult.content || ''
+                    repairPreWriteSha256 = readResult.sha256
+                  }
+                }
+              } catch { /* 忽略 */ }
+            }
+
+            const result = await toolExecutor.execute(tc)
+            allToolCalls.push(result)
+
+            // P0-fix: 修复轮次写后捕获 diff + 文件基线（与主循环一致）
+            if ((tc.function.name === 'write_file' || tc.function.name === 'search_replace') && result.status === 'success') {
+              try {
+                const args = JSON.parse(tc.function.arguments)
+                let newContent = args.content || ''
+                let newSha256: string | undefined
+                if (tc.function.name === 'search_replace' && window.electronAPI?.readFile) {
+                  const postRead = await window.electronAPI.readFile(args.path)
+                  if (postRead.success) {
+                    newContent = postRead.content || ''
+                    newSha256 = postRead.sha256
+                  }
+                }
+                if (tc.function.name === 'write_file' && (result.result as any)?.sha256) {
+                  newSha256 = (result.result as any).sha256
+                }
+                ;(result as any).diffData = {
+                  filePath: args.path || '',
+                  oldContent: repairPreWriteOldContent || '',
+                  newContent,
+                  isNew: repairPreWriteOldContent === null
+                }
+                if (args.path && newSha256) {
+                  if (!this._fileBaselines) this._fileBaselines = {}
+                  const existing = this._fileBaselines[args.path]
+                  if (existing) {
+                    existing.afterSha256 = newSha256
+                  } else {
+                    this._fileBaselines[args.path] = {
+                      beforeSha256: repairPreWriteSha256 || 'unknown',
+                      afterSha256: newSha256,
+                      originalContent: repairPreWriteOldContent !== null ? repairPreWriteOldContent : undefined
+                    }
+                  }
+                }
+              } catch { /* 忽略 */ }
+            }
+
+            messages.push({
+              role: 'tool',
+              content: typeof result.result === 'string' ? result.result : JSON.stringify(result.result, null, 2),
+              tool_call_id: tc.id,
+              name: tc.function.name
+            })
+          }
+
+          iterations++
+
+          // 重新验收
+          const newChangedFiles = collectChangedFiles(allToolCalls)
+          try {
+            acceptance = await runAcceptance(workingDirectory, newChangedFiles, cmdExecutor)
+          } catch {
+            acceptance = { checks: [], overallState: 'unverified' }
+          }
+        }
+      }
+    }
+
+    // ── Phase 2: 测试循环 ──
+    let testLoopResult: TestLoopResult | undefined
+    if (workingDirectory && goalReached && !aborted) {
+      const changedFilesForTest = collectChangedFiles(allToolCalls)
+      if (changedFilesForTest.length > 0) {
+        const testCmdExecutor: CommandExecutor = {
+          execute: async (cmd: string, cwd?: string, timeoutMs?: number) => {
+            if (window.electronAPI?.executeCommand) {
+              const r = await window.electronAPI.executeCommand({
+                command: cmd,
+                cwd: cwd || workingDirectory,
+                timeout: timeoutMs || 120000
+              })
+              return {
+                exitCode: r.exitCode ?? (r.success ? 0 : 1),
+                stdout: r.stdout || '',
+                stderr: r.stderr || '',
+                timedOut: r.timedOut || false
+              }
+            }
+            return { exitCode: 1, stdout: '', stderr: '无命令执行能力', timedOut: false }
+          }
+        }
+
+        const testLoop = new TestLoopEngine({
+          workingDirectory,
+          maxRounds: 3,
+          agentsMdHint: this.config.agentsMdHint
+        })
+
+        this.emit({ type: 'verifying', data: { phase: 'test-loop' } })
+
+        try {
+          testLoopResult = await testLoop.execute({
+            provider,
+            systemPrompt: this.buildSystemPrompt(
+              '你是一个代码修复专家。请分析测试失败的原因并修复代码。',
+              workingDirectory,
+              this.config.agentsMdHint
+            ),
+            toolDefs,
+            executor: testCmdExecutor,
+            goal,
+            changedFiles: changedFilesForTest,
+            onBeforeToolExecute,
+            onContent,
+            abortSignal,
+            onToolCall
+          })
+
+          // 测试循环中的工具调用计入总记录
+          if (testLoopResult.fixToolCalls.length > 0) {
+            allToolCalls.push(...testLoopResult.fixToolCalls)
+          }
+
+          // P1-fix: 合并测试循环的文件基线
+          if (testLoopResult.fileBaselines) {
+            if (!this._fileBaselines) this._fileBaselines = {}
+            for (const [path, baseline] of Object.entries(testLoopResult.fileBaselines)) {
+              if (!this._fileBaselines[path]) {
+                this._fileBaselines[path] = {
+                  beforeSha256: baseline.beforeSha256,
+                  afterSha256: baseline.afterSha256,
+                  originalContent: baseline.originalContent
+                }
+              } else {
+                this._fileBaselines[path].afterSha256 = baseline.afterSha256
+              }
+            }
+          }
+
+          // P0-fix: 测试失败则回滚 goalReached，确保最终验收反映真实状态
+          if (!testLoopResult.passed) {
+            goalReached = false
+          }
+        } catch (e) {
+          // P1-fix: 测试循环异常也应回滚 goalReached
+          console.error('[AutonomousEngine] 测试循环异常:', e)
+          goalReached = false
+        }
+      }
+    }
+
+    // ── Phase 4: Lint 自动修复 ──
+    let lintFixResult: LintFixResult | undefined
+    if (workingDirectory && goalReached && !aborted) {
+      const changedFilesForLint = collectChangedFiles(allToolCalls)
+      if (changedFilesForLint.length > 0) {
+        const lintCmdExecutor: CommandExecutor = {
+          execute: async (cmd: string, cwd?: string, timeoutMs?: number) => {
+            if (window.electronAPI?.executeCommand) {
+              const r = await window.electronAPI.executeCommand({
+                command: cmd,
+                cwd: cwd || workingDirectory,
+                timeout: timeoutMs || 60000
+              })
+              return {
+                exitCode: r.exitCode ?? (r.success ? 0 : 1),
+                stdout: r.stdout || '',
+                stderr: r.stderr || '',
+                timedOut: r.timedOut || false
+              }
+            }
+            return { exitCode: 1, stdout: '', stderr: '无命令执行能力', timedOut: false }
+          },
+          // P1-fix: 接入 readFile，统一哈希读取路径（与恢复校验同一读取接口）
+          readFile: async (path: string) => {
+            if (window.electronAPI?.readFile) {
+              const r = await window.electronAPI.readFile(path)
+              return { success: r?.success ?? false, content: r?.content, sha256: r?.sha256 }
+            }
+            return { success: false }
+          },
+          // P1-fix: 接入 writeFile，用于安全传入 commit message 等
+          writeFile: async (path: string, content: string) => {
+            if (window.electronAPI?.writeFile) {
+              const r = await window.electronAPI.writeFile(path, content)
+              return { success: r?.success ?? false }
+            }
+            return { success: false }
+          }
+        }
+
+        const lintFix = new LintFixEngine({
+          workingDirectory,
+          maxRounds: 2
+        })
+
+        this.emit({ type: 'verifying', data: { phase: 'lint-fix' } })
+
+        try {
+          lintFixResult = await lintFix.execute({
+            provider,
+            systemPrompt: this.buildSystemPrompt(
+              '你是一个代码质量修复专家。请分析 lint 输出并修复代码问题。',
+              workingDirectory,
+              this.config.agentsMdHint
+            ),
+            toolDefs,
+            executor: lintCmdExecutor,
+            changedFiles: changedFilesForLint,
+            onBeforeToolExecute,
+            onContent,
+            abortSignal,
+            onToolCall
+          })
+
+          if (lintFixResult.fixToolCalls.length > 0) {
+            allToolCalls.push(...lintFixResult.fixToolCalls)
+          }
+
+          // P1-fix: 合并 Lint 修复循环的文件基线
+          if (lintFixResult.fileBaselines) {
+            if (!this._fileBaselines) this._fileBaselines = {}
+            for (const [path, baseline] of Object.entries(lintFixResult.fileBaselines)) {
+              if (!this._fileBaselines[path]) {
+                this._fileBaselines[path] = {
+                  beforeSha256: baseline.beforeSha256,
+                  afterSha256: baseline.afterSha256,
+                  originalContent: baseline.originalContent
+                }
+              } else {
+                this._fileBaselines[path].afterSha256 = baseline.afterSha256
+              }
+            }
+          }
+
+          // P0-fix: Lint 修复改动了代码（LLM 工具调用或 --fix 命令）→ 必须重跑测试
+          const lintModifiedCode = lintFixResult.fixToolCalls.length > 0 || lintFixResult.fixCommandModifiedFiles
+          if (lintModifiedCode && testLoopResult?.passed) {
+            const changedFilesAfterLint = collectChangedFiles(allToolCalls)
+            if (changedFilesAfterLint.length > 0) {
+              const reTestCmdExecutor: CommandExecutor = {
+                execute: async (cmd: string, cwd?: string, timeoutMs?: number) => {
+                  if (window.electronAPI?.executeCommand) {
+                    const r = await window.electronAPI.executeCommand({
+                      command: cmd,
+                      cwd: cwd || workingDirectory,
+                      timeout: timeoutMs || 120000
+                    })
+                    return {
+                      exitCode: r.exitCode ?? (r.success ? 0 : 1),
+                      stdout: r.stdout || '',
+                      stderr: r.stderr || '',
+                      timedOut: r.timedOut || false
+                    }
+                  }
+                  return { exitCode: 1, stdout: '', stderr: '无命令执行能力', timedOut: false }
+                },
+                // P1-fix: 接入 readFile，统一哈希读取路径
+                readFile: async (path: string) => {
+                  if (window.electronAPI?.readFile) {
+                    const r = await window.electronAPI.readFile(path)
+                    return { success: r?.success ?? false, content: r?.content, sha256: r?.sha256 }
+                  }
+                  return { success: false }
+                },
+                writeFile: async (path: string, content: string) => {
+                  if (window.electronAPI?.writeFile) {
+                    const r = await window.electronAPI.writeFile(path, content)
+                    return { success: r?.success ?? false }
+                  }
+                  return { success: false }
+                }
+              }
+
+              const reTestLoop = new TestLoopEngine({
+                workingDirectory,
+                maxRounds: 2,
+                agentsMdHint: this.config.agentsMdHint,
+                testCommand: testLoopResult.testCommand !== 'none' ? testLoopResult.testCommand : undefined
+              })
+
+              this.emit({ type: 'verifying', data: { phase: 'test-loop-recheck' } })
+
+              try {
+                const reTestResult = await reTestLoop.execute({
+                  provider,
+                  systemPrompt: this.buildSystemPrompt(
+                    '你是一个代码修复专家。Lint 修复后测试失败，请分析并修复。',
+                    workingDirectory,
+                    this.config.agentsMdHint
+                  ),
+                  toolDefs,
+                  executor: reTestCmdExecutor,
+                  goal,
+                  changedFiles: changedFilesAfterLint,
+                  onBeforeToolExecute,
+                  onContent,
+                  abortSignal,
+                  onToolCall
+                })
+
+                if (reTestResult.fixToolCalls.length > 0) {
+                  allToolCalls.push(...reTestResult.fixToolCalls)
+                }
+
+                // 重跑测试失败则回滚 goalReached
+                if (!reTestResult.passed) {
+                  goalReached = false
+                }
+
+                // 合并测试结果
+                testLoopResult = {
+                  ...testLoopResult,
+                  passed: reTestResult.passed,
+                  totalRounds: testLoopResult.totalRounds + reTestResult.totalRounds,
+                  rounds: [...testLoopResult.rounds, ...reTestResult.rounds],
+                  fixToolCalls: [...testLoopResult.fixToolCalls, ...reTestResult.fixToolCalls],
+                  duration: testLoopResult.duration + reTestResult.duration
+                }
+
+                // P1-fix: 合并 reTestResult 的文件基线
+                if (reTestResult.fileBaselines) {
+                  if (!this._fileBaselines) this._fileBaselines = {}
+                  for (const [path, baseline] of Object.entries(reTestResult.fileBaselines)) {
+                    if (!this._fileBaselines[path]) {
+                      this._fileBaselines[path] = {
+                        beforeSha256: baseline.beforeSha256,
+                        afterSha256: baseline.afterSha256,
+                        originalContent: baseline.originalContent
+                      }
+                    } else {
+                      this._fileBaselines[path].afterSha256 = baseline.afterSha256
+                    }
+                  }
+                }
+              } catch (e) {
+                // P1-fix: 重跑测试异常也应回滚 goalReached
+                console.error('[AutonomousEngine] Lint 后重跑测试异常:', e)
+                goalReached = false
+              }
+            }
+          }
+
+          // P0-fix: Lint 失败（仍有问题）也回滚 goalReached
+          // 但“未检测到 lint 工具”不算失败，不影响 goalReached
+          if (!lintFixResult.passed && lintFixResult.lintCommand !== 'none') {
+            goalReached = false
+          }
+        } catch (e) {
+          // P1-fix: Lint 修复异常也应回滚 goalReached
+          console.error('[AutonomousEngine] Lint 修复异常:', e)
+          goalReached = false
+        }
+      }
+    }
+
+    // P0-fix: 测试/Lint 循环后重新验收，确保 acceptance 反映最终状态
+    if (workingDirectory && (testLoopResult || lintFixResult)) {
+      const finalChangedFiles = collectChangedFiles(allToolCalls)
+      if (finalChangedFiles.length > 0) {
+        const reAcceptanceExecutor: CommandExecutor = {
+          execute: async (cmd: string, cwd?: string, timeoutMs?: number) => {
+            if (window.electronAPI?.executeCommand) {
+              const r = await window.electronAPI.executeCommand({
+                command: cmd,
+                cwd: cwd || workingDirectory,
+                timeout: timeoutMs || 120000
+              })
+              return {
+                exitCode: r.exitCode ?? (r.success ? 0 : 1),
+                stdout: r.stdout || '',
+                stderr: r.stderr || '',
+                timedOut: r.timedOut || false
+              }
+            }
+            return { exitCode: 1, stdout: '', stderr: '无命令执行能力', timedOut: false }
+          }
+        }
+        try {
+          acceptance = await runAcceptance(workingDirectory, finalChangedFiles, reAcceptanceExecutor)
+        } catch {
+          acceptance = { checks: [], overallState: 'unverified' }
+        }
+      }
+    }
+
     return {
       content: finalContent,
       toolCalls: allToolCalls,
       iterations,
       goalReached,
       duration,
-      aborted: aborted || undefined
+      aborted: aborted || undefined,
+      acceptance,
+      fileBaselines: this._fileBaselines,
+      testLoop: testLoopResult,
+      lintFix: lintFixResult
     }
   }
 
@@ -500,6 +1099,14 @@ export class AutonomousEngine {
     if (agentsMdHint) prompt += agentsMdHint
     if (memoryHint) prompt += memoryHint
 
+    // 三期 Phase A: 子 Agent 提示词追加
+    if (this.config.subAgentProfile) {
+      prompt += `\n\n${this.config.subAgentProfile.systemPromptAddon}`
+      if (this.config.subAgentProfile.outputFormat) {
+        prompt += `\n\n### 输出格式要求\n${this.config.subAgentProfile.outputFormat}`
+      }
+    }
+
     return prompt
   }
 
@@ -516,7 +1123,7 @@ export class AutonomousEngine {
   private resolveToolPaths(tc: ToolCall, workingDirectory?: string): void {
     if (!workingDirectory) return
 
-    const pathTools = ['write_file', 'create_directory', 'read_file', 'read_directory', 'read_document', 'search_code']
+    const pathTools = ['write_file', 'search_replace', 'create_directory', 'read_file', 'read_directory', 'read_document', 'search_code']
     if (pathTools.includes(tc.function.name)) {
       try {
         const args = JSON.parse(tc.function.arguments)

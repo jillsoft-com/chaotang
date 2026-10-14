@@ -59,6 +59,8 @@ export interface TaskUsage {
   elapsedMs: number
 }
 
+import type { GateState, CheckRecord } from './acceptance-gate'
+
 export interface TaskNode {
   id: string
   parentId: string | null
@@ -93,6 +95,14 @@ export interface TaskNode {
   createdAt: number
   startedAt?: number
   finishedAt?: number
+  /** 验收状态（P0-B） */
+  acceptanceState?: GateState
+  /** 验收检查详情（P0-B） */
+  acceptanceChecks?: CheckRecord[]
+  /** 文件基线记录（P1-C）— 写操作前后 SHA-256 */
+  fileBaselines?: Record<string, { beforeSha256: string; afterSha256?: string; originalContent?: string }>
+  /** 子 Agent ID（三期 Phase A）— 指定执行策略 */
+  subAgentId?: string
 }
 
 export type TreeState =
@@ -126,6 +136,30 @@ export interface TaskTreeSnapshot {
   state: TreeState
   limits: TreeLimits
   updatedAt: number
+  /** 长期目标（三期 Phase B） */
+  longTermGoal?: LongTermGoal
+}
+
+/** 长期目标定义 */
+export interface LongTermGoal {
+  /** 目标陈述 */
+  statement: string
+  /** 成功标准（数组） */
+  successCriteria: string[]
+  /** 进度百分比 0-100 */
+  progressPercent: number
+  /** 心跳检查次数 */
+  checkCount: number
+  /** 上次心跳时间戳 */
+  lastCheckAt?: number
+  /** 目标是否停滞（连续 N 次心跳进度未变） */
+  stalled: boolean
+  /** 连续停滞次数 */
+  stallCount: number
+  /** 创建时间 */
+  createdAt: number
+  /** 达成时间（100% 时设置） */
+  achievedAt?: number
 }
 
 // ============ 结果类型 ============
@@ -148,6 +182,86 @@ export interface ParentSummary {
   partial: string[]
   conflicts: string[]
   gaps: string[]
+}
+
+// ============ 长期目标操作 ============
+
+/**
+ * 设定长期目标
+ */
+export function setLongTermGoal(
+  tree: TaskTreeSnapshot,
+  statement: string,
+  successCriteria: string[]
+): TreeResult {
+  tree.longTermGoal = {
+    statement,
+    successCriteria,
+    progressPercent: 0,
+    checkCount: 0,
+    lastCheckAt: undefined,
+    stalled: false,
+    stallCount: 0,
+    createdAt: Date.now(),
+    achievedAt: undefined
+  }
+  tree.updatedAt = Date.now()
+  return { ok: true }
+}
+
+/**
+ * 更新目标进度（心跳检查）
+ * 自动检测停滞：连续 3 次心跳进度未变 → stalled = true
+ */
+export function updateGoalProgress(
+  tree: TaskTreeSnapshot,
+  progressPercent: number
+): TreeResult {
+  if (!tree.longTermGoal) {
+    return { ok: false, error: '未设定长期目标' }
+  }
+
+  const goal = tree.longTermGoal
+  const clamped = Math.max(0, Math.min(100, progressPercent))
+
+  goal.checkCount++
+  goal.lastCheckAt = Date.now()
+
+  // 停滞检测：进度未变 → stallCount++
+  if (clamped === goal.progressPercent) {
+    goal.stallCount++
+  } else {
+    goal.stallCount = 0
+    goal.stalled = false
+  }
+
+  // 连续 3 次未变 → 标记停滞
+  if (goal.stallCount >= 3) {
+    goal.stalled = true
+  }
+
+  goal.progressPercent = clamped
+
+  // 达成目标
+  if (clamped >= 100 && !goal.achievedAt) {
+    goal.achievedAt = Date.now()
+    goal.stalled = false
+    goal.stallCount = 0
+  }
+
+  tree.updatedAt = Date.now()
+  return { ok: true }
+}
+
+/**
+ * 获取目标进度摘要（供提示词注入）
+ */
+export function getGoalSummary(tree: TaskTreeSnapshot): string {
+  if (!tree.longTermGoal) return ''
+  const g = tree.longTermGoal
+  const stall = g.stalled ? ' ⚠️ 目标停滞' : ''
+  const achieved = g.achievedAt ? ' ✅ 已达成' : ''
+  return `长期目标: ${g.statement}\n进度: ${g.progressPercent}%${stall}${achieved}\n成功标准: ${g.successCriteria.join('; ')}`
 }
 
 // ============ 默认值 ============
@@ -176,7 +290,7 @@ const VALID_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
   waiting:             ['ready', 'paused', 'cancelled'],
   paused:              ['ready', 'cancelled'],
   interrupted:         ['ready', 'pending', 'cancelled'],
-  completed:           [],
+  completed:           ['ready'],                    // 恢复：写入丢失时允许重新执行
   partial:             [],
   failed:              ['ready', 'cancelled'],      // 重试：用户批准或只读自动重试
   blocked:             ['ready', 'partial', 'cancelled'],

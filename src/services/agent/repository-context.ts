@@ -1,13 +1,21 @@
 /**
- * 仓库级自动上下文 — 项目索引 + 关键词检索 + 上下文注入
+ * 仓库级自动上下文 — 项目索引 + 关键词检索 + 语义检索 + 上下文注入
  *
  * 当 session 设置了 workingDirectory 时：
  * 1. 自动扫描项目结构，构建文件索引
  * 2. 提供关键词检索（TF-IDF 评分）
- * 3. 在 minister 发言前自动注入相关上下文摘要
+ * 3. 提供语义检索（VectorIndex，支持 TF-IDF 降级和嵌入 API）
+ * 4. 在 minister 发言前自动注入相关上下文摘要
  *
- * Sprint B - #8
+ * Sprint B - #8 / Phase 5 语义增强
  */
+
+import { VectorIndex, createTfIdfIndex } from './vector-index'
+import type { VectorDocument, VectorSearchResult } from './vector-index'
+import { extractSymbols, extractReferences, SymbolIndex } from './symbol-index'
+import type { SymbolInfo, ReferenceInfo } from './symbol-index'
+import { extractDependencies, buildModuleGraph } from './module-graph'
+import type { ModuleGraph, ModuleDependency } from './module-graph'
 
 // ============ 类型 ============
 
@@ -58,6 +66,12 @@ export interface ProjectIndex {
   treeSummary: string
   /** 关键文件摘要（package.json / README 等） */
   keyFileSummaries: Record<string, string>
+  /** 三期 Phase C: 符号索引 */
+  symbolIndex?: SymbolIndex
+  /** 三期 Phase C: 引用关系 */
+  references?: ReferenceInfo[]
+  /** 三期 Phase D: 模块依赖图 */
+  moduleGraph?: ModuleGraph
 }
 
 // ============ 配置 ============
@@ -128,6 +142,10 @@ export async function buildProjectIndex(rootDir: string): Promise<ProjectIndex> 
     f.category === 'source' || f.category === 'config' || f.category === 'doc'
   ).slice(0, 500) // 最多处理 500 个文件
 
+  const symbolIndex = new SymbolIndex()
+  const allReferences: ReferenceInfo[] = []
+  const allDependencies: ModuleDependency[] = []
+
   for (const file of importantFiles) {
     const absPath = `${rootDir}/${file.path}`
     try {
@@ -153,6 +171,18 @@ export async function buildProjectIndex(rootDir: string): Promise<ProjectIndex> 
             if (endLine >= lines.length) break
           }
 
+          // Phase C: 符号提取（仅源码文件）
+          if (file.category === 'source' && ['.ts', '.tsx', '.js', '.jsx', '.vue', '.py', '.go'].includes(file.ext)) {
+            const symbols = extractSymbols(content, file.path, file.ext)
+            symbolIndex.addSymbols(symbols)
+          }
+
+          // Phase D: 模块依赖提取（仅 TS/JS 源码）
+          if (file.category === 'source' && ['.ts', '.tsx', '.js', '.jsx'].includes(file.ext)) {
+            const deps = extractDependencies(content, file.path)
+            allDependencies.push(...deps)
+          }
+
           // 关键文件摘要（取前 500 字符）
           if (isKeyFile(file.name)) {
             keyFileSummaries[file.path] = content.slice(0, 500)
@@ -161,6 +191,26 @@ export async function buildProjectIndex(rootDir: string): Promise<ProjectIndex> 
       }
     } catch { /* 读取失败跳过 */ }
   }
+
+  // Phase C: 提取引用关系（需要已知符号列表）
+  const allSymbols = symbolIndex.getAllSymbols()
+  for (const file of importantFiles.filter(f => f.category === 'source')) {
+    const absPath = `${rootDir}/${file.path}`
+    try {
+      if (window.electronAPI?.readFile) {
+        const result = await window.electronAPI.readFile(absPath)
+        if (result.success && result.content) {
+          const content = result.content.slice(0, MAX_FILE_CHARS)
+          const refs = extractReferences(content, file.path, allSymbols)
+          allReferences.push(...refs)
+        }
+      }
+    } catch { /* 读取失败跳过 */ }
+  }
+  symbolIndex.addReferences(allReferences)
+
+  // Phase D: 构建模块依赖图
+  const moduleGraph = allDependencies.length > 0 ? buildModuleGraph(allDependencies) : undefined
 
   // 构建目录树摘要
   const treeSummary = buildTreeSummary(rootDir, files)
@@ -171,7 +221,10 @@ export async function buildProjectIndex(rootDir: string): Promise<ProjectIndex> 
     chunks,
     builtAt: Date.now(),
     treeSummary,
-    keyFileSummaries
+    keyFileSummaries,
+    symbolIndex,
+    references: allReferences,
+    moduleGraph
   }
 }
 
@@ -284,6 +337,14 @@ export function generateContextHint(
 ): string {
   const parts: string[] = []
 
+  // 0. 索引元数据（P1-A 4.4）
+  const totalFiles = index.files.length
+  const indexedFiles = index.chunks.length > 0
+    ? new Set(index.chunks.map(c => c.filePath)).size
+    : 0
+  const builtAt = new Date(index.builtAt).toLocaleString('zh-CN')
+  parts.push(`=== 索引信息 ===\n文件数: ${totalFiles} | 已索引: ${indexedFiles} | 构建时间: ${builtAt}`)
+
   // 1. 项目结构
   parts.push(`=== 项目结构 ===\n${index.treeSummary}`)
 
@@ -308,6 +369,106 @@ export function generateContextHint(
   // 拼接并截断
   const full = parts.join('\n\n')
   return full.length > maxChars ? full.slice(0, maxChars) + '\n...(已截断)' : full
+}
+
+// ============ 语义检索 ============
+
+/** 内存中的语义索引缓存（rootDir → VectorIndex） */
+const semanticIndexCache = new Map<string, { index: VectorIndex; expiresAt: number }>()
+
+/**
+ * 构建语义索引（从 ProjectIndex 的 chunks 构建 VectorIndex）
+ */
+async function buildSemanticIndex(projectIndex: ProjectIndex): Promise<VectorIndex> {
+  const vectorIndex = createTfIdfIndex()
+
+  const docs: VectorDocument[] = projectIndex.chunks.map((chunk) => ({
+    id: `${chunk.filePath}:${chunk.startLine}`,
+    text: chunk.content,
+    metadata: {
+      filePath: chunk.filePath,
+      startLine: chunk.startLine,
+      endLine: chunk.endLine
+    }
+  }))
+
+  await vectorIndex.addAll(docs)
+  return vectorIndex
+}
+
+/**
+ * 语义搜索 — 使用 VectorIndex 检索最相关的代码块
+ *
+ * 如果配置了嵌入 API 则使用真实向量检索，否则降级为 TF-IDF。
+ * 结果按相关性排序，可直接注入提示词。
+ */
+export async function semanticSearch(
+  index: ProjectIndex,
+  query: string,
+  topK: number = 10
+): Promise<VectorSearchResult[]> {
+  const cached = semanticIndexCache.get(index.rootDir)
+  let vectorIndex: VectorIndex
+
+  if (cached && cached.expiresAt > Date.now()) {
+    vectorIndex = cached.index
+  } else {
+    vectorIndex = await buildSemanticIndex(index)
+    semanticIndexCache.set(index.rootDir, { index: vectorIndex, expiresAt: Date.now() + CACHE_TTL })
+  }
+
+  return vectorIndex.search(query, topK)
+}
+
+/**
+ * 清除语义索引缓存
+ */
+export function clearSemanticIndexCache(rootDir?: string): void {
+  if (rootDir) {
+    semanticIndexCache.delete(rootDir)
+  } else {
+    semanticIndexCache.clear()
+  }
+}
+
+// ============ Phase C: 符号搜索 ============
+
+/**
+ * 符号搜索 — 查找符号定义和引用
+ * 返回符号定义位置 + 引用位置，供 Agent 理解代码结构
+ */
+export function symbolSearch(
+  index: ProjectIndex,
+  query: string,
+  mode: 'definition' | 'references' | 'callers' = 'definition',
+  maxResults: number = 20
+): Array<{ symbol: SymbolInfo; references?: ReferenceInfo[] }> {
+  if (!index.symbolIndex) return []
+
+  const symbols = index.symbolIndex.lookupSymbol(query)
+  if (symbols.length === 0) {
+    // 模糊匹配：名称包含查询字符串
+    const allSymbols = index.symbolIndex.getAllSymbols()
+    const fuzzyMatches = allSymbols
+      .filter(s => s.name.toLowerCase().includes(query.toLowerCase()))
+      .slice(0, maxResults)
+    
+    return fuzzyMatches.map(s => ({
+      symbol: s,
+      references: mode !== 'definition' ? index.symbolIndex!.findReferences(s.name) : undefined
+    }))
+  }
+
+  return symbols.slice(0, maxResults).map(s => {
+    const result: { symbol: SymbolInfo; references?: ReferenceInfo[] } = { symbol: s }
+    if (mode === 'references' || mode === 'callers') {
+      result.references = index.symbolIndex!.findReferences(s.name)
+      if (mode === 'callers') {
+        result.references = result.references.filter(r => r.kind === 'call')
+      }
+    }
+    return result
+  })
 }
 
 // ============ 缓存 ============
@@ -342,6 +503,16 @@ export function clearIndexCache(rootDir?: string): void {
   } else {
     indexCache.clear()
   }
+}
+
+/**
+ * 写操作后失效索引缓存（P1-A）
+ * 当 write_file / search_replace / create_directory / git_operation 成功后调用，
+ * 确保下次读取索引时会重新构建。
+ */
+export function invalidateIndexOnWrite(rootDir: string): void {
+  clearIndexCache(rootDir)
+  clearSemanticIndexCache(rootDir)
 }
 
 // ============ 工具函数 ============

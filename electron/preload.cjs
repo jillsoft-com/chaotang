@@ -22,6 +22,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 文件操作通道
   readFile: (filePath) => ipcRenderer.invoke('read-file', filePath),
   writeFile: (filePath, content) => ipcRenderer.invoke('write-file', filePath, content),
+  patchFile: (filePath, patches, expectedSha256) => ipcRenderer.invoke('patch-file', filePath, patches, expectedSha256),
+  revertFile: (filePath, oldContent, expectedSha256) => ipcRenderer.invoke('revert-file', filePath, oldContent, expectedSha256),
   createDirectory: (dirPath) => ipcRenderer.invoke('create-directory', dirPath),
   readDirectory: (dirPath) => ipcRenderer.invoke('read-directory', dirPath),
   // 文档解析通道

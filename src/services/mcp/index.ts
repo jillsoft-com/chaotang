@@ -5,9 +5,12 @@
  * 使朝堂能够接入外部 MCP Server 的工具生态。
  */
 
-export { mcpService } from './mcp-client'
+export { mcpService, MCPClient } from './mcp-client'
 export type {
   MCPToolDefinition,
   MCPServerConfig,
-  MCPServerStatus
+  MCPServerStatus,
+  MCPResource,
+  MCPResourceContents,
+  MCPPrompt
 } from './mcp-client'

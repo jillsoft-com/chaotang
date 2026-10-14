@@ -8,7 +8,11 @@ export {
   webSearchTool, knowledgeQueryTool, calculateTool,
   readFileTool, summarizeResultsTool, readDocumentTool, executeCommandTool,
   searchCodeTool, gitOperationTool, runTestsTool,
+  gitAutoCommitTool, gitCreateBranchTool, gitDiffSummaryTool,
+  symbolLookupTool,
   webSearchHandler, knowledgeQueryHandler, calculateHandler,
   readFileHandler, summarizeResultsHandler, readDocumentHandler, executeCommandHandler,
-  searchCodeHandler, gitOperationHandler, runTestsHandler
+  searchCodeHandler, gitOperationHandler, runTestsHandler,
+  gitAutoCommitHandler, gitCreateBranchHandler, gitDiffSummaryHandler,
+  symbolLookupHandler
 } from './handlers/minimal'

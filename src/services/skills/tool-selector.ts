@@ -35,7 +35,7 @@ import type { AdvisorMetrics, AdvisorResult } from '@/services/skills/llm-adviso
 /** 始终包含的工具（核心基础设施，无论议题都需要） */
 const ALWAYS_ON_TOOLS: ReadonlySet<string> = new Set([
   // 文件操作：几乎所有任务都需要读写文件
-  'read_file', 'write_file', 'create_directory', 'read_directory',
+  'read_file', 'write_file', 'search_replace', 'create_directory', 'read_directory',
   // 记忆：跨会话知识
   'save_memory', 'search_memory',
 ])

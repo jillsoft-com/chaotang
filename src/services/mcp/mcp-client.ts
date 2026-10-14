@@ -23,6 +23,30 @@ export interface MCPToolDefinition {
   }
 }
 
+export interface MCPResource {
+  uri: string
+  name: string
+  description?: string
+  mimeType?: string
+}
+
+export interface MCPResourceContents {
+  uri: string
+  mimeType?: string
+  text?: string
+  blob?: string
+}
+
+export interface MCPPrompt {
+  name: string
+  description?: string
+  arguments?: Array<{
+    name: string
+    description?: string
+    required?: boolean
+  }>
+}
+
 export interface MCPServerConfig {
   id: string
   name: string
@@ -42,6 +66,8 @@ export interface MCPServerStatus {
   name: string
   connected: boolean
   tools: MCPToolDefinition[]
+  resources: MCPResource[]
+  prompts: MCPPrompt[]
   error?: string
   lastConnected?: number
 }
@@ -67,7 +93,7 @@ interface JsonRpcResponse {
 /**
  * MCPClient — 管理单个 MCP Server 连接
  */
-class MCPClient {
+export class MCPClient {
   private config: MCPServerConfig
   private requestId = 0
   private pendingRequests = new Map<JsonRpcId, {
@@ -75,6 +101,8 @@ class MCPClient {
     reject: (error: Error) => void
   }>()
   private tools: MCPToolDefinition[] = []
+  private resources: MCPResource[] = []
+  private prompts: MCPPrompt[] = []
   private connected = false
   private error?: string
   /** SSE 模式下的 EventSource */
@@ -92,6 +120,8 @@ class MCPClient {
       name: this.config.name,
       connected: this.connected,
       tools: this.tools,
+      resources: this.resources,
+      prompts: this.prompts,
       error: this.error,
       lastConnected: this.connected ? Date.now() : undefined
     }
@@ -114,10 +144,12 @@ class MCPClient {
       // 初始化握手
       await this.initialize()
 
-      // 获取工具列表
+      // 获取工具、资源、提示词列表
       this.tools = await this.listTools()
+      this.resources = await this.listResources()
+      this.prompts = await this.listPrompts()
       this.connected = true
-      console.log(`[MCP] 已连接 "${this.config.name}"，发现 ${this.tools.length} 个工具`)
+      console.log(`[MCP] 已连接 "${this.config.name}"，发现 ${this.tools.length} 个工具，${this.resources.length} 个资源，${this.prompts.length} 个提示词`)
       return this.tools
     } catch (err) {
       this.error = err instanceof Error ? err.message : '连接失败'
@@ -138,6 +170,8 @@ class MCPClient {
     this.messageEndpoint = null
     this.connected = false
     this.tools = []
+    this.resources = []
+    this.prompts = []
     // 清理 pending requests
     for (const [, pending] of this.pendingRequests) {
       pending.reject(new Error('已断开连接'))
@@ -153,6 +187,28 @@ class MCPClient {
       throw new Error(`MCP Server "${this.config.name}" 未连接`)
     }
     const response = await this.sendRequest('tools/call', { name, arguments: args })
+    return response
+  }
+
+  /**
+   * 读取资源内容
+   */
+  async readResource(uri: string): Promise<MCPResourceContents> {
+    if (!this.connected) {
+      throw new Error(`MCP Server "${this.config.name}" 未连接`)
+    }
+    const response = await this.sendRequest('resources/read', { uri })
+    return response?.contents?.[0] || { uri }
+  }
+
+  /**
+   * 获取提示词
+   */
+  async getPrompt(name: string, args?: Record<string, any>): Promise<any> {
+    if (!this.connected) {
+      throw new Error(`MCP Server "${this.config.name}" 未连接`)
+    }
+    const response = await this.sendRequest('prompts/get', { name, arguments: args })
     return response
   }
 
@@ -288,6 +344,16 @@ class MCPClient {
     const result = await this.sendRequest('tools/list')
     return result?.tools || []
   }
+
+  private async listResources(): Promise<MCPResource[]> {
+    const result = await this.sendRequest('resources/list')
+    return result?.resources || []
+  }
+
+  private async listPrompts(): Promise<MCPPrompt[]> {
+    const result = await this.sendRequest('prompts/list')
+    return result?.prompts || []
+  }
 }
 
 // ============ MCP Service（全局管理） ============
@@ -311,6 +377,8 @@ class MCPService {
         name: c.name,
         connected: false,
         tools: [],
+        resources: [],
+        prompts: [],
         error: '未连接'
       }
     })
@@ -403,6 +471,56 @@ class MCPService {
       }
     }
     return handlers
+  }
+
+  /**
+   * 获取所有已连接 Server 的资源列表
+   */
+  getAllResources(): Array<{ serverId: string; resource: MCPResource }> {
+    const resources: Array<{ serverId: string; resource: MCPResource }> = []
+    for (const [, client] of this.clients) {
+      if (!client.status.connected) continue
+      for (const resource of client.status.resources) {
+        resources.push({ serverId: client.status.id, resource })
+      }
+    }
+    return resources
+  }
+
+  /**
+   * 读取指定资源的内容
+   */
+  async readResource(serverId: string, uri: string): Promise<MCPResourceContents> {
+    const client = this.clients.get(serverId)
+    if (!client) {
+      throw new Error(`MCP Server "${serverId}" 不存在`)
+    }
+    return client.readResource(uri)
+  }
+
+  /**
+   * 获取所有已连接 Server 的提示词列表
+   */
+  getAllPrompts(): Array<{ serverId: string; prompt: MCPPrompt }> {
+    const prompts: Array<{ serverId: string; prompt: MCPPrompt }> = []
+    for (const [, client] of this.clients) {
+      if (!client.status.connected) continue
+      for (const prompt of client.status.prompts) {
+        prompts.push({ serverId: client.status.id, prompt })
+      }
+    }
+    return prompts
+  }
+
+  /**
+   * 获取指定提示词
+   */
+  async getPrompt(serverId: string, name: string, args?: Record<string, any>): Promise<any> {
+    const client = this.clients.get(serverId)
+    if (!client) {
+      throw new Error(`MCP Server "${serverId}" 不存在`)
+    }
+    return client.getPrompt(name, args)
   }
 
   /**

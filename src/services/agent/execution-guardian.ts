@@ -90,7 +90,8 @@ const READ_ONLY_TOOLS = new Set([
   'calculate',
   'search_memory',
   'summarize_results',
-  'git_operation'   // 只读 git 操作（log/diff/status/show）
+  'git_operation',   // 只读 git 操作（log/diff/status/show）
+  'git_diff_summary' // 只读 diff 摘要
 ])
 
 /** 预期重复的例外工具（分页/轮询场景不算循环） */

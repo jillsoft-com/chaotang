@@ -18,6 +18,12 @@ import { skillRegistry, selectToolsForTopic, estimateToolTokens } from '@/servic
 import { toolExecutor } from '@/services/tools/executor'
 import { getProjectIndex, generateContextHint } from '@/services/agent/repository-context'
 import { mcpService } from '@/services/mcp'
+import { runAcceptance, collectChangedFiles } from '@/services/agent/acceptance-gate'
+import type { CommandExecutor } from '@/services/agent/acceptance-gate'
+import { buildDeliveryReport } from '@/services/agent/delivery-report'
+import type { DeliveryReport, FileChange } from '@/services/agent/delivery-report'
+import DeliveryPanel from '@/components/DeliveryPanel.vue'
+import PlanReviewPanel from '@/components/PlanReviewPanel.vue'
 
 // ============ 危险命令审批 (Approval Mode) ============
 
@@ -34,8 +40,12 @@ const DANGEROUS_CMD_PATTERNS = [
   /\bRemove-Item\b/i, /\bClear-RecycleBin\b/i
 ]
 
-/** 检查命令是否危险 */
+/** 检查命令是否危险 — P0-fix: 扩展到 git_auto_commit / git_create_branch 等工具 */
 function isDangerousCommand(toolCall: ToolCall): boolean {
+  // P0-fix: git_auto_commit 和 git_create_branch 始终需要审批
+  if (toolCall.function.name === 'git_auto_commit' || toolCall.function.name === 'git_create_branch') {
+    return true
+  }
   if (toolCall.function.name !== 'execute_command') return false
   try {
     const args = JSON.parse(toolCall.function.arguments)
@@ -48,16 +58,34 @@ function isDangerousCommand(toolCall: ToolCall): boolean {
 
 /** 弹出确认框，返回 true 表示用户批准 */
 async function confirmDangerousCommand(toolCall: ToolCall): Promise<boolean> {
-  let cmd = ''
+  // P1-fix: 根据工具类型展示有意义的审批信息
+  let title = '⚠️ 危险命令确认'
+  let detail = ''
+
   try {
     const args = JSON.parse(toolCall.function.arguments)
-    cmd = args.command || ''
-  } catch { /* ignore */ }
+
+    if (toolCall.function.name === 'git_auto_commit') {
+      title = '🚀 Git 自动提交确认'
+      const files = args.files || []
+      const msg = args.message || '(自动生成)'
+      detail = `操作: git add + commit\n提交信息: ${msg}\n文件范围: ${files.length > 0 ? files.join(', ') : '(全部变更)'}`
+    } else if (toolCall.function.name === 'git_create_branch') {
+      title = '🌿 Git 创建分支确认'
+      detail = `操作: git checkout -b ${args.branch_name || '(未知)'}\n将从当前分支创建新分支`
+    } else {
+      // execute_command 等其他工具
+      const cmd = args.command || ''
+      detail = `即将执行以下命令：\n\n${cmd}`
+    }
+  } catch {
+    detail = '无法解析工具参数'
+  }
 
   try {
     await ElMessageBox.confirm(
-      `即将执行以下命令，请确认是否批准：\n\n${cmd}`,
-      '⚠️ 危险命令确认',
+      detail,
+      title,
       {
         confirmButtonText: '批准执行',
         cancelButtonText: '拒绝',
@@ -85,6 +113,119 @@ const userInput = ref('')
 const courtInput = ref('')
 const isSending = ref(false)
 const hasStartedCourt = ref(false)
+
+// P1-B: 交付报告
+const deliveryReport = ref<DeliveryReport | null>(null)
+
+// Phase 1: Plan Mode 审阅面板
+const planReviewData = ref<{ plan: { plan: string; tasks: any[] }; workers: any[]; resolve: (result: any) => void } | null>(null)
+
+/** Phase 1: 创建 Plan Mode 回调 — 弹出可视化编辑面板，返回用户修改后的计划或 null */
+function createPlanReviewCallback(workers: any[]) {
+  return async (plan: any): Promise<any> => {
+    return new Promise((resolve) => {
+      planReviewData.value = { plan, workers, resolve }
+    })
+  }
+}
+
+/** Phase 1: 用户批准计划 */
+function handlePlanApprove(editedPlan: any) {
+  if (planReviewData.value) {
+    planReviewData.value.resolve(editedPlan)
+    planReviewData.value = null
+  }
+}
+
+/** Phase 1: 用户取消计划 */
+function handlePlanCancel() {
+  if (planReviewData.value) {
+    planReviewData.value.resolve(null)
+    planReviewData.value = null
+  }
+}
+
+/** P1-B: 撤销交付 — 尝试恢复文件到修改前状态 */
+async function handleDeliveryRevert() {
+  if (!deliveryReport.value) return
+  const report = deliveryReport.value
+  let reverted = 0
+  let failed = 0
+  let conflicts = 0
+  let skipped = 0
+  for (const file of report.changedFiles) {
+    // P0-fix: 缺失原始内容的文件无法安全撤销
+    if (file.revertDisabled) {
+      skipped++
+      continue
+    }
+    if (!window.electronAPI?.readFile || !window.electronAPI?.revertFile) {
+      failed++
+      continue
+    }
+    try {
+      // P0-fix: 先读取当前文件内容与哈希，校验是否与交付时一致
+      const currentRead = await window.electronAPI.readFile(file.path)
+      if (!currentRead.success) {
+        // 文件不存在：如果是新建的文件，无需撤销
+        if (file.status === 'created') {
+          reverted++
+          continue
+        }
+        failed++
+        continue
+      }
+
+      // P1-fix: 使用原子撤销 API（带版本校验，防止覆盖窗口）
+      // 先检查当前内容是否与交付时的 newContent 一致
+      const currentContent = currentRead.content || ''
+      const expectedNewContent = file.newContent || ''
+      if (currentContent !== expectedNewContent) {
+        // 文件已被外部修改，撤销会覆盖用户后续修改
+        conflicts++
+        continue
+      }
+
+      // 新建文件无法撤销（没有 deleteFile API）
+      if (file.status === 'created') {
+        conflicts++ // 计入冲突，提示用户手动处理
+        continue
+      }
+
+      // P1-fix: 使用原子撤销 API，传入当前文件的 SHA-256 作为版本校验
+      if (file.oldContent !== undefined && currentRead.sha256) {
+        const result = await window.electronAPI.revertFile(file.path, file.oldContent, currentRead.sha256)
+        if (result?.success) {
+          reverted++
+        } else if (result?.errorCode === 'VERSION_MISMATCH' || result?.errorCode === 'VERSION_MISMATCH_AFTER_APPROVAL') {
+          // 审批期间文件被修改，算作冲突
+          conflicts++
+        } else {
+          failed++
+        }
+      } else {
+        failed++
+      }
+    } catch {
+      failed++
+    }
+  }
+
+  const messages: string[] = []
+  if (reverted > 0) messages.push(`${reverted} 个文件已撤销`)
+  if (conflicts > 0) messages.push(`${conflicts} 个文件已被后续修改或为新建文件，已跳过`)
+  if (skipped > 0) messages.push(`${skipped} 个文件缺少原始内容，无法撤销`)
+  if (failed > 0) messages.push(`${failed} 个文件撤销失败`)
+
+  if (failed === 0 && conflicts === 0 && skipped === 0) {
+    ElMessage.success(`已撤销 ${reverted} 个文件的改动`)
+  } else if (failed === 0) {
+    ElMessage.warning(messages.join('，'))
+  } else {
+    ElMessage.error(messages.join('，'))
+  }
+  deliveryReport.value = null
+}
 
 // 消息字体大小（从 localStorage 读取，在设置页面中调节）
 const messageFontSize = ref(parseInt(appStorage.getItem('message_font_size') || '15', 10))
@@ -890,6 +1031,9 @@ async function runMinisterTurn(params: {
     debateStore.ministers.find(m => m.id === ministerId)!.llm
   ))
 
+  // P1-fix: 每次执行开始时清空旧的交付报告，避免失败轮次展示上次报告
+  deliveryReport.value = null
+
   // 没有工作目录，走普通无工具对话
   if (!workingDir) {
     const messages = [
@@ -968,6 +1112,7 @@ async function runMinisterTurn(params: {
   const MAX_ROUNDS = parseInt(appStorage.getItem('max_tool_rounds') || '30', 10)
   let finalContent = ''
   let accumulatedContent = ''
+  const allToolCallResults: Array<{ functionName: string; status: string; arguments?: Record<string, any> }> = []
 
   for (let round = 0; round < MAX_ROUNDS; round++) {
     const pendingToolCalls: ToolCall[] = []
@@ -1087,10 +1232,10 @@ async function runMinisterTurn(params: {
         }
       }
 
-      // Diff 预览：write_file 执行前读取旧内容
+      // Diff 预览：write_file / search_replace 执行前读取旧内容
       let preWriteOldContent: string | null = null
       let preWriteFilePath = ''
-      if (tc.function.name === 'write_file') {
+      if (tc.function.name === 'write_file' || tc.function.name === 'search_replace') {
         try {
           const args = JSON.parse(tc.function.arguments)
           preWriteFilePath = args.path || ''
@@ -1105,6 +1250,17 @@ async function runMinisterTurn(params: {
 
       const result = await toolExecutor.execute(tc)
 
+      // 跟踪工具调用结果（用于验收）
+      try {
+        allToolCallResults.push({
+          functionName: tc.function.name,
+          status: result.status,
+          arguments: JSON.parse(tc.function.arguments)
+        })
+      } catch {
+        allToolCallResults.push({ functionName: tc.function.name, status: result.status })
+      }
+
       // Diff 预览：write_file 执行后捕获 diff 数据
       const statusEntry = reactiveSpeech.toolStatuses.find(s => s.toolCallId === tc.id)
       if (statusEntry) {
@@ -1113,14 +1269,20 @@ async function runMinisterTurn(params: {
           ? result.result.slice(0, 60)
           : result.error || ''
 
-        // 如果是 write_file 且执行成功，附加 diff 数据
-        if (tc.function.name === 'write_file' && result.status === 'success') {
+        // 如果是 write_file / search_replace 且执行成功，附加 diff 数据
+        if ((tc.function.name === 'write_file' || tc.function.name === 'search_replace') && result.status === 'success') {
           try {
             const args = JSON.parse(tc.function.arguments)
+            let newContent = args.content || ''
+            // search_replace: 读取写入后的文件内容
+            if (tc.function.name === 'search_replace' && window.electronAPI?.readFile) {
+              const postRead = await window.electronAPI.readFile(args.path || '')
+              if (postRead.success) newContent = postRead.content || ''
+            }
             statusEntry.diffData = {
               filePath: args.path || '',
               oldContent: preWriteOldContent || '',
-              newContent: args.content || '',
+              newContent,
               isNew: preWriteOldContent === null
             }
           } catch { /* 解析失败不附加 */ }
@@ -1240,6 +1402,66 @@ async function runMinisterTurn(params: {
     }
   }
   console.log('[runMinisterTurn] 全部完成, finalContent 长度:', finalContent.length)
+
+  // P0-B: 验收——工具循环结束后，若有文件改动则运行检查
+  if (workingDir && allToolCallResults.length > 0) {
+    const changedFiles = collectChangedFiles(allToolCallResults)
+    if (changedFiles.length > 0) {
+      const cmdExecutor: CommandExecutor = {
+        execute: async (cmd: string, cwd?: string, timeoutMs?: number) => {
+          if (window.electronAPI?.executeCommand) {
+            const r = await window.electronAPI.executeCommand({
+              command: cmd,
+              cwd: cwd || workingDir,
+              timeout: timeoutMs || 120000
+            })
+            return {
+              exitCode: r.exitCode ?? (r.success ? 0 : 1),
+              stdout: r.stdout || '',
+              stderr: r.stderr || '',
+              timedOut: r.timedOut || false
+            }
+          }
+          return { exitCode: 1, stdout: '', stderr: '无命令执行能力', timedOut: false }
+        }
+      }
+      try {
+        const acceptance = await runAcceptance(workingDir, changedFiles, cmdExecutor)
+        // P1-fix: 验收失败时作为硬门槛，在回复中明确标注，并阻断交付
+        if (acceptance.overallState === 'failed') {
+          const failedChecks = acceptance.checks.filter(c => c.status === 'failed')
+          const diagnostics = failedChecks.map(c => `- [${c.kind}] ${c.command}: ${c.summary}`).join('\n')
+          const warningText = `\n\n---\n\u274c **\u9a8c\u6536\u68c0\u67e5\u672a\u901a\u8fc7**\n\n${diagnostics}\n\n\u4ee5\u4e0a\u68c0\u67e5\u672a\u901a\u8fc7\uff0c\u4ee3\u7801\u53ef\u80fd\u5b58\u5728\u95ee\u9898\uff0c\u8bf7\u4ed4\u7ec6\u68c0\u67e5\u540e\u518d\u91c7\u7eb3\u3002\n\n**\u5df2\u963b\u65ad\u4ea4\u4ed8**\uff0c\u8bf7\u4fee\u590d\u4ee5\u4e0a\u95ee\u9898\u540e\u91cd\u65b0\u6267\u884c\u3002`
+          finalContent += warningText
+          onContent(finalContent)
+          // P1-fix: 验收失败时不构建交付报告，阻断交付
+          // deliveryReport.value 不设置
+        } else if (acceptance.overallState === 'passed') {
+          const passedSummary = acceptance.checks.map(c => `- [${c.kind}] ${c.command}: \u2705 \u901a\u8fc7`).join('\n')
+          const passText = `\n\n---\n\u2705 **\u9a8c\u6536\u68c0\u67e5\u5168\u90e8\u901a\u8fc7**\n\n${passedSummary}`
+          finalContent += passText
+          onContent(finalContent)
+          // P1-B: 验收通过才构建交付报告
+          deliveryReport.value = buildDeliveryReport({
+            toolCalls: allToolCallResults as any,
+            acceptance,
+            nodeTitle: '会话'
+          })
+        } else if (acceptance.overallState === 'unverified') {
+          // P1-fix: 未验证状态也明确告知用户
+          finalContent += '\n\n---\n\u26a0\ufe0f **\u9a8c\u6536\u68c0\u67e5\u672a\u6267\u884c**\n\n\u672a\u914d\u7f6e\u81ea\u52a8\u68c0\u67e5\uff0c\u65e0\u6cd5\u9a8c\u8bc1\u5b8c\u6210\u72b6\u6001\u3002'
+          onContent(finalContent)
+          // P1-fix: 未验证状态也不构建交付报告，避免无法撤销的风险
+        }
+      } catch (acceptanceError) {
+        // P1-fix: 验收过程抛错时不再静默忽略，而是在回复中展示，并阻断交付
+        const errMsg = acceptanceError instanceof Error ? acceptanceError.message : String(acceptanceError)
+        finalContent += `\n\n---\n\u26a0\ufe0f **\u9a8c\u6536\u8fc7\u7a0b\u51fa\u9519**\n\n${errMsg}\n\n\u8bf7\u6ce8\u610f\u4ee5\u4e0a\u9519\u8bef\uff0c\u5efa\u8bae\u624b\u52a8\u68c0\u67e5\u4ee3\u7801\u3002\n\n**\u5df2\u963b\u65ad\u4ea4\u4ed8**\u3002`
+        onContent(finalContent)
+        // P1-fix: 验收出错时也不构建交付报告
+      }
+    }
+  }
 
   // 清理本次注册的 MCP 工具处理器
   for (const name of mcpToolNames) {
@@ -1370,6 +1592,9 @@ async function runCourtDebate() {
 async function runAgentDebate() {
   if (!session.value) return
 
+  // P1-fix: 每次执行开始时清空旧的交付报告，避免失败轮次展示上次报告
+  deliveryReport.value = null
+
   const allMinisters = debateStore.sortedMinisters
   const mentioned = session.value.mentionedMinisters
   const ministers = mentioned && mentioned.length > 0
@@ -1431,31 +1656,8 @@ async function runAgentDebate() {
     autonomousMaxIterations: 10
   })
 
-  // Plan Mode 确认回调
-  const onPlanReady = async (_plan: any) => {
-    while (true) {
-      try {
-        await ElMessageBox.confirm(
-          '丞相已拆解完成，是否批准执行？',
-          '📋 执行计划确认',
-          {
-            confirmButtonText: '批准执行',
-            cancelButtonText: '取消',
-            distinguishCancelAndClose: true,
-            type: 'info'
-          }
-        )
-        return true
-      } catch (action) {
-        if (action === 'cancel') {
-          // 用户点击取消
-          return false
-        }
-        // ESC 关闭也返回 false
-        return false
-      }
-    }
-  }
+  // Phase 1: Plan Mode 审阅回调 — 弹出可视化编辑面板
+  const onPlanReady = createPlanReviewCallback(workers)
 
   // Approval Mode 回调
   const onBeforeToolExecute = async (tc: ToolCall) => {
@@ -1549,6 +1751,115 @@ async function runAgentDebate() {
 
   if (session.value) {
     debateStore.completeDebate()
+  }
+
+  // P1-B: Agent 模式完成后构建交付报告
+  if (session.value?.taskTreeSnapshot) {
+    const tree = session.value.taskTreeSnapshot
+    const nodes = Object.values(tree.nodes || {})
+    // P1-fix: 聚合所有叶节点的验收状态 + 文件变更
+    let overallState: 'passed' | 'failed' | 'unverified' = 'unverified'
+    const allChecks: any[] = []
+    let hasFailed = false
+    let hasAnyChecks = false
+    // P1-fix: 检查任务树终态，如果有 failed/interrupted 状态则不交付
+    const treeState = tree.state
+    // P1-fix: 逐一核对所有 action 模式叶节点的验收状态
+    let allActionNodesPassed = true
+    let anyActionNodeLacksAcceptance = false
+    for (const rawNode of nodes) {
+      const node = rawNode as any
+      // 跳过根节点和非叶节点
+      if (node.id === tree.rootId || node.childIds.length > 0) continue
+      // 只检查 action 模式的叶节点
+      if (node.mode !== 'action') continue
+      // 跳过已取消/已跳过的节点
+      if (node.status === 'cancelled' || node.status === 'skipped') continue
+      if (node.status === 'failed') {
+        hasFailed = true
+        allActionNodesPassed = false
+      }
+      if (node.acceptanceChecks?.length) {
+        allChecks.push(...node.acceptanceChecks)
+        hasAnyChecks = true
+        if (node.acceptanceState === 'failed') {
+          hasFailed = true
+          allActionNodesPassed = false
+        } else if (node.acceptanceState !== 'passed') {
+          // 有检查记录但不是 passed
+          allActionNodesPassed = false
+        }
+      } else {
+        // action 模式叶节点没有验收检查记录
+        anyActionNodeLacksAcceptance = true
+      }
+    }
+    // P1-fix: 汇总判定：必须所有 action 叶节点都有验收记录且全部 passed
+    if (hasAnyChecks && allActionNodesPassed && !anyActionNodeLacksAcceptance && treeState !== 'failed' && treeState !== 'interrupted') {
+      overallState = 'passed'
+    } else if (hasFailed || treeState === 'failed' || treeState === 'interrupted') {
+      overallState = 'failed'
+    }
+    // 聚合所有叶节点的文件变更
+    const allChangedFiles: FileChange[] = []
+    for (const node of nodes) {
+      if ((node as any).fileBaselines) {
+        for (const [path, baseline] of Object.entries((node as any).fileBaselines as Record<string, any>)) {
+          const existing = allChangedFiles.find(f => f.path === path)
+          if (!existing) {
+            // P1-fix: 读取实际文件内容与哈希，校验是否与任务写入后一致
+            let actualNewContent = ''
+            let currentSha256: string | undefined
+            let isNew = false
+            if (window.electronAPI?.readFile) {
+              try {
+                const readResult = await window.electronAPI.readFile(path)
+                if (readResult.success) {
+                  actualNewContent = readResult.content || ''
+                  currentSha256 = readResult.sha256
+                }
+              } catch { /* 忽略读取失败 */ }
+            }
+            // 如果没有 beforeSha256 或 beforeSha256 为 'unknown'，可能是新建文件
+            if (!baseline.beforeSha256 || baseline.beforeSha256 === 'unknown') {
+              isNew = true
+            }
+            // P0-fix: 从执行时的 diff 保存首次写入前内容；缺失时禁用撤销
+            const savedOldContent = baseline.originalContent
+            const hasRevertData = isNew || savedOldContent !== undefined
+            // P0-fix: 校验当前文件哈希是否与任务写入后一致，不一致说明用户后续修改了文件
+            let hashMismatch = false
+            if (currentSha256 && baseline.afterSha256 && currentSha256 !== baseline.afterSha256) {
+              hashMismatch = true
+            }
+            allChangedFiles.push({
+              path,
+              status: isNew ? 'created' : 'modified',
+              newContent: actualNewContent,
+              oldContent: savedOldContent !== undefined ? savedOldContent : '',
+              linesAdded: 0,
+              linesRemoved: 0,
+              // 标记是否可撤销：新建文件、缺失原始内容、哈希不一致都禁用撤销
+              revertDisabled: !hasRevertData || hashMismatch
+            })
+          }
+          // P1-fix: 多节点修改同文件时，保留首次写入的 originalContent（真正的原始版本）
+          // 已存在的条目不需要更新，因为第一个节点的 originalContent 就是修改前的真正原始内容
+        }
+      }
+    }
+    // P1-fix: Agent 模式也受硬门槛约束：只有验收通过才构建交付报告
+    // unverified 和 failed 都阻断交付
+    if (overallState === 'passed') {
+      deliveryReport.value = {
+        changedFiles: allChangedFiles,
+        acceptanceState: overallState,
+        acceptanceChecks: allChecks,
+        unresolvedQuestions: nodes.filter((n: any) => n.status === 'failed').map((n: any) => `${n.title}: ${n.resultSummary || '执行失败'}`),
+        repairsUsed: 0,
+        nodeTitle: 'Agent 协作'
+      }
+    }
   }
 }
 
@@ -1697,27 +2008,8 @@ async function sendCourtMessage() {
         autonomousMaxIterations: 10
       })
 
-      // Plan Mode 确认回调
-      const onPlanReady = async (_plan: any) => {
-        while (true) {
-          try {
-            await ElMessageBox.confirm(
-              '丞相已拆解完成，是否批准执行？',
-              '📋 执行计划确认',
-              {
-                confirmButtonText: '批准执行',
-                cancelButtonText: '取消',
-                distinguishCancelAndClose: true,
-                type: 'info'
-              }
-            )
-            return true
-          } catch (action) {
-            if (action === 'cancel') return false
-            return false
-          }
-        }
-      }
+      // Phase 1: Plan Mode 审阅回调 — 弹出可视化编辑面板
+      const onPlanReady = createPlanReviewCallback(workers)
 
       // Approval Mode 回调
       const onBeforeToolExecute = async (tc: ToolCall) => {
@@ -2252,6 +2544,28 @@ function renderMarkdown(content: string): string {
           </ol>
         </section>
       </div>
+    </div>
+
+    <!-- Phase 1: Plan Mode 审阅面板 -->
+    <div v-if="planReviewData" class="plan-review-container">
+      <PlanReviewPanel
+        :plan="planReviewData.plan"
+        :workers="planReviewData.workers"
+        @approve="handlePlanApprove"
+        @cancel="handlePlanCancel"
+      />
+    </div>
+
+    <!-- P1-B: 交付审阅面板 -->
+    <div
+      v-if="deliveryReport && session?.status === 'completed' && deliveryReport.changedFiles.length + deliveryReport.acceptanceChecks.length > 0"
+      class="delivery-panel-wrapper"
+    >
+      <DeliveryPanel
+        :report="deliveryReport"
+        @confirm="deliveryReport = null"
+        @revert="handleDeliveryRevert"
+      />
     </div>
 
     <!-- 底部 -->

@@ -11,6 +11,8 @@
  */
 
 import { getStorageBackend } from '@/services/storage'
+import { createTfIdfIndex } from '@/services/agent/vector-index'
+import type { VectorDocument } from '@/services/agent/vector-index'
 
 // ============ 类型定义 ============
 
@@ -150,6 +152,35 @@ class MemoryStore {
   }
 
   /**
+   * 语义搜索记忆 — 使用 VectorIndex 按语义相似度排序
+   *
+   * 将每条记忆作为文档构建向量索引，然后按与 query 的语义相似度排序。
+   * 如果未配置嵌入 API，降级为 TF-IDF 检索。
+   */
+  async semanticSearch(query: string, topK = 10): Promise<Array<Memory & { score: number }>> {
+    if (this.memories.length === 0 || !query.trim()) return []
+
+    const vectorIndex = createTfIdfIndex()
+    const docs: VectorDocument[] = this.memories.map(m => ({
+      id: m.id,
+      text: `${m.content} ${m.tags.join(' ')}`,
+      metadata: { memoryId: m.id }
+    }))
+    await vectorIndex.addAll(docs)
+
+    const results = await vectorIndex.search(query, topK)
+    const memoryMap = new Map(this.memories.map(m => [m.id, m]))
+
+    return results
+      .map(r => {
+        const memory = memoryMap.get(r.id)
+        if (!memory) return null
+        return { ...memory, score: r.score }
+      })
+      .filter((m): m is Memory & { score: number } => m !== null)
+  }
+
+  /**
    * 按类型获取记忆
    */
   getByType(type: MemoryType): Memory[] {
@@ -192,7 +223,7 @@ class MemoryStore {
 
     // 筛选相关记忆：
     // 1. 高重要性记忆（importance >= 4）
-    // 2. 与当前话题相关的记忆
+    // 2. 与当前话题相关的记忆（关键词 + 语义匹配）
     // 3. 最近更新的记忆
     const relevant = this.memories
       .filter(m => {
@@ -203,6 +234,10 @@ class MemoryStore {
           const q = topic.toLowerCase()
           if (m.content.toLowerCase().includes(q)) return true
           if (m.tags.some(t => q.includes(t.toLowerCase()))) return true
+          // 语义匹配：分词后检查任意词是否出现在内容中
+          const topicWords = topic.toLowerCase().split(/[\s,;，；、]+/).filter(w => w.length >= 2)
+          if (topicWords.some(w => m.content.toLowerCase().includes(w))) return true
+          if (topicWords.some(w => m.tags.some(t => t.toLowerCase().includes(w)))) return true
         }
         // 如果有工作目录，包含项目相关记忆
         if (workingDirectory && m.tags.some(t => t.toLowerCase() === 'project')) return true
