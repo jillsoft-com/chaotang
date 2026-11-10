@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Host 测试页</title></head>
+<body style="font-family:sans-serif">
+  <h1 id="target">idle</h1>
+  <button id="btn" onclick="document.getElementById('target').textContent='clicked:'+event.isTrusted">press me</button>
+  <input id="inp" placeholder="type here">
+  <div id="hoverable" style="width:90px;height:90px;background:#ddd"
+       onmouseover="window.__hovers=(window.__hovers||0)+1">hover me</div>
+  <a id="nav" href="page2.html">go page2</a>
+  <script>
+    window.addEventListener('keydown', (e) => { window.__lastKey = e.key + ':' + e.isTrusted })
+    window.addEventListener('scroll', () => { window.__scrolled = true })
+  </script>
+  <div style="height:3000px">长页面尾部</div>
+</body>
+</html>

@@ -6,6 +6,58 @@ declare module '*.vue' {
   export default component
 }
 
+// ============ 内嵌浏览器宿主（M2）============
+
+/** 页面当前能不能拿到画面：由主进程按挂载/窗口/尺寸三态判定 */
+type BrowserHostVisibility = 'visible' | 'detached' | 'minimized' | 'hidden' | 'zero-size'
+
+interface BrowserHostTabInfo {
+  id: string
+  url: string
+  title: string
+  partition: string
+  active: boolean
+  mounted: boolean
+}
+
+/** state 与 browser-state 广播共用的面板状态体 */
+interface BrowserHostState {
+  active: boolean
+  tabId: string | null
+  url: string
+  title: string
+  httpStatus: number
+  loadError: string
+  blockedUrl: string
+  viewport: { width: number; height: number }
+  visibility: BrowserHostVisibility
+  canCapture: boolean
+  captureHint: string
+  policy: { allowlistEnabled?: boolean; allowlist?: string[] }
+  tabs: BrowserHostTabInfo[]
+}
+
+interface BrowserHostResult extends Partial<BrowserHostState> {
+  success: boolean
+  error?: string
+  message?: string
+  moved?: boolean
+  data?: string
+  type?: string
+  result?: any
+  accessibilityTree?: string
+  truncated?: boolean
+  frameUrl?: string
+  tabs?: BrowserHostTabInfo[]
+  autoRaise?: boolean
+  /** 真事件拿不到合成层时退化为 JS 合成事件，此标记与 warning 一起给模型 */
+  fallback?: boolean
+  warning?: string
+  hint?: string
+  /** 只是暂时拿不到画面（窗口被遮挡、刚重挂载），调用方可以重试而不是当作失败 */
+  retryable?: boolean
+}
+
 interface ElectronAPI {
   platform: string
   version: string
@@ -178,6 +230,31 @@ interface ElectronAPI {
     viewport?: { width: number; height: number }
     policy?: { allowlistEnabled?: boolean; allowlist?: string[] }
   }>
+
+  // 内嵌浏览器宿主：与上面的 Playwright 通道并存，由渲染进程 browser_engine 开关选用
+  browserHostAction: (params: {
+    action:
+      | 'tab-list' | 'tab-open' | 'tab-select' | 'tab-close'
+      | 'navigate' | 'back' | 'forward' | 'reload' | 'stop' | 'state'
+      | 'set-policy' | 'set-bounds' | 'detach' | 'attach' | 'set-auto-raise'
+      | 'viewport' | 'screenshot' | 'snapshot' | 'query' | 'evaluate'
+      | 'click' | 'mouse-click' | 'hover' | 'type' | 'keyboard'
+      | 'scroll' | 'mouse-wheel' | 'frame-evaluate' | 'close'
+    params?: Record<string, any>
+  }) => Promise<BrowserHostResult>
+  onBrowserState: (callback: (state: BrowserHostState) => void) => () => void
+  onBrowserRaise: (callback: (data: { reason: string; tabId?: string }) => void) => () => void
+  onBrowserBlocked: (callback: (data: { tabId?: string; url: string; host: string }) => void) => () => void
+  onBrowserGesture: (callback: (data: {
+    tabId?: string
+    type: 'click' | 'hover' | 'key' | 'wheel'
+    x?: number
+    y?: number
+    key?: string
+    deltaX?: number
+    deltaY?: number
+  }) => void) => () => void
+  onBrowserTabOpened: (callback: (data: { tabId: string; url: string; fromTabId?: string }) => void) => () => void
 
   // 企业微信 Webhook
   sendWebhook: (params: {

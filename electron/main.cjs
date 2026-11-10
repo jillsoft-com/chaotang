@@ -1,11 +1,12 @@
-const { app, BrowserWindow, ipcMain, dialog, safeStorage, shell } = require('electron')
+const { app, BrowserWindow, BrowserView, ipcMain, dialog, safeStorage, shell, session } = require('electron')
 const path = require('path')
-const { pathToFileURL } = require('url')
 const fs = require('fs')
 const crypto = require('crypto')
 const { exec, execFile } = require('child_process')
 const { resolveWithinRoot } = require('./workspace-access.cjs')
 const { executeInSandbox, runTestsInSandbox, checkCommandSafety } = require('./sandbox.cjs')
+const { createBrowserHost, isEmbeddedTab } = require('./browser-host.cjs')
+const { decideShellNavigation } = require('./nav-guard.cjs')
 const isDev = process.env.NODE_ENV === 'development'
 
 let mainWindow = null
@@ -1591,6 +1592,29 @@ app.whenReady().then(() => {
     }
   })
 
+  // ============ 内嵌浏览器宿主 IPC ============
+  // 与上面的 Playwright 通道并存：新宿主走 browser-host-action，
+  // 渲染进程用 browser_engine 开关选走哪一条。旧通道到 M7 才删。
+  const browserHost = createBrowserHost({
+    BrowserView,
+    session,
+    getWindow: () => mainWindow,
+    broadcast: (channel, payload) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(channel, payload)
+      }
+    }
+  })
+
+  // IPC: 执行内嵌浏览器操作（宿主自带 try/catch，这里不再包一层）
+  ipcMain.handle('browser-host-action', async (_event, { action, params = {} }) => {
+    return await browserHost.handle(action, params)
+  })
+
+  app.on('before-quit', () => {
+    try { browserHost.dispose() } catch { /* 退出时无所谓 */ }
+  })
+
   // ============ 企业微信 Webhook IPC ============
 
   let webhookServer = null
@@ -1727,19 +1751,15 @@ app.on('activate', () => {
 
 app.on('web-contents-created', (event, contents) => {
   contents.on('will-navigate', (event, navigationUrl) => {
-    let allowed = false
-    try {
-      const destination = new URL(navigationUrl)
-      allowed = isDev
-        ? destination.origin === 'http://localhost:3000'
-        : destination.protocol === 'file:' &&
-          destination.pathname === new URL(pathToFileURL(path.join(__dirname, '../dist/index.html')).href).pathname
-      if (!allowed && (destination.protocol === 'https:' || destination.protocol === 'mailto:')) {
-        shell.openExternal(navigationUrl)
-      }
-    } catch { /* 无效地址一律禁止 */ }
-    if (!allowed) {
-      event.preventDefault()
-    }
+    // 内嵌浏览器的页面由宿主自己管导航（包括白名单拦截），不能被界面守卫拦住
+    const decision = decideShellNavigation(navigationUrl, {
+      isEmbedded: isEmbeddedTab(contents),
+      isDev,
+      devOrigin: 'http://localhost:3000',
+      distIndex: path.join(__dirname, '../dist/index.html')
+    })
+    if (decision.skip) return
+    if (decision.external) shell.openExternal(navigationUrl)
+    if (!decision.allowed) event.preventDefault()
   })
 })

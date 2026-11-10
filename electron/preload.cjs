@@ -56,6 +56,34 @@ contextBridge.exposeInMainWorld('electronAPI', {
   writeArbitraryFile: (filePath, content, token) => ipcRenderer.invoke('write-arbitrary-file', filePath, content, token),
   // 浏览器自动化通道
   browserAction: (params) => ipcRenderer.invoke('browser-action', params),
+  // 内嵌浏览器宿主通道（与 Playwright 并存，由渲染进程 browser_engine 开关选用）
+  browserHostAction: (params) => ipcRenderer.invoke('browser-host-action', params),
+  // 宿主主动推给面板的事件：返回卸载函数，沿用 onWebhookMessage 的写法
+  onBrowserState: (callback) => {
+    const handler = (_event, data) => callback(data)
+    ipcRenderer.on('browser-state', handler)
+    return () => ipcRenderer.removeListener('browser-state', handler)
+  },
+  onBrowserRaise: (callback) => {
+    const handler = (_event, data) => callback(data)
+    ipcRenderer.on('browser-raise', handler)
+    return () => ipcRenderer.removeListener('browser-raise', handler)
+  },
+  onBrowserBlocked: (callback) => {
+    const handler = (_event, data) => callback(data)
+    ipcRenderer.on('browser-blocked', handler)
+    return () => ipcRenderer.removeListener('browser-blocked', handler)
+  },
+  onBrowserGesture: (callback) => {
+    const handler = (_event, data) => callback(data)
+    ipcRenderer.on('browser-gesture', handler)
+    return () => ipcRenderer.removeListener('browser-gesture', handler)
+  },
+  onBrowserTabOpened: (callback) => {
+    const handler = (_event, data) => callback(data)
+    ipcRenderer.on('browser-tab-opened', handler)
+    return () => ipcRenderer.removeListener('browser-tab-opened', handler)
+  },
   // 企业微信 Webhook 通道
   sendWebhook: (params) => ipcRenderer.invoke('send-webhook', params),
   startWebhookServer: (params) => ipcRenderer.invoke('start-webhook-server', params),
