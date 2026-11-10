@@ -60,6 +60,8 @@ export interface TaskUsage {
 }
 
 import type { GateState, CheckRecord } from './acceptance-gate'
+// 仅引入额度常量与纯换算函数，保持本模块无运行时依赖
+import { DEFAULT_MAX_TOOL_ROUNDS, NODE_TIMEOUT_MS, calcNodeToolCalls, calcRunToolCalls } from './round-budget'
 
 export interface TaskNode {
   id: string
@@ -81,6 +83,8 @@ export interface TaskNode {
   acceptance: string[]
   status: TaskStatus
   waitingReason?: string
+  /** 终态失败原因（failed / interrupted / partial）— 此前终态 reason 被丢弃，节点显示失败却查不到缘由 */
+  failureReason?: string
   wakeCondition?: WakeCondition
   verification: Verification
   resultSummary?: string
@@ -266,18 +270,20 @@ export function getGoalSummary(tree: TaskTreeSnapshot): string {
 
 // ============ 默认值 ============
 
+// 额度按“轮次上限 × 每轮工具调用数”换算（见 round-budget），
+// 目的是让正常任务不会撞顶；即使撞顶也只做告警，不再暂停执行。
 const DEFAULT_BUDGET: TaskBudget = {
-  maxIterations: 10,
-  maxToolCalls: 50,
-  timeoutMs: 5 * 60 * 1000
+  maxIterations: DEFAULT_MAX_TOOL_ROUNDS,
+  maxToolCalls: calcNodeToolCalls(DEFAULT_MAX_TOOL_ROUNDS),
+  timeoutMs: NODE_TIMEOUT_MS
 }
 
 const DEFAULT_LIMITS: TreeLimits = {
   maxDepth: 3,
   maxChildren: 5,
   maxNodes: 20,
-  maxIterationsPerLeaf: 10,
-  maxToolCallsPerRun: 200
+  maxIterationsPerLeaf: DEFAULT_MAX_TOOL_ROUNDS,
+  maxToolCallsPerRun: calcRunToolCalls(DEFAULT_MAX_TOOL_ROUNDS)
 }
 
 // ============ 合法状态迁移表 ============
@@ -291,7 +297,7 @@ const VALID_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
   paused:              ['ready', 'cancelled'],
   interrupted:         ['ready', 'pending', 'cancelled'],
   completed:           ['ready'],                    // 恢复：写入丢失时允许重新执行
-  partial:             [],
+  partial:             ['ready'],                    // 续跑：部分完成可在用户确认后重新执行未完成部分
   failed:              ['ready', 'cancelled'],      // 重试：用户批准或只读自动重试
   blocked:             ['ready', 'partial', 'cancelled'],
   skipped:             [],
@@ -580,6 +586,14 @@ export function transitionStatus(
     node.waitingReason = undefined
   }
 
+  // 设置终态失败原因：只在失败类终态保留，重新进入执行队列或成功时清空，
+  // 避免重试后仍挂着上一次的失败缘由
+  if (reason && ['failed', 'interrupted', 'partial'].includes(newStatus)) {
+    node.failureReason = reason
+  } else if (['pending', 'ready', 'running', 'completed', 'cancelled', 'skipped'].includes(newStatus)) {
+    node.failureReason = undefined
+  }
+
   tree.updatedAt = Date.now()
   return { ok: true }
 }
@@ -682,10 +696,13 @@ export function getReadyNodes(tree: TaskTreeSnapshot): TaskNode[] {
     if (node.status !== 'pending' && node.status !== 'ready') continue
 
     // 检查所有必需依赖是否完成
+    // 达成口径必须与调度器 updateReadyNodes 一致（completed 或 partial）：
+    // 只看 completed 会让依赖部分完成任务的节点被推成 ready 后又被这里过滤掉，
+    // 既不再执行也不落快照，整树停在"执行中"收不了尾
     const requiredDeps = node.dependencies.filter(d => d.kind === 'required')
     const allRequiredDone = requiredDeps.every(dep => {
       const depNode = tree.nodes[dep.taskId]
-      return depNode && depNode.status === 'completed'
+      return depNode && (depNode.status === 'completed' || depNode.status === 'partial')
     })
 
     if (allRequiredDone) {

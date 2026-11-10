@@ -185,6 +185,28 @@ describe('TestLoopEngine 测试循环引擎', () => {
       expect(result.passed).toBe(false)
       expect(result.testCommand).toBe('none')
       expect(result.totalRounds).toBe(0)
+      // “没检测到命令”与“检测到但跑挂了”必须靠 testCommand 区分：
+      // 自主引擎对 none 不回滚 goalReached，否则会把已完成的任务误判为失败
+    })
+
+    it('真实测试失败时保留具体命令', async () => {
+      const engine = new TestLoopEngine(makeConfig({ testCommand: 'npm test', maxRounds: 1 }))
+      const executor = mockExecutor({
+        'npm test': { exitCode: 1, stderr: 'FAIL: 1 test' }
+      })
+
+      const result = await engine.execute({
+        provider: mockProvider(),
+        systemPrompt: 'test',
+        toolDefs: mockToolDefs,
+        executor,
+        goal: '修复代码',
+        changedFiles: ['/test/project/src/index.ts']
+      })
+
+      expect(result.passed).toBe(false)
+      expect(result.testCommand).toBe('npm test')
+      expect(result.totalRounds).toBe(1)
     })
 
     it('使用指定的测试命令（跳过检测）', async () => {

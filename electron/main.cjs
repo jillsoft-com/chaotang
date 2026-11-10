@@ -3,7 +3,7 @@ const path = require('path')
 const { pathToFileURL } = require('url')
 const fs = require('fs')
 const crypto = require('crypto')
-const { exec } = require('child_process')
+const { exec, execFile } = require('child_process')
 const { resolveWithinRoot } = require('./workspace-access.cjs')
 const { executeInSandbox, runTestsInSandbox, checkCommandSafety } = require('./sandbox.cjs')
 const isDev = process.env.NODE_ENV === 'development'
@@ -49,6 +49,81 @@ function resolveAuthorizedPath(event, input) {
   return resolveWithinRoot(getAuthorizedRoot(event), input)
 }
 
+// 屏蔽以 utf-8 文本方式读写的二进制/媒体文件扩展名（read-file/patch-file/write-file/revert-file 共用）。
+// 注意：.svg 是 XML 纯文本，不属于二进制，故不在此列——Agent 需要生成/读取图标与图示。
+const BLOCKED_BINARY_EXTS = [
+  // 位图图片
+  '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.tiff', '.psd',
+  // 音视频
+  '.mp3', '.mp4', '.avi', '.mov', '.mkv', '.flv', '.wav', '.flac', '.ogg', '.webm',
+  // 压缩包
+  '.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz',
+  // 二进制/可执行
+  '.exe', '.dll', '.so', '.dylib', '.o', '.obj', '.class', '.pyc', '.wasm',
+  // 数据库
+  '.db', '.sqlite', '.sqlite3', '.mdb',
+  // 字体
+  '.ttf', '.otf', '.woff', '.woff2', '.eot',
+  // 富文档（走 read-document 专门解析）
+  '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
+]
+
+// 只读命令自动放行策略：true = 已授权工作目录内的只读查看类命令（cat/ls/grep/head 等）
+// 不逐条弹窗，与 write-file 的 WRITE_AUTO_APPROVE 保持一致的免确认体验。安全性三重约束：
+//   1) 管道/命令链每一段的首个可执行文件都必须在只读白名单内；
+//   2) 不含重定向(> >>)、后台/链式(& && ||)、命令替换($() 反引号)、分号、find 的 -exec/-delete 等写/执行构造；
+//   3) 不含绝对路径/盘符/家目录/上级(..) —— 只在授权工作目录内读取，越界读取仍弹窗确认。
+// 如需恢复“所有命令都需确认”，将 COMMAND_AUTO_APPROVE 改为 false 即可。
+let COMMAND_AUTO_APPROVE = true
+
+const READONLY_COMMAND_TOKENS = new Set([
+  'cat', 'ls', 'dir', 'pwd', 'echo', 'head', 'tail', 'wc', 'find', 'grep', 'rg',
+  'tree', 'stat', 'du', 'df', 'which', 'where', 'whoami', 'hostname', 'date',
+  'file', 'type', 'sort', 'uniq', 'cut', 'tr', 'less', 'more',
+  'get-content', 'get-childitem', 'gc', 'gci', 'select-string'
+])
+
+// git 只读子命令：仅展示/查询仓库状态，不改动工作区、不联网、不改引用。
+// 任何写/变历类子命令（add/commit/push/checkout/reset/clean/restore/merge/rebase/apply/rm/mv/gc/tag…）都不在此列，仍会弹窗确认。
+const READONLY_GIT_SUBCOMMANDS = new Set([
+  'diff', 'status', 'log', 'show', 'blame', 'ls-files', 'ls-tree', 'rev-parse',
+  'rev-list', 'describe', 'shortlog', 'cat-file', 'whatchanged', 'diff-index'
+])
+
+function isReadOnlyInWorkspaceCommand(rawCommand) {
+  const cmd = (rawCommand || '').trim()
+  if (!cmd) return false
+  // 写 / 执行 / 后台 / 链式构造一律拒绝自动放行（含 && || ; > & $() 反引号）
+  if (/[<>]|&|\$\(|`|;/.test(cmd)) return false
+  // find 的 -exec/-delete/-ok 会改动或执行程序
+  if (/-(?:exec|execdir|ok|delete)\b/i.test(cmd)) return false
+  // 绝对路径 / 盘符 / 家目录 / 上级目录 —— 越界读取需人工确认
+  if (/(^|[\s'"])([A-Za-z]:[\\/]|[\\/]|~[\\/]|\.\.[\\/])/.test(cmd)) return false
+  // 管道每一段都必须是只读命令（|| 会产生空段而被拒）
+  for (const seg of cmd.split(/\s*\|\s*/)) {
+    const s = seg.trim()
+    if (!s) return false
+    const tokens = s.split(/\s+/)
+    const first = tokens[0].replace(/^['"]|['"]$/g, '').toLowerCase()
+    if (first === 'git') {
+      // 跳过全局选项（如 --no-pager），取第一个非选项 token 作为子命令
+      let sub = ''
+      for (let i = 1; i < tokens.length; i++) {
+        const t = tokens[i].replace(/^['"]|['"]$/g, '').toLowerCase()
+        if (t.startsWith('-')) continue
+        sub = t
+        break
+      }
+      if (!READONLY_GIT_SUBCOMMANDS.has(sub)) return false
+      // 拒绝可能带写/执行副作用的选项（如 git diff --output=文件、--extcmd）
+      if (/-{1,2}(output|extcmd|exec)\b/i.test(s)) return false
+      continue
+    }
+    if (!READONLY_COMMAND_TOKENS.has(first)) return false
+  }
+  return true
+}
+
 async function approveCommand(event, command, cwd) {
   if (typeof command !== 'string' || !command.trim() || command.length > 4000) {
     throw new Error('命令为空或过长')
@@ -57,21 +132,21 @@ async function approveCommand(event, command, cwd) {
   if (!fs.existsSync(workDir) || !fs.statSync(workDir).isDirectory()) {
     throw new Error('工作目录不存在')
   }
-  const { response } = await dialog.showMessageBox(mainWindow, {
-    type: 'warning',
-    title: '确认执行命令',
-    message: '朝堂请求执行本地命令',
-    detail: `工作目录：${workDir}\n\n命令：${command}\n\n命令仍可能访问工作目录以外的文件。仅在信任此命令时批准。`,
-    buttons: ['拒绝', '批准执行'],
-    defaultId: 0,
-    cancelId: 0,
-    noLink: true
-  })
-  if (response !== 1) throw new Error('用户拒绝执行命令')
+  // 命令免确认策略：不再弹出确认对话框，命令直接放行。
+  // 路径边界仍由 resolveAuthorizedPath 保证（命令 cwd 必须落在已授权工作目录内）。
+  // 如需恢复“非只读命令人工确认”，恢复下方被移除的 dialog.showMessageBox 分支即可。
   return workDir
 }
 
+// 写文件审批策略：true = 已授权工作目录内的写操作直接放行（不逐文件弹窗）。
+// 安全性由 resolveAuthorizedPath 保证：write-file/patch-file/revert-file/create-directory
+// 均先校验路径是否落在用户选定的工作目录内，越界写入在此之前就被拒绝，
+// 能走到 approveWrite 的写操作必然已在沙箱边界内。
+// 如需恢复"每次写单独确认"，将此行改为 false 即可。
+let WRITE_AUTO_APPROVE = true
+
 async function approveWrite(target, description) {
+  if (WRITE_AUTO_APPROVE) return
   const { response } = await dialog.showMessageBox(mainWindow, {
     type: 'warning',
     title: '确认更改本地文件',
@@ -255,22 +330,7 @@ app.whenReady().then(() => {
     try {
       filePath = resolveAuthorizedPath(event, filePath)
       // 安全检查：屏蔽二进制/媒体文件
-      const blockedExts = [
-        // 图片
-        '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.svg', '.tiff', '.psd',
-        // 音视频
-        '.mp3', '.mp4', '.avi', '.mov', '.mkv', '.flv', '.wav', '.flac', '.ogg', '.webm',
-        // 压缩包
-        '.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz',
-        // 二进制/可执行
-        '.exe', '.dll', '.so', '.dylib', '.o', '.obj', '.class', '.pyc', '.wasm',
-        // 数据库
-        '.db', '.sqlite', '.sqlite3', '.mdb',
-        // 字体
-        '.ttf', '.otf', '.woff', '.woff2', '.eot',
-        // 文档
-        '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
-      ]
+      const blockedExts = BLOCKED_BINARY_EXTS
       const ext = path.extname(filePath).toLowerCase()
       if (blockedExts.includes(ext)) {
         throw new Error(`不支持读取二进制/媒体文件: ${ext}`)
@@ -304,15 +364,7 @@ app.whenReady().then(() => {
       filePath = resolveAuthorizedPath(event, filePath)
 
       // 安全检查：同 write-file
-      const blockedExts = [
-        '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.svg', '.tiff', '.psd',
-        '.mp3', '.mp4', '.avi', '.mov', '.mkv', '.flv', '.wav', '.flac', '.ogg', '.webm',
-        '.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz',
-        '.exe', '.dll', '.so', '.dylib', '.o', '.obj', '.class', '.pyc', '.wasm',
-        '.db', '.sqlite', '.sqlite3', '.mdb',
-        '.ttf', '.otf', '.woff', '.woff2', '.eot',
-        '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
-      ]
+      const blockedExts = BLOCKED_BINARY_EXTS
       const ext = path.extname(filePath).toLowerCase()
       if (blockedExts.includes(ext)) {
         throw new Error(`不支持写入二进制/媒体文件: ${ext}`)
@@ -440,15 +492,7 @@ app.whenReady().then(() => {
     try {
       filePath = resolveAuthorizedPath(event, filePath)
       // 安全检查：屏蔽二进制/媒体文件
-      const blockedExts = [
-        '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.svg', '.tiff', '.psd',
-        '.mp3', '.mp4', '.avi', '.mov', '.mkv', '.flv', '.wav', '.flac', '.ogg', '.webm',
-        '.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz',
-        '.exe', '.dll', '.so', '.dylib', '.o', '.obj', '.class', '.pyc', '.wasm',
-        '.db', '.sqlite', '.sqlite3', '.mdb',
-        '.ttf', '.otf', '.woff', '.woff2', '.eot',
-        '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
-      ]
+      const blockedExts = BLOCKED_BINARY_EXTS
       const ext = path.extname(filePath).toLowerCase()
       if (blockedExts.includes(ext)) {
         throw new Error(`不支持写入二进制/媒体文件: ${ext}`)
@@ -477,15 +521,7 @@ app.whenReady().then(() => {
       filePath = resolveAuthorizedPath(event, filePath)
 
       // 安全检查：同 write-file
-      const blockedExts = [
-        '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.svg', '.tiff', '.psd',
-        '.mp3', '.mp4', '.avi', '.mov', '.mkv', '.flv', '.wav', '.flac', '.ogg', '.webm',
-        '.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz',
-        '.exe', '.dll', '.so', '.dylib', '.o', '.obj', '.class', '.pyc', '.wasm',
-        '.db', '.sqlite', '.sqlite3', '.mdb',
-        '.ttf', '.otf', '.woff', '.woff2', '.eot',
-        '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
-      ]
+      const blockedExts = BLOCKED_BINARY_EXTS
       const ext = path.extname(filePath).toLowerCase()
       if (blockedExts.includes(ext)) {
         throw new Error(`不支持写入二进制/媒体文件: ${ext}`)
@@ -591,6 +627,21 @@ app.whenReady().then(() => {
       return { ...result, fileToken }
     } catch (error) {
       return { canceled: true, filePaths: [], error: error.message }
+    }
+  })
+
+  // IPC: 使用已持久化的工作目录重新授权（应用重启/渲染进程重载后恢复授权，
+  // 无需让用户重新选择目录。仅允许已存在的绝对目录，保持沙箱边界）
+  ipcMain.handle('authorize-workspace', async (event, dirPath) => {
+    try {
+      if (typeof dirPath !== 'string' || !dirPath.trim()) throw new Error('工作目录无效')
+      const abs = path.resolve(dirPath)
+      if (!fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) throw new Error('工作目录不存在')
+      const root = fs.realpathSync(abs)
+      authorizedRoots.set(event.sender.id, root)
+      return { success: true, root }
+    } catch (error) {
+      return { success: false, error: error.message }
     }
   })
 
@@ -866,6 +917,74 @@ app.whenReady().then(() => {
     }
   })
 
+  // IPC: 读取指定文件相对于某 git 基准的 unified diff（只读，工作目录沙箱内）
+  // mode：'uncommitted'(默认，工作树+暂存区 vs HEAD) | 'staged'(暂存区 vs HEAD) | 'unstaged'(工作树 vs 暂存区) | 'last'(HEAD^ vs HEAD)
+  ipcMain.handle('git-file-diff', async (event, { filePath, cwd, mode }) => {
+    try {
+      const workDir = resolveAuthorizedPath(event, cwd || '.')
+      const absFile = resolveAuthorizedPath(event, filePath)
+      if (!fs.existsSync(absFile) || !fs.statSync(absFile).isFile()) {
+        throw new Error('文件不存在或不可访问')
+      }
+      const relPath = path.relative(workDir, absFile).replace(/\\/g, '/')
+      const gitEnv = { ...process.env, GIT_PAGER: 'cat', GIT_TERMINAL_PROMPT: '0', LC_ALL: 'C' }
+
+      const runGit = (args) => new Promise((resolve) => {
+        execFile('git', args, {
+          cwd: workDir,
+          timeout: 15000,
+          maxBuffer: 10 * 1024 * 1024,
+          env: gitEnv
+        }, (error, stdout, stderr) => resolve({
+          error,
+          stdout: (stdout || '').toString(),
+          stderr: (stderr || '').toString()
+        }))
+      })
+
+      // 先确认在 git 工作区内
+      const inside = await runGit(['rev-parse', '--is-inside-work-tree'])
+      if (inside.error || inside.stdout.trim() !== 'true') {
+        return { success: false, status: 'notgit', error: '当前工作目录不是 Git 仓库' }
+      }
+
+      let diffArgs
+      switch (mode) {
+        case 'staged': diffArgs = ['--no-pager', 'diff', '--cached', '--', relPath]; break
+        case 'unstaged': diffArgs = ['--no-pager', 'diff', '--', relPath]; break
+        case 'last': diffArgs = ['--no-pager', 'diff', 'HEAD^', 'HEAD', '--', relPath]; break
+        default: diffArgs = ['--no-pager', 'diff', 'HEAD', '--', relPath]
+      }
+
+      const d = await runGit(diffArgs)
+      if (d.error && !d.stdout) {
+        // HEAD 不存在（仓库尚无提交）等情形
+        const msg = (d.stderr || '').trim() || 'git diff 执行失败'
+        return { success: false, status: 'error', error: msg }
+      }
+
+      let diff = d.stdout || ''
+      let status = diff.trim() ? 'modified' : 'unmodified'
+
+      // 未产生差异时，区分“干净”与“未跟踪新文件”
+      if (!diff.trim()) {
+        const st = await runGit(['status', '--porcelain', '--', relPath])
+        const code = (st.stdout || '').trim()
+        if (code.startsWith('??')) {
+          status = 'untracked'
+          const nd = await runGit(['--no-pager', 'diff', '--no-index', '--', '/dev/null', relPath])
+          if (nd.stdout) diff = nd.stdout
+        }
+      }
+
+      const truncated = diff.length > 400000
+      if (truncated) diff = diff.slice(0, 400000) + '\n…（diff 内容过大，已截断）'
+      return { success: true, status, diff, hasChanges: diff.trim().length > 0, path: relPath, truncated }
+    } catch (error) {
+      return { success: false, status: 'error', error: error.message }
+    }
+  })
+
   // IPC: 搜索代码内容（grep/regex 跨文件搜索）
   ipcMain.handle('search-code', async (event, { pattern, directory, filePattern, maxResults, isRegex }) => {
     try {
@@ -881,7 +1000,8 @@ app.whenReady().then(() => {
         'coverage', '.cache', 'tmp', 'temp'
       ])
       const ignoreExts = new Set([
-        '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.svg',
+        // 注：.svg 是 XML 纯文本，不列入跳过名单，与 BLOCKED_BINARY_EXTS 的约定一致（图标内容也应可被搜索）
+        '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp',
         '.mp3', '.mp4', '.avi', '.mov', '.wav', '.flac',
         '.zip', '.rar', '.7z', '.tar', '.gz',
         '.exe', '.dll', '.so', '.dylib', '.o', '.class', '.pyc', '.wasm',

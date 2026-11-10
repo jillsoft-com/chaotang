@@ -39,6 +39,7 @@ import { eventLogger } from './event-logger'
 import { ResourceLockManager } from './resource-lock'
 import { generateParentSummary, buildSiblingContext } from './hierarchical-summary'
 import { depthEvaluator } from './depth-evaluator'
+import { DEFAULT_MAX_TOOL_ROUNDS, calcRunToolCalls } from './round-budget'
 import type { AcceptancePlan } from './acceptance-gate'
 
 // ============ 树编辑类型 ============
@@ -57,7 +58,7 @@ export interface SchedulerConfig {
   activeTickMs: number
   /** 等待状态巡检间隔 ms（默认 30s） */
   idleTickMs: number
-  /** 全树最大工具调用数 */
+  /** 全树最大工具调用数（额度上限，触顶只告警不暂停） */
   maxToolCallsPerRun: number
   /** 并发策略：1 = 串行，'readonly-parallel' = 只读任务并行 */
   concurrency: 1 | 'readonly-parallel'
@@ -68,7 +69,7 @@ export interface SchedulerConfig {
 const DEFAULT_SCHEDULER_CONFIG: SchedulerConfig = {
   activeTickMs: 10000,
   idleTickMs: 30000,
-  maxToolCallsPerRun: 200,
+  maxToolCallsPerRun: calcRunToolCalls(DEFAULT_MAX_TOOL_ROUNDS),
   concurrency: 'readonly-parallel'
 }
 
@@ -162,6 +163,25 @@ export interface SchedulerEvent {
 
 type SchedulerEventCallback = (event: SchedulerEvent) => void
 
+// ============ 失败原因摘要 ============
+
+/**
+ * 把叶子执行结果折算成一句可查看的失败原因（写入 node.failureReason 供任务树详情展示）
+ * — 目标未达成与引擎抛错是两类成因，分开说；其余取结果首行作为线索
+ */
+function describeFailure(result: LeafResult, newStatus: TaskStatus): string | undefined {
+  if (newStatus !== 'failed') return undefined
+  if (result.goalReached === false) {
+    return '自主引擎未达成目标：自动测试或验收未通过'
+  }
+  const firstLine = (result.content || '')
+    .split('\n')
+    .map(l => l.trim())
+    .find(l => l.length > 0)
+  if (!firstLine) return '执行未成功（未返回可读的错误信息）'
+  return firstLine.length > 200 ? firstLine.slice(0, 200) + '…' : firstLine
+}
+
 // ============ 调度器 ============
 
 export class TaskScheduler {
@@ -185,6 +205,10 @@ export class TaskScheduler {
     coordinating: boolean
     /** 资源读写锁管理器 */
     resourceLocks: ResourceLockManager
+    /** 已就超时告警过的节点：nodeId -> 告警时该节点的 startedAt（节点重新执行后 startedAt 变化即可再次告警） */
+    timeoutWarnedAt: Map<string, number>
+    /** 整树工具调用额度告警时间戳，避免每次巡检重复告警 */
+    treeBudgetWarnedAt: number
   }> = new Map()
 
   constructor(config?: Partial<SchedulerConfig>) {
@@ -230,6 +254,8 @@ export class TaskScheduler {
       fileWatchBaseline: Map<string, string | null>
       coordinating: boolean
       resourceLocks: ResourceLockManager
+      timeoutWarnedAt: Map<string, number>
+      treeBudgetWarnedAt: number
     } = {
       tree,
       context,
@@ -242,7 +268,9 @@ export class TaskScheduler {
       fileWatchCache: new Map<string, string | null>(),
       fileWatchBaseline: new Map<string, string | null>(),
       coordinating: false,
-      resourceLocks: new ResourceLockManager()
+      resourceLocks: new ResourceLockManager(),
+      timeoutWarnedAt: new Map<string, number>(),
+      treeBudgetWarnedAt: 0
     }
     this.activeTrees.set(tree.runId, entry)
 
@@ -271,6 +299,18 @@ export class TaskScheduler {
 
     // 立即触发首次协调
     this.coordinate(tree.runId)
+  }
+
+  /**
+   * 按 debateId 查找仍驻留在调度器中的 runId。
+   * 用于任务树暂停后（activeTrees 条目仍在、isDebating 仍为 true）就地 resume/retry，
+   * 而不是被误判为“任务正在执行中”拒绝重试。未找到返回 null。
+   */
+  findRunIdByDebateId(debateId: string): string | null {
+    for (const [runId, entry] of this.activeTrees) {
+      if (entry.tree.debateId === debateId) return runId
+    }
+    return null
   }
 
   /** 暂停整棵树 */
@@ -338,8 +378,8 @@ export class TaskScheduler {
     // 只允许重试失败/暂停/被阻塞的节点
     if (!['failed', 'paused', 'blocked'].includes(node.status)) return false
 
-    // 写入任务需要用户确认
-    if (!node.readOnly && !userConfirmed) return false
+    // 失败/暂停节点的重试需用户确认（写操作安全闸门）
+    if (!userConfirmed) return false
 
     // 递增尝试次数
     node.attempt++
@@ -510,32 +550,42 @@ export class TaskScheduler {
       }
     }
 
-    // 检查运行中的节点：是否超时
+    // 检查运行中的节点：超出时间预算只告警不打断
+    // 旧策略到点即 paused，用户“继续”后节点又回落到 ready，做了很久的工作反复作废
     for (const node of Object.values(entry.tree.nodes)) {
       if (node.status === 'running' && node.startedAt) {
         const elapsed = Date.now() - node.startedAt
-        if (elapsed > node.budget.timeoutMs) {
-          transitionStatus(entry.tree, node.id, 'paused', `超时: ${Math.round(elapsed / 1000)}s`)
+        if (elapsed > node.budget.timeoutMs && entry.timeoutWarnedAt.get(node.id) !== node.startedAt) {
+          entry.timeoutWarnedAt.set(node.id, node.startedAt)
+          node.waitingReason = `已运行 ${Math.round(elapsed / 1000)}s，超出时间预算 ${Math.round(node.budget.timeoutMs / 1000)}s`
           entry.context.saveSnapshot(entry.tree)
           this.emit({
-            type: 'node-paused',
+            type: 'guardian-warning',
             runId,
             nodeId: node.id,
-            data: { reason: 'timeout', elapsed }
+            data: { type: 'timeout_soft', elapsed, budgetMs: node.budget.timeoutMs }
           })
         }
       }
     }
 
-    // 检查全树预算
+    // 检查全树预算：超额只告警，不再暂停整树
+    // 旧策略到点即 pause，把已经完成的节点工作一并卡住，用户只能反复点“继续”
     aggregateTreeUsage(entry.tree)
     if (entry.tree.usage.toolCalls >= entry.tree.limits.maxToolCallsPerRun) {
-      this.pause(runId)
-      this.emit({
-        type: 'error',
-        runId,
-        data: { reason: 'budget_exceeded', usage: entry.tree.usage }
-      })
+      if (Date.now() - entry.treeBudgetWarnedAt > 60000) {
+        entry.treeBudgetWarnedAt = Date.now()
+        this.emit({
+          type: 'guardian-warning',
+          runId,
+          data: {
+            type: 'tree_budget_exceeded',
+            usage: entry.tree.usage,
+            limit: entry.tree.limits.maxToolCallsPerRun,
+            detail: `整树工具调用数已达额度上限（${entry.tree.usage.toolCalls}/${entry.tree.limits.maxToolCallsPerRun}），已改为继续执行不中断`
+          }
+        })
+      }
     }
 
     // 三期 Phase B: 长期目标心跳
@@ -605,12 +655,18 @@ export class TaskScheduler {
     }
 
     // 2. 更新 pending → ready（依赖已满足的）
-    this.updateReadyNodes(tree)
+    const readyChanged = this.updateReadyNodes(tree)
 
     // 3. 找 ready 节点
     const readyNodes = getReadyNodes(tree)
 
     if (readyNodes.length === 0) {
+      // 没有就绪节点：先把“不会再有进展”的状态收束干净，再检查树是否完成。
+      // 缺这一步时任务树面板会停在执行过程中的最后一个快照上：已做完的父节点还显示执行中、
+      // 依赖已失败的节点停在待处理/就绪，整树也因存在 running 节点而推导不出终态
+      const settled = this.settleStalledTree(tree, entry.runningNodes)
+      if (settled || readyChanged) context.saveSnapshot(tree)
+
       // 没有就绪节点：检查树是否完成
       const newState = deriveTreeState(tree)
       if (newState !== tree.state) {
@@ -673,46 +729,23 @@ export class TaskScheduler {
     }
 
     if (parallelMode) {
-      // 分离只读节点和写节点
-      const readOnlyNodes = availableNodes.filter(n => n.readOnly)
-      const writeNodes = availableNodes.filter(n => !n.readOnly)
-
-      // 资源锁检查：如果有写节点正在执行，读节点需等待
-
-      if (readOnlyNodes.length > 0 && writeNodes.length === 0 && !entry.resourceLocks.isLocked(resourcePath)) {
-        // 纯只读场景：并行执行所有（获取共享读锁）
-        const promises = readOnlyNodes.map(node => {
-          entry.runningNodes.add(node.id)
-          entry.resourceLocks.acquire(resourcePath, 'read', node.id)
-          // 实际工具过滤在 coordinator.executeLeafNode 中进行（基于 node.readOnly 标志）
-          const executeOrDecompose = node.decomposition === 'unexamined' && computeDepth(tree, node.id) < tree.limits.maxDepth
-            ? this.tryDecompose(runId, node)
-            : this.executeNode(runId, node)
-          return executeOrDecompose.finally(() => {
-            entry.runningNodes.delete(node.id)
-            entry.resourceLocks.release(resourcePath, node.id)
-          })
-        })
-        await Promise.all(promises)
-      } else if (writeNodes.length > 0) {
-        // 有写节点：尝试获取排他写锁
-        const node = writeNodes[0]
-        const lockResult = entry.resourceLocks.acquire(resourcePath, 'write', node.id)
-        if (!lockResult.acquired) {
-          // 无法获取写锁：延迟执行，等待当前锁释放
-          return
+      // 只读设计已移除：所有节点都可能写文件，统一走排他写锁串行执行，避免并发写冲突
+      const node = availableNodes[0]
+      const lockResult = entry.resourceLocks.acquire(resourcePath, 'write', node.id)
+      if (!lockResult.acquired) {
+        // 无法获取写锁：延迟执行，等待当前锁释放
+        return
+      }
+      entry.runningNodes.add(node.id)
+      try {
+        if (node.decomposition === 'unexamined' && computeDepth(tree, node.id) < tree.limits.maxDepth) {
+          await this.tryDecompose(runId, node)
+        } else {
+          await this.executeNode(runId, node)
         }
-        entry.runningNodes.add(node.id)
-        try {
-          if (node.decomposition === 'unexamined' && computeDepth(tree, node.id) < tree.limits.maxDepth) {
-            await this.tryDecompose(runId, node)
-          } else {
-            await this.executeNode(runId, node)
-          }
-        } finally {
-          entry.runningNodes.delete(node.id)
-          entry.resourceLocks.release(resourcePath, node.id)
-        }
+      } finally {
+        entry.runningNodes.delete(node.id)
+        entry.resourceLocks.release(resourcePath, node.id)
       }
     } else {
       // 串行模式：取第一个 ready 节点
@@ -865,6 +898,10 @@ export class TaskScheduler {
         if (guardianRecord.action === 'paused') {
           // 循环或停滞触发 -> 暂停节点
           transitionStatus(tree, node.id, 'paused', guardianRecord.detail)
+          // 父节点先推导再落快照：否则父节点状态永远落后一次快照
+          if (node.parentId) {
+            this.updateParentStatus(tree, node.parentId)
+          }
           context.saveSnapshot(tree)
           this.emit({
             type: 'guardian-paused',
@@ -872,12 +909,9 @@ export class TaskScheduler {
             nodeId: node.id,
             data: { record: guardianRecord }
           })
-          if (node.parentId) {
-            this.updateParentStatus(tree, node.parentId)
-          }
           return
         }
-        if (guardianRecord.type === 'budget_warning') {
+        if (guardianRecord.type === 'budget_warning' || guardianRecord.action === 'notified') {
           this.emit({
             type: 'guardian-warning',
             runId,
@@ -905,16 +939,11 @@ export class TaskScheduler {
         const failedChecks = result.acceptance.checks.filter(c => c.status === 'failed')
         const diagnostics = failedChecks.map(c => `[${c.kind}] ${c.command}: ${c.summary}`).join('\n')
         transitionStatus(tree, node.id, 'failed', `验收失败:\n${diagnostics}`)
-      } else if (result.status === 'success' && result.acceptance && result.acceptance.overallState === 'unverified') {
-        // 未配置自动检查 → 标记为 failed（不是 completed）
-        // 但 analysis 模式允许通过
-        if (node.mode === 'action') {
-          transitionStatus(tree, node.id, 'failed', '未配置自动检查，无法验证完成状态')
-        } else {
-          transitionStatus(tree, node.id, newStatus, result.goalReached === false ? '自主引擎未达成目标' : undefined)
-        }
       } else {
-        transitionStatus(tree, node.id, newStatus, result.goalReached === false ? '自主引擎未达成目标' : undefined)
+        // 未配置自动检查（unverified）不再判失败：工作做完即按执行结果落定状态，
+        // 验收缺失由 acceptanceState 单独呈现为“未验证”，避免已完成任务被重试后显示成就绪
+        // 失败时把缘由写进节点，否则面板只剩一个“失败”字样可看
+        transitionStatus(tree, node.id, newStatus, describeFailure(result, newStatus))
       }
 
       // R10: 仅当 LLM 输出明确表明需要更深拆解时才记录
@@ -947,12 +976,12 @@ export class TaskScheduler {
         node.verification = result.toolCalls.length > 0 ? 'tool_evidence' : 'model_claim'
       }
 
-      context.saveSnapshot(tree)
-
-      // 更新父节点
+      // 更新父节点（必须在落快照之前：父节点状态与汇总要和本节点结果进同一份快照）
       if (node.parentId) {
         this.updateParentStatus(tree, node.parentId)
       }
+
+      context.saveSnapshot(tree)
 
       this.emit({
         type: newStatus === 'completed' ? 'node-completed' : 'node-failed',
@@ -963,11 +992,12 @@ export class TaskScheduler {
     } catch (error) {
       // 执行失败
       transitionStatus(tree, node.id, 'failed', error instanceof Error ? error.message : '未知错误')
-      context.saveSnapshot(tree)
 
       if (node.parentId) {
         this.updateParentStatus(tree, node.parentId)
       }
+
+      context.saveSnapshot(tree)
 
       this.emit({
         type: 'node-failed',
@@ -980,9 +1010,11 @@ export class TaskScheduler {
 
   /**
    * 更新 pending 节点为 ready（当所有必需依赖已满足时）
+   * @returns 发生状态迁移的节点数（调用方据此决定是否落快照）
    */
-  private updateReadyNodes(tree: TaskTreeSnapshot): void {
+  private updateReadyNodes(tree: TaskTreeSnapshot): number {
     const newlyBlocked: string[] = []
+    let changed = 0
     for (const node of Object.values(tree.nodes)) {
       if (node.status !== 'pending') continue
 
@@ -998,10 +1030,12 @@ export class TaskScheduler {
       })
 
       if (allRequiredDone) {
-        transitionStatus(tree, node.id, 'ready')
+        if (transitionStatus(tree, node.id, 'ready').ok) changed++
       } else if (anyRequiredFailed) {
-        transitionStatus(tree, node.id, 'blocked', '必需依赖失败')
-        if (node.parentId) newlyBlocked.push(node.parentId)
+        if (transitionStatus(tree, node.id, 'blocked', '必需依赖失败').ok) {
+          changed++
+          if (node.parentId) newlyBlocked.push(node.parentId)
+        }
       }
     }
 
@@ -1009,6 +1043,8 @@ export class TaskScheduler {
     for (const parentId of new Set(newlyBlocked)) {
       this.updateParentStatus(tree, parentId)
     }
+
+    return changed
   }
 
   /**
@@ -1057,6 +1093,79 @@ export class TaskScheduler {
         this.updateParentStatus(tree, parent.parentId)
       }
     }
+  }
+
+  /**
+   * 收束「不会再有进展」的节点状态
+   *
+   * 在没有就绪节点、即将推导整树终态时调用。三类残留必须在这里落定，
+   * 否则任务树面板会一直停在执行过程中的那份快照上（节点已完成却仍显示执行中、
+   * 子任务全绿的父节点不落状态、剩余节点停在待处理/就绪）：
+   * 1. 孤儿 running 叶子：调度器已不在执行它（不在 runningNodes 中），却没人替它落定结果，
+   *    deriveTreeState 会因存在 running 节点恒判「执行中」，整树既收不了尾也发不出终态事件；
+   * 2. 依赖已不可达成的 pending/ready 叶子：判为 blocked，不再挂在「待处理」；
+   * 3. 子节点已全部到达终态、自身却没被推导过的父节点：自底向上（深→浅）落定其状态与汇总。
+   *
+   * @returns 是否发生状态变化（调用方据此决定是否落快照）
+   */
+  private settleStalledTree(tree: TaskTreeSnapshot, runningNodes: Set<string>): boolean {
+    const terminal: TaskStatus[] = ['completed', 'failed', 'skipped', 'cancelled', 'partial', 'blocked']
+    const done: TaskStatus[] = ['completed', 'partial']
+    let changed = false
+
+    for (const node of Object.values(tree.nodes)) {
+      if (node.id === tree.rootId) continue
+      // 拆解出的父节点交给下面的自底向上推导
+      if (node.childIds.length > 0) continue
+
+      if (node.status === 'running') {
+        if (runningNodes.has(node.id)) continue
+        if (transitionStatus(tree, node.id, 'failed', '执行中断，未产生结果').ok) {
+          changed = true
+          if (node.parentId) this.updateParentStatus(tree, node.parentId)
+        }
+        continue
+      }
+
+      if (node.status === 'pending' || node.status === 'ready') {
+        // 必需依赖已落到无法达成的终态（失败/受阻/取消/跳过）→ 该节点永远排不上执行
+        const unreachable = node.dependencies.some(d => {
+          if (d.kind !== 'required') return false
+          const dep = tree.nodes[d.taskId]
+          return !!dep && terminal.includes(dep.status) && !done.includes(dep.status)
+        })
+        if (!unreachable) continue
+        if (transitionStatus(tree, node.id, 'blocked', '必需依赖未达成').ok) {
+          changed = true
+          if (node.parentId) this.updateParentStatus(tree, node.parentId)
+        }
+      }
+    }
+
+    // 父节点按深度从大到小处理，保证祖父在其子节点落定之后才被推导
+    const parents = Object.values(tree.nodes)
+      .filter(n => n.id !== tree.rootId && n.childIds.length > 0 && !terminal.includes(n.status))
+      .sort((a, b) => computeDepth(tree, b.id) - computeDepth(tree, a.id))
+
+    for (const parent of parents) {
+      if (runningNodes.has(parent.id)) continue
+      const allChildrenTerminal = parent.childIds.every(id => {
+        const child = tree.nodes[id]
+        return !!child && terminal.includes(child.status)
+      })
+      if (!allChildrenTerminal) continue
+
+      const before = parent.status
+      // pending / ready 没有直达终态的合法迁移：先补到 running，再由子节点结果落定
+      if (parent.status === 'pending') transitionStatus(tree, parent.id, 'ready')
+      if (parent.status === 'pending' || parent.status === 'ready') {
+        transitionStatus(tree, parent.id, 'running', '子任务已全部结束')
+      }
+      this.updateParentStatus(tree, parent.id)
+      if (parent.status !== before) changed = true
+    }
+
+    return changed
   }
 
   /**

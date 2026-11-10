@@ -1,4 +1,4 @@
-import { appStorage } from '@/services/storage'
+import { appStorage, flushAppStorage } from '@/services/storage'
 import { defineStore } from 'pinia'
 import { ref, computed, watch } from 'vue'
 import type { Minister, Debate, Speech, DebateMode, DecisionReport, LLMConfig, Attachment } from '@/types'
@@ -27,11 +27,52 @@ import {
 } from '@/services/dynasty-presets'
 import type { DynastyPreset, DynastyRolePrompt } from '@/services/dynasty-presets'
 
+/** 按工作目录（项目）分组后的会话集合 */
+export interface ProjectGroup {
+  /** 分组键：工作目录绝对路径；无工作目录时为空串 */
+  key: string
+  /** 工作目录；无则为 null（对应“临时议题”） */
+  dir: string | null
+  /** 展示名：别名优先，否则目录最后一段或“临时议题” */
+  name: string
+  /** 用户设置的别名（未设置为 undefined） */
+  alias?: string
+  /** 组内会话（已按创建时间倒序） */
+  sessions: Debate[]
+  /** 组内最近活跃时间（用于排序） */
+  latestAt: number
+}
+
 export const useDebateStore = defineStore('debate', () => {
   const ministers = ref<Minister[]>([])
   const sessions = ref<Debate[]>([])
   const activeSessionId = ref<string | null>(null)
   const debates = ref<Debate[]>([])
+
+  // 任务树刷新计数器：调度器原地修改节点、引用不变，靠此计数器自增强制右侧面板重算
+  const taskTreeTick = ref(0)
+
+  // 项目别名（工作目录 -> 别名），持久化到本地
+  const ALIAS_KEY = 'project_aliases'
+  const projectAliases = ref<Record<string, string>>({})
+
+  function loadProjectAliases() {
+    const saved = appStorage.getItem(ALIAS_KEY)
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved)
+        projectAliases.value = parsed && typeof parsed === 'object' ? parsed : {}
+      } catch {
+        projectAliases.value = {}
+      }
+    }
+  }
+
+  function saveProjectAliases() {
+    appStorage.setItem(ALIAS_KEY, JSON.stringify(projectAliases.value))
+  }
+
+  loadProjectAliases()
 
   // 朝议执行模式（全局偏好，所有朝议共享）
   const debateMode = ref<DebateMode>(
@@ -56,6 +97,83 @@ export const useDebateStore = defineStore('debate', () => {
 
   // 初始化时加载
   loadDebates()
+
+  // ============ 进行中会话的实时持久化 ============
+  // 与 debates_history 不同：sessions（打开的 tab）+ activeSessionId 也需要落盘，
+  // 保证串行/并行/朝议/私召等任意模式下“每一轮对话”都不会因退出而丢失
+  const SESSIONS_KEY = 'active_sessions'
+  let sessionsSaveTimer: ReturnType<typeof setTimeout> | null = null
+
+  function saveSessions() {
+    appStorage.setItem(SESSIONS_KEY, JSON.stringify({
+      sessions: sessions.value,
+      activeSessionId: activeSessionId.value
+    }))
+  }
+
+  /** 防抖保存：流式输出期间合并高频变更，最迟 500ms 落盘一次 */
+  function scheduleSaveSessions() {
+    if (sessionsSaveTimer) clearTimeout(sessionsSaveTimer)
+    sessionsSaveTimer = setTimeout(() => {
+      sessionsSaveTimer = null
+      saveSessions()
+    }, 500)
+  }
+
+  /** 立即保存：用于关闭/隐藏等不可丢失的时机 */
+  function flushSaveSessions() {
+    if (sessionsSaveTimer) {
+      clearTimeout(sessionsSaveTimer)
+      sessionsSaveTimer = null
+    }
+    saveSessions()
+  }
+
+  function loadSessions() {
+    const saved = appStorage.getItem(SESSIONS_KEY)
+    if (!saved) return
+    try {
+      const parsed = JSON.parse(saved)
+      const list: Debate[] = Array.isArray(parsed.sessions) ? parsed.sessions : []
+      // 归一化：上一个进程遗留的 streaming 发言视为已结束，避免界面卡在“正在输入”
+      for (const s of list) {
+        if (!Array.isArray(s.speeches)) s.speeches = []
+        for (const sp of s.speeches) {
+          if (sp.status === 'streaming') {
+            if (sp.content) {
+              sp.status = 'completed'
+            } else {
+              sp.content = '（应用在该轮发言完成前被关闭，内容未能保存）'
+              sp.status = 'error'
+            }
+          }
+        }
+      }
+      sessions.value = list
+      activeSessionId.value = typeof parsed.activeSessionId === 'string' ? parsed.activeSessionId : null
+    } catch {
+      sessions.value = []
+      activeSessionId.value = null
+    }
+  }
+
+  // 初始化时恢复进行中的会话（含 tab 与激活态）
+  loadSessions()
+
+  // 深度监听：任何发言内容/状态/新增会话的变化都会触发防抖落盘
+  watch(sessions, () => scheduleSaveSessions(), { deep: true })
+  watch(activeSessionId, () => scheduleSaveSessions())
+
+  // 页面关闭或切后台时同步落盘，确保“最后一轮”不丢
+  if (typeof window !== 'undefined') {
+    window.addEventListener('beforeunload', () => {
+      flushSaveSessions()
+      void flushAppStorage()
+    })
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') flushSaveSessions()
+    })
+  }
 
   // Sprint D - #17：初始化 GEPA 自学习引擎
   gepaEngine.initialize()
@@ -224,6 +342,27 @@ export const useDebateStore = defineStore('debate', () => {
     activeSessionId.value = session.id
   }
 
+  /**
+   * 在项目分组中新建一个空白会话：立即进入、不自动开朝（status=idle），
+   * 首条圣谕由会话界面的输入框触发。workingDirectory 传入则归属该项目，
+   * 不传则归入“临时议题”。
+   */
+  function createBlankSession(workingDirectory?: string): string {
+    const session: Debate = {
+      id: Date.now().toString(),
+      topic: '新会话',
+      mode: 'court',
+      debateMode: debateMode.value,
+      speeches: [],
+      status: 'idle',
+      createdAt: Date.now(),
+      workingDirectory: workingDirectory || undefined
+    }
+    sessions.value.push(session)
+    activeSessionId.value = session.id
+    return session.id
+  }
+
   function startPrivateAudience(ministerId: string) {
     const minister = ministers.value.find(m => m.id === ministerId)
     if (!minister) return
@@ -335,11 +474,13 @@ export const useDebateStore = defineStore('debate', () => {
     saveDebates()
 
     // Sprint A - #1：朝议模式自动触发决策报告生成（不阻塞主流程）
-    if (session.mode === 'court') {
-      generateDecisionReportAsync(session.id).catch(err => {
-        console.warn('[completeDebate] 决策报告生成失败:', err)
-      })
-    }
+    // 决策报告暂时停用（当前价值不大）：不再自动生成，省去每次拍板/退朝的额外 LLM 调用。
+    // 如需恢复：取消下方注释即可（同时把 ChatSession 的 enableDecisionReport 置为 true）。
+    // if (session.mode === 'court') {
+    //   generateDecisionReportAsync(session.id).catch(err => {
+    //     console.warn('[completeDebate] 决策报告生成失败:', err)
+    //   })
+    // }
   }
 
   /**
@@ -646,6 +787,67 @@ export const useDebateStore = defineStore('debate', () => {
       .sort((a, b) => b.count - a.count)
   }
 
+  // ============ 项目（工作目录）分组 ============
+
+  /** 项目展示名：别名优先，否则取工作目录最后一段，无工作目录则为“临时议题” */
+  function projectDisplayName(dir: string): string {
+    if (!dir) return '临时议题'
+    const alias = projectAliases.value[dir]
+    if (alias && alias.trim()) return alias.trim()
+    const normalized = dir.replace(/[\\/]+$/, '')
+    const lastSep = Math.max(normalized.lastIndexOf('\\'), normalized.lastIndexOf('/'))
+    return (lastSep >= 0 ? normalized.slice(lastSep + 1) : normalized) || dir
+  }
+
+  /** 设置/清除项目别名（传空字符串即恢复按目录名显示） */
+  function setProjectAlias(dir: string, alias: string): void {
+    if (!dir) return
+    const trimmed = (alias || '').trim()
+    if (trimmed) projectAliases.value[dir] = trimmed
+    else delete projectAliases.value[dir]
+    saveProjectAliases()
+  }
+
+  /**
+   * 合并已完成历史 + 进行中会话（按 id 去重，优先取活动会话的实时副本），
+   * 供项目列表与历史列表统一数据源使用（修复进行中会话不显示于历史的问题）。
+   */
+  const mergedSessions = computed<Debate[]>(() => {
+    const map = new Map<string, Debate>()
+    for (const d of debates.value) map.set(d.id, d)
+    for (const s of sessions.value) map.set(s.id, s)
+    return Array.from(map.values())
+  })
+
+  /** 将任意会话列表按工作目录分组，组内按创建时间倒序、组间按最近活跃倒序 */
+  function groupIntoProjects(list: Debate[]): ProjectGroup[] {
+    const buckets = new Map<string, Debate[]>()
+    for (const d of list) {
+      const key = d.workingDirectory || ''
+      const arr = buckets.get(key)
+      if (arr) arr.push(d)
+      else buckets.set(key, [d])
+    }
+    const groups: ProjectGroup[] = []
+    for (const [key, arr] of buckets) {
+      arr.sort((a, b) => b.createdAt - a.createdAt)
+      const latestAt = arr.reduce((m, d) => Math.max(m, d.completedAt || d.createdAt || 0), 0)
+      const alias = key ? projectAliases.value[key] : undefined
+      groups.push({
+        key,
+        dir: key || null,
+        name: projectDisplayName(key),
+        alias: alias && alias.trim() ? alias.trim() : undefined,
+        sessions: arr,
+        latestAt
+      })
+    }
+    groups.sort((a, b) => b.latestAt - a.latestAt)
+    return groups
+  }
+
+  const projectGroups = computed<ProjectGroup[]>(() => groupIntoProjects(mergedSessions.value))
+
   /**
    * 全文搜索历史朝议（含活动会话）
    * - query: 关键词（空格分词，OR 匹配）
@@ -706,6 +908,7 @@ export const useDebateStore = defineStore('debate', () => {
    * 保存任务树快照到朝议记录
    */
   function saveTaskTreeSnapshot(debateId: string, tree: TaskTreeSnapshot) {
+    taskTreeTick.value++
     const session = sessions.value.find(s => s.id === debateId)
     if (session) {
       session.taskTreeSnapshot = tree
@@ -719,6 +922,35 @@ export const useDebateStore = defineStore('debate', () => {
       debates.value.unshift({ ...session, speeches: [...session.speeches], taskTreeSnapshot: tree })
     }
     saveDebates()
+  }
+
+  /**
+   * 保存交付报告到会话与历史归档
+   *
+   * 报告只建一次但需要长期可看：写入 session（由 active_sessions 深度 watch 防抖落盘）
+   * 并同步到 debates_history，切标签页/重开会话后仍能回到“交付审阅”面板。
+   * @param report 传 null 表示清除（新一轮执行开始、撤销改动后）
+   */
+  function saveDeliveryReport(debateId: string, report: any | null) {
+    const session = sessions.value.find(s => s.id === debateId)
+    if (session) session.deliveryReport = report ?? undefined
+    const archived = debates.value.find(d => d.id === debateId)
+    if (archived) {
+      archived.deliveryReport = report ?? undefined
+      saveDebates()
+    }
+  }
+
+  /** 标记交付已确认：报告保留可重看，只记录确认时间 */
+  function markDeliveryConfirmed(debateId: string) {
+    const at = Date.now()
+    const session = sessions.value.find(s => s.id === debateId)
+    if (session) session.deliveryConfirmedAt = at
+    const archived = debates.value.find(d => d.id === debateId)
+    if (archived) {
+      archived.deliveryConfirmedAt = at
+      saveDebates()
+    }
   }
 
   /**
@@ -815,12 +1047,14 @@ export const useDebateStore = defineStore('debate', () => {
     getDynastyPresets,
     startDebate,
     startPrivateAudience,
+    createBlankSession,
     switchSession,
     closeSession,
     addSpeech,
     updateSpeech,
     completeDebate,
     reopenSession,
+    flushSaveSessions,
     saveMinisterLLMConfig,
     resetMinisterLLMConfig,
     updateSessionMinisters,
@@ -835,10 +1069,19 @@ export const useDebateStore = defineStore('debate', () => {
     setDebateTags,
     getAllTags,
     searchDebates,
+    mergedSessions,
+    projectGroups,
+    groupIntoProjects,
+    projectDisplayName,
+    projectAliases,
+    setProjectAlias,
     scheduleFollowUp,
     scheduleLongDebate,
     executeImperialDecree,
     saveTaskTreeSnapshot,
-    recoverInterruptedTree
+    saveDeliveryReport,
+    markDeliveryConfirmed,
+    recoverInterruptedTree,
+    taskTreeTick
   }
 })

@@ -54,7 +54,7 @@
               <el-input
                 v-model="task.task"
                 type="textarea"
-                :autosize="{ minRows: 2, maxRows: 6 }"
+                :autosize="{ minRows: 1, maxRows: 6 }"
                 placeholder="输入子任务描述..."
               />
             </div>
@@ -82,15 +82,6 @@
                       @click="task.autonomous = !task.autonomous"
                     >
                       🔧 自主执行
-                    </el-button>
-                  </el-tooltip>
-                  <el-tooltip content="只读模式：仅分析/调研，不修改文件" placement="top">
-                    <el-button
-                      :type="task.readOnly ? 'warning' : 'default'"
-                      size="small"
-                      @click="task.readOnly = !task.readOnly"
-                    >
-                      👁️ 只读
                     </el-button>
                   </el-tooltip>
                 </div>
@@ -143,7 +134,6 @@ interface PlanTask {
   task: string
   context?: string
   autonomous?: boolean
-  readOnly?: boolean
 }
 
 /** 计划审阅数据 */
@@ -164,7 +154,7 @@ const emit = defineEmits<{
 
 // ============ 状态 ============
 
-const planExpanded = ref(true)
+const planExpanded = ref(false)
 
 // 本地可编辑副本
 const localTasks = ref<PlanTask[]>(
@@ -190,8 +180,7 @@ function addTask() {
     ministerId: defaultMinisterId,
     task: '',
     context: '',
-    autonomous: true,
-    readOnly: false
+    autonomous: true
   })
 }
 
@@ -226,32 +215,32 @@ function handleCancel() {
 .plan-review-panel {
   border: 1px solid var(--ct-border);
   border-radius: 12px;
-  padding: 18px;
+  padding: 12px 14px;
   background: var(--ct-bg-secondary);
 }
 
 .plan-header {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
   border-bottom: 1px solid var(--ct-border);
-  padding-bottom: 10px;
-  margin-bottom: 12px;
+  padding-bottom: 8px;
+  margin-bottom: 8px;
 }
 
 .plan-title {
   margin: 0;
-  font-size: 18px;
+  font-size: 15px;
   color: var(--ct-accent);
 }
 
 .plan-subtitle {
-  font-size: 13px;
+  font-size: 12px;
   color: var(--ct-text-muted);
 }
 
 .plan-section {
-  margin-bottom: 14px;
+  margin-bottom: 10px;
 }
 
 .plan-section-title {
@@ -273,9 +262,9 @@ function handleCancel() {
 .plan-overview {
   border: 1px solid var(--ct-border);
   border-radius: 6px;
-  padding: 10px 14px;
+  padding: 8px 12px;
   background: var(--ct-bg);
-  max-height: 200px;
+  max-height: 140px;
   overflow: auto;
 }
 
@@ -310,7 +299,7 @@ function handleCancel() {
 .plan-task-item {
   border: 1px solid var(--ct-border);
   border-radius: 8px;
-  padding: 10px 12px;
+  padding: 8px 10px;
   background: var(--ct-bg);
 }
 
@@ -372,7 +361,7 @@ function handleCancel() {
   display: flex;
   gap: 8px;
   justify-content: flex-end;
-  padding-top: 12px;
+  padding-top: 8px;
   border-top: 1px solid var(--ct-border);
 }
 </style>

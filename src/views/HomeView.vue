@@ -4,12 +4,15 @@ import { useRouter } from 'vue-router'
 import { useDebateStore } from '@/stores/debate'
 import { Promotion, Setting, Fold, Expand, Plus, Close, House, Clock, Right, Back, FolderOpened, Edit, DocumentCopy, Connection, Delete, User, InfoFilled, Search } from '@element-plus/icons-vue'
 import ChatSession from '@/components/ChatSession.vue'
+import TaskTreePanel from '@/components/TaskTreePanel.vue'
+import FileTreePanel from '@/components/FileTreePanel.vue'
+import FileEditorPanel from '@/components/FileEditorPanel.vue'
 import { llmService } from '@/services/llm-config'
 import { ElMessageBox } from 'element-plus'
 import { TOPIC_TEMPLATES, getTemplateCategories, applyTemplate as applyTopicTemplate } from '@/services/topic-templates'
 import type { TopicTemplate } from '@/services/topic-templates'
 import type { Attachment } from '@/types'
-import { backgroundScheduler } from '@/services/scheduler'
+import type { ProjectGroup } from '@/stores/debate'
 
 const router = useRouter()
 const debateStore = useDebateStore()
@@ -76,7 +79,7 @@ function handleLoginClick() {
 
 // 右侧面板
 const showRightPanel = ref(false)
-const rightPanelWidth = ref(300)
+const rightPanelWidth = ref(420)
 const mainContentRef = ref<HTMLElement | null>(null)
 let isResizingRight = false
 let resizeStartX = 0
@@ -88,71 +91,38 @@ function toggleRightPanel() {
 
 // ============ 右侧任务面板 ============
 
-const rightPanelTab = ref<'tasks' | 'attachments'>('tasks')
+const rightPanelTab = ref<'taskTree' | 'files'>('taskTree')
 
-/** 当前会话关联的后台任务 */
-const sessionTasks = computed(() => {
-  const sessionId = debateStore.activeSessionId
-  if (!sessionId) return []
-  return backgroundScheduler.getAll().filter(t => t.debateId === sessionId)
-})
+/** 当前会话的任务树快照（Agent 模式） */
+const activeTaskTree = computed(() => debateStore.activeSession?.taskTreeSnapshot || null)
 
-const activeTaskCount = computed(() => sessionTasks.value.filter(t => t.status === 'pending' || t.status === 'running').length)
+/** 当前会话的工作目录（工程文件浏览根路径） */
+const activeWorkDir = computed(() => debateStore.activeSession?.workingDirectory || '')
 
-function openTaskPanel() {
-  rightPanelTab.value = 'tasks'
+/** 工程面板中当前在左侧编辑器/预览器打开的文件路径（空则不显示编辑列） */
+const editingFilePath = ref('')
+
+// 切换工作目录（换会话）时关闭编辑器，避免跨会话残留
+watch(activeWorkDir, () => { editingFilePath.value = '' })
+
+/** 点击工程文件：在左侧打开编辑/预览面板，并适当加宽右侧面板以容纳并排两列 */
+function openInEditor(path: string) {
+  editingFilePath.value = path
+  const maxWidth = mainContentRef.value ? mainContentRef.value.offsetWidth * 0.7 : 600
+  const want = Math.min(720, maxWidth)
+  if (rightPanelWidth.value < want) rightPanelWidth.value = want
+}
+
+/** 自动拉出右侧面板并切到任务树 tab（首次建树时由 ChatSession 触发） */
+function openTaskTreePanel() {
+  rightPanelTab.value = 'taskTree'
   showRightPanel.value = true
+  // 任务树宽度适中，默认面板太窄
+  if (rightPanelWidth.value < 360) rightPanelWidth.value = 360
 }
 
-function openAttachmentPanel() {
-  rightPanelTab.value = 'attachments'
-  showRightPanel.value = true
-}
-
-function getTaskStatusIcon(status: string): string {
-  switch (status) {
-    case 'pending': return '⏳'
-    case 'running': return '🔄'
-    case 'completed': return '✅'
-    case 'failed': return '❌'
-    case 'cancelled': return '🚫'
-    default: return '❓'
-  }
-}
-
-function getTaskStatusLabel(status: string): string {
-  switch (status) {
-    case 'pending': return '等待中'
-    case 'running': return '执行中'
-    case 'completed': return '已完成'
-    case 'failed': return '失败'
-    case 'cancelled': return '已取消'
-    default: return status
-  }
-}
-
-function getTaskTypeLabel(type: string): string {
-  switch (type) {
-    case 'delayed': return '延时任务'
-    case 'interval': return '周期任务'
-    case 'follow-up': return '再上奏'
-    case 'long-debate': return '长辩论'
-    default: return type
-  }
-}
-
-function formatTime(ts: number): string {
-  if (!ts) return '-'
-  const d = new Date(ts)
-  return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
-}
-
-function cancelTask(taskId: string) {
-  backgroundScheduler.cancel(taskId)
-}
-
-/** 当前会话的附件列表（代理到 session） */
-const sessionAttachments = computed(() => debateStore.activeSession?.attachments || [])
+/** ChatSession 组件引用：供任务树面板调用其 continueTaskTree 进行续跑 */
+const chatSessionRef = ref<InstanceType<typeof ChatSession> | null>(null)
 
 function startResizeRight(e: MouseEvent) {
   isResizingRight = true
@@ -167,7 +137,7 @@ function startResizeRight(e: MouseEvent) {
 function onResizeRight(e: MouseEvent) {
   if (!isResizingRight) return
   const delta = resizeStartX - e.clientX
-  const maxWidth = mainContentRef.value ? mainContentRef.value.offsetWidth * 0.5 : 600
+  const maxWidth = mainContentRef.value ? mainContentRef.value.offsetWidth * 0.7 : 600
   rightPanelWidth.value = Math.max(200, Math.min(maxWidth, resizeStartWidth + delta))
 }
 
@@ -179,7 +149,32 @@ function stopResizeRight() {
   document.body.style.userSelect = ''
 }
 
-const recentDebates = computed(() => debateStore.debates.slice(0, 10))
+// 项目分组列表（侧边栏）：按工作目录聚合已完成历史 + 进行中会话
+const collapsedProjects = ref<Set<string>>(new Set())
+
+function toggleProject(key: string) {
+  const next = new Set(collapsedProjects.value)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  collapsedProjects.value = next
+}
+
+function newSessionInProject(dir: string | null) {
+  debateStore.createBlankSession(dir || undefined)
+}
+
+async function renameProject(group: ProjectGroup) {
+  if (!group.dir) return
+  try {
+    const { value } = await ElMessageBox.prompt('输入项目别名（留空则恢复按目录名显示）', '重命名项目', {
+      confirmButtonText: '确定',
+      cancelButtonText: '取消',
+      inputValue: group.alias || '',
+      message: group.dir
+    })
+    debateStore.setProjectAlias(group.dir, value || '')
+  } catch { /* 取消 */ }
+}
 
 // 状态栏：当前主题名称
 const currentThemeName = computed(() => {
@@ -615,22 +610,49 @@ onUnmounted(() => {
       </el-button>
 
       <div class="history-section">
-        <h3 class="section-title">历史朝议</h3>
+        <h3 class="section-title">项目</h3>
         <el-scrollbar height="calc(100vh - 288px)">
-          <div class="history-list">
-            <div
-              v-for="debate in recentDebates"
-              :key="debate.id"
-              class="history-item"
-              :class="{ active: debate.id === debateStore.activeSessionId }"
-              @click="debateStore.reopenSession(debate.id)"
-              @contextmenu="onTabContextMenu($event, debate.id)"
-            >
-              <div class="history-title">{{ debate.topic }}</div>
-              <div class="history-meta">
-                {{ new Date(debate.createdAt).toLocaleDateString('zh-CN') }}
+          <div class="project-list">
+            <div v-for="group in debateStore.projectGroups" :key="group.key || '__temp__'" class="project-group">
+              <div class="project-header" @click="toggleProject(group.key)">
+                <span class="project-caret">{{ collapsedProjects.has(group.key) ? '▸' : '▾' }}</span>
+                <el-icon class="project-icon"><FolderOpened /></el-icon>
+                <span class="project-name" :title="group.alias && group.dir ? group.alias + ' — ' + group.dir : (group.dir || '临时议题')">{{ group.name }}</span>
+                <span class="project-count">{{ group.sessions.length }}</span>
+                <button
+                  v-if="group.dir"
+                  class="project-add"
+                  title="重命名项目"
+                  @click.stop="renameProject(group)"
+                >
+                  <el-icon :size="13"><Edit /></el-icon>
+                </button>
+                <button
+                  class="project-add"
+                  :title="group.dir ? '在此项目新开会话' : '新建临时议题会话'"
+                  @click.stop="newSessionInProject(group.dir)"
+                >
+                  <el-icon :size="13"><Plus /></el-icon>
+                </button>
+              </div>
+              <div v-show="!collapsedProjects.has(group.key)" class="project-sessions">
+                <div
+                  v-for="debate in group.sessions"
+                  :key="debate.id"
+                  class="history-item"
+                  :class="{ active: debate.id === debateStore.activeSessionId }"
+                  @click="debateStore.reopenSession(debate.id)"
+                  @contextmenu="onTabContextMenu($event, debate.id)"
+                >
+                  <div class="history-title">{{ debate.topic }}</div>
+                  <div class="history-meta">
+                    {{ new Date(debate.createdAt).toLocaleDateString('zh-CN') }}
+                    <span v-if="debate.status !== 'completed'" class="history-running">· 进行中</span>
+                  </div>
+                </div>
               </div>
             </div>
+            <el-empty v-if="debateStore.projectGroups.length === 0" :image-size="60" description="暂无会话" />
           </div>
         </el-scrollbar>
       </div>
@@ -703,7 +725,7 @@ onUnmounted(() => {
       <!-- Content Area -->
       <div class="content-area">
       <template v-if="debateStore.activeSession">
-        <ChatSession :sessionId="debateStore.activeSessionId!" :key="debateStore.activeSessionId!" @open-task-panel="openTaskPanel" @open-attachment-panel="openAttachmentPanel" />
+        <ChatSession ref="chatSessionRef" :sessionId="debateStore.activeSessionId!" :key="debateStore.activeSessionId!" @open-task-tree-panel="openTaskTreePanel" />
       </template>
 
       <!-- Welcome Page -->
@@ -841,18 +863,20 @@ onUnmounted(() => {
         <div class="right-panel-header">
           <div class="right-panel-tabs">
             <button
+              v-if="activeTaskTree"
               class="right-panel-tab"
-              :class="{ active: rightPanelTab === 'tasks' }"
-              @click="rightPanelTab = 'tasks'"
+              :class="{ active: rightPanelTab === 'taskTree' }"
+              @click="rightPanelTab = 'taskTree'"
             >
-              📋 任务{{ activeTaskCount > 0 ? ` (${activeTaskCount})` : '' }}
+              🌳 任务树
             </button>
             <button
+              v-if="activeWorkDir"
               class="right-panel-tab"
-              :class="{ active: rightPanelTab === 'attachments' }"
-              @click="rightPanelTab = 'attachments'"
+              :class="{ active: rightPanelTab === 'files' }"
+              @click="rightPanelTab = 'files'"
             >
-              📎 附件{{ sessionAttachments.length > 0 ? ` (${sessionAttachments.length})` : '' }}
+              📁 工程
             </button>
           </div>
           <el-button text size="small" @click="toggleRightPanel">
@@ -861,62 +885,39 @@ onUnmounted(() => {
         </div>
 
         <div class="right-panel-body">
-          <!-- 任务列表 -->
-          <template v-if="rightPanelTab === 'tasks'">
-            <div v-if="sessionTasks.length === 0" class="panel-empty">
-              <p>🕊️ 当前会话暂无关联任务</p>
-              <p class="panel-empty-hint">拍板后的行动项、再上奏、长辩论等会显示在这里</p>
-            </div>
-            <div v-else class="task-list">
-              <div v-for="task in sessionTasks" :key="task.id" class="task-card" :class="`task-status-${task.status}`">
-                <div class="task-card-header">
-                  <span class="task-status-icon">{{ getTaskStatusIcon(task.status) }}</span>
-                  <span class="task-title">{{ task.title }}</span>
-                </div>
-                <div class="task-card-meta">
-                  <el-tag size="small" :type="task.status === 'running' ? 'warning' : task.status === 'completed' ? 'success' : task.status === 'failed' ? 'danger' : 'info'">
-                    {{ getTaskTypeLabel(task.type) }}
-                  </el-tag>
-                  <span class="task-status-label">{{ getTaskStatusLabel(task.status) }}</span>
-                </div>
-                <p class="task-desc">{{ task.description }}</p>
-                <div class="task-card-footer">
-                  <span class="task-time" v-if="task.lastRunAt">上次: {{ formatTime(task.lastRunAt) }}</span>
-                  <span class="task-time" v-else>下次: {{ formatTime(task.nextRunAt) }}</span>
-                  <span class="task-runs" v-if="task.runCount > 0">已执行 {{ task.runCount }} 次</span>
-                  <el-button
-                    v-if="task.status === 'pending' || task.status === 'running'"
-                    size="small"
-                    type="danger"
-                    text
-                    @click="cancelTask(task.id)"
-                  >取消</el-button>
-                </div>
-                <div v-if="task.lastResult" class="task-result">
-                  <div class="task-result-label">最近结果：</div>
-                  <div class="task-result-content">{{ task.lastResult }}</div>
-                </div>
-                <div v-if="task.error" class="task-error">
-                  ❌ {{ task.error }}
-                </div>
-              </div>
+          <!-- 任务树（Agent 模式） -->
+          <template v-if="rightPanelTab === 'taskTree'">
+            <TaskTreePanel
+              v-if="activeTaskTree"
+              :tree="activeTaskTree"
+              :ministers="debateStore.sortedMinisters"
+              :tick="debateStore.taskTreeTick"
+              :working-directory="activeWorkDir"
+              @continue="chatSessionRef?.continueTaskTree()"
+              @retry-node="(id: string) => chatSessionRef?.continueTaskTree(id)"
+            />
+            <div v-else class="panel-empty">
+              <p>🌳 当前会话暂无任务树</p>
+              <p class="panel-empty-hint">Agent 模式批准执行后，任务拆解会在此实时展示</p>
             </div>
           </template>
-
-          <!-- 附件列表 -->
-          <template v-if="rightPanelTab === 'attachments'">
-            <div v-if="sessionAttachments.length === 0" class="panel-empty">
-              <p>📎 当前会话暂无附件</p>
-              <p class="panel-empty-hint">在会话输入区点击“附件”按钮或拖拽文件添加</p>
-            </div>
-            <div v-else class="panel-attachment-list">
-              <div v-for="att in sessionAttachments" :key="att.id" class="panel-att-item">
-                <div class="panel-att-icon">{{ att.fileType === 'pdf' ? '📄' : att.fileType === 'docx' || att.fileType === 'doc' ? '📝' : att.fileType === 'xlsx' || att.fileType === 'xls' ? '📊' : '📎' }}</div>
-                <div class="panel-att-info">
-                  <div class="panel-att-name" :title="att.filePath">{{ att.fileName }}</div>
-                  <div class="panel-att-meta">{{ att.fileType.toUpperCase() }} · {{ att.fileSize < 1024 ? att.fileSize + ' B' : att.fileSize < 1048576 ? (att.fileSize / 1024).toFixed(1) + ' KB' : (att.fileSize / 1048576).toFixed(1) + ' MB' }} · {{ att.content?.length || 0 }} 字符</div>
-                </div>
+          <!-- 工程目录文件树 -->
+          <template v-if="rightPanelTab === 'files'">
+            <div v-if="activeWorkDir" class="files-split">
+              <div v-if="editingFilePath" class="files-editor-col">
+                <FileEditorPanel :file-path="editingFilePath" :root-dir="activeWorkDir" @close="editingFilePath = ''" />
               </div>
+              <div class="files-tree-col" :class="{ 'with-editor': editingFilePath }">
+                <FileTreePanel
+                  :root-dir="activeWorkDir"
+                  :selected-path="editingFilePath"
+                  @select-file="openInEditor"
+                />
+              </div>
+            </div>
+            <div v-else class="panel-empty">
+              <p>📁 当前会话未设置工作目录</p>
+              <p class="panel-empty-hint">在首页选择工作目录后可在此浏览工程文件</p>
             </div>
           </template>
         </div>
@@ -1172,6 +1173,109 @@ onUnmounted(() => {
   margin-top: 4px;
 }
 
+.history-running {
+  color: var(--el-color-warning);
+  margin-left: 4px;
+}
+
+/* 项目分组侧边栏 */
+.project-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-bottom: 16px;
+}
+
+.project-group {
+  margin-bottom: 4px;
+}
+
+.project-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.project-header:hover {
+  background: var(--ct-bg-tertiary);
+}
+
+.project-caret {
+  font-size: 10px;
+  color: var(--ct-text-muted);
+  width: 10px;
+  flex-shrink: 0;
+}
+
+.project-icon {
+  font-size: 14px;
+  color: var(--ct-accent);
+  flex-shrink: 0;
+}
+
+.project-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ct-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-count {
+  font-size: 11px;
+  color: var(--ct-text-muted);
+  background: var(--ct-bg);
+  border-radius: 10px;
+  padding: 0 6px;
+  line-height: 16px;
+  flex-shrink: 0;
+}
+
+.project-add {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--ct-text-secondary);
+  cursor: pointer;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: all 0.15s;
+}
+
+.project-header:hover .project-add {
+  opacity: 1;
+}
+
+.project-add:hover {
+  background: var(--ct-accent);
+  color: #fff;
+}
+
+.project-sessions {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-left: 14px;
+  margin-left: 8px;
+  border-left: 1px solid var(--ct-border);
+}
+
+.project-sessions .history-item {
+  padding: 8px 10px;
+}
+
 /* Main Content */
 .main-content {
   flex: 1;
@@ -1402,6 +1506,31 @@ onUnmounted(() => {
   padding: 12px;
 }
 
+/* 工程面板：左编辑/预览列 + 右文件树列 并排（撑满面板高度） */
+.files-split {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  height: 100%;
+}
+
+.files-editor-col {
+  flex: 1 1 58%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.files-tree-col {
+  flex: 1 1 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.files-tree-col.with-editor {
+  flex: 0 0 40%;
+  max-width: 40%;
+}
+
 /* 右侧面板 - 标签页 */
 .right-panel-tabs {
   display: flex;
@@ -1447,164 +1576,6 @@ onUnmounted(() => {
 .panel-empty-hint {
   font-size: 12px !important;
   opacity: 0.7;
-}
-
-/* 任务卡片 */
-.task-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.task-card {
-  padding: 10px 12px;
-  border: 1px solid var(--ct-border);
-  border-radius: 8px;
-  background: var(--ct-bg);
-  transition: all 0.15s;
-}
-
-.task-card:hover {
-  border-color: var(--ct-accent);
-}
-
-.task-card.task-status-running {
-  border-color: rgba(212, 175, 55, 0.4);
-  box-shadow: 0 0 8px rgba(212, 175, 55, 0.08);
-}
-
-.task-card.task-status-failed {
-  border-color: rgba(239, 68, 68, 0.3);
-}
-
-.task-card-header {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-bottom: 6px;
-}
-
-.task-status-icon {
-  font-size: 14px;
-  flex-shrink: 0;
-}
-
-.task-title {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--ct-text-primary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.task-card-meta {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-bottom: 6px;
-}
-
-.task-status-label {
-  font-size: 11px;
-  color: var(--ct-text-muted);
-}
-
-.task-desc {
-  font-size: 12px;
-  color: var(--ct-text-secondary);
-  margin: 0 0 6px;
-  line-height: 1.4;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
-.task-card-footer {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 11px;
-  color: var(--ct-text-muted);
-}
-
-.task-card-footer .el-button {
-  margin-left: auto;
-  padding: 0 4px;
-  font-size: 11px;
-}
-
-.task-result {
-  margin-top: 6px;
-  padding: 6px 8px;
-  background: var(--ct-bg-secondary);
-  border-radius: 4px;
-  font-size: 11px;
-}
-
-.task-result-label {
-  color: var(--ct-text-muted);
-  margin-bottom: 2px;
-}
-
-.task-result-content {
-  color: var(--ct-text-secondary);
-  line-height: 1.4;
-  white-space: pre-wrap;
-  max-height: 80px;
-  overflow-y: auto;
-}
-
-.task-error {
-  margin-top: 6px;
-  padding: 4px 8px;
-  background: rgba(239, 68, 68, 0.08);
-  border-radius: 4px;
-  font-size: 11px;
-  color: #ef4444;
-}
-
-/* 附件面板 */
-.panel-attachment-list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.panel-att-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 10px;
-  border: 1px solid var(--ct-border);
-  border-radius: 8px;
-  background: var(--ct-bg);
-}
-
-.panel-att-icon {
-  font-size: 20px;
-  flex-shrink: 0;
-}
-
-.panel-att-info {
-  flex: 1;
-  min-width: 0;
-}
-
-.panel-att-name {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--ct-text-primary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.panel-att-meta {
-  font-size: 11px;
-  color: var(--ct-text-muted);
-  margin-top: 2px;
 }
 
 .welcome-content {

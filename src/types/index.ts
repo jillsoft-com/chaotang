@@ -28,6 +28,41 @@ export interface LLMConfig {
   llmId?: string
 }
 
+/**
+ * Agent 执行时间线片段 —— “思考→执行工具→思考→…”交错展示的数据单元。
+ * 仅在 Agent 模式下 worker 执行任务时构建（speech.execTimeline），
+ * 会话区按顺序渲染为可折叠块：think 段展开看思考全文，tool 段展开看命令行与返回内容。
+ */
+export type ExecSegment =
+  | {
+      type: 'think'
+      id: string
+      /** 本轮思考正文（流式追加） */
+      text: string
+      /** 本轮 LLM 输出是否已结束 */
+      done: boolean
+    }
+  | {
+      type: 'tool'
+      id: string
+      /** 对应的工具调用 id */
+      toolCallId: string
+      functionName: string
+      displayName: string
+      status: 'executing' | 'completed' | 'error' | 'timeout'
+      /** 工具入参（命令原文/参数摘要，JSON 字符串） */
+      input?: string
+      /** 工具返回内容（截断后） */
+      output?: string
+      /** 文件变更 diff 数据（write_file / search_replace 时捕获） */
+      diffData?: {
+        filePath: string
+        oldContent: string
+        newContent: string
+        isNew: boolean
+      }
+    }
+
 export interface Speech {
   id: string
   ministerId: string
@@ -36,6 +71,8 @@ export interface Speech {
   status: 'pending' | 'streaming' | 'completed' | 'error'
   toolCalls?: ToolCallResult[]   // 本次发言中的工具调用记录
   toolStatuses?: ToolCallStatus[] // 工具调用状态（UI 展示用）
+  /** Agent 执行时间线（思考/工具交错有序，仅 worker 执行发言使用） */
+  execTimeline?: ExecSegment[]
   /** Token 使用统计（估算或 API 返回） */
   tokenUsage?: {
     promptTokens: number
@@ -89,6 +126,15 @@ export interface Debate {
   attachments?: Attachment[]
   /** 任务树快照（Agent 模式下使用，类型为 TaskTreeSnapshot） */
   taskTreeSnapshot?: any
+  /** Agent 模式：PM 已拆解但用户尚未批准执行的计划（TaskDecomposition）。用于离开/重进会话后恢复“执行计划审阅”面板 */
+  pendingPlan?: any
+  /**
+   * 交付报告（执行结束后生成，随会话持久化，确认交付或切换标签页后仍可回看）
+   * 类型为 services/agent/delivery-report 的 DeliveryReport；此处用 any 避免 types 反向依赖服务层
+   */
+  deliveryReport?: any
+  /** 用户点击“确认交付”的时间戳（确认后报告保留，仅收起面板） */
+  deliveryConfirmedAt?: number
 }
 
 export interface ChatMessage {

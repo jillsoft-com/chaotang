@@ -286,9 +286,10 @@ describe('acceptance-gate 验收状态机', () => {
     })
 
     it('有 tsconfig.json 但无 package.json → typecheck', async () => {
+      // 探测走跨平台实现：PowerShell 形式优先，命中输出 __EXISTS__ 标记
       const executor = mockExecutor({
         'cat package.json': { exitCode: 1 },
-        'test -f tsconfig.json': { exitCode: 0, stdout: 'exists' },
+        'Test-Path "tsconfig.json"': { exitCode: 0, stdout: '__EXISTS__' },
         'npx tsc --version': { exitCode: 0, stdout: 'Version 5.0.0' }
       })
       const plan = await buildAcceptancePlan('/work', ['/src/a.ts'], executor)
@@ -299,8 +300,7 @@ describe('acceptance-gate 验收状态机', () => {
     it('有 Cargo.toml → cargo build + cargo test', async () => {
       const executor = mockExecutor({
         'cat package.json': { exitCode: 1 },
-        'test -f tsconfig.json': { exitCode: 1 },
-        'test -f Cargo.toml': { exitCode: 0, stdout: 'exists' }
+        'Test-Path "Cargo.toml"': { exitCode: 0, stdout: '__EXISTS__' }
       })
       const plan = await buildAcceptancePlan('/work', ['/src/main.rs'], executor)
       expect(plan.checks.length).toBe(2)
@@ -311,9 +311,7 @@ describe('acceptance-gate 验收状态机', () => {
     it('有 go.mod → go build + go test', async () => {
       const executor = mockExecutor({
         'cat package.json': { exitCode: 1 },
-        'test -f tsconfig.json': { exitCode: 1 },
-        'test -f Cargo.toml': { exitCode: 1 },
-        'test -f go.mod': { exitCode: 0, stdout: 'exists' }
+        'Test-Path "go.mod"': { exitCode: 0, stdout: '__EXISTS__' }
       })
       const plan = await buildAcceptancePlan('/work', ['/main.go'], executor)
       expect(plan.checks.length).toBe(2)
@@ -321,13 +319,20 @@ describe('acceptance-gate 验收状态机', () => {
       expect(plan.checks[1].command).toBe('go test ./...')
     })
 
-    it('无可用检查 → unverified', async () => {
+    it('PowerShell 不可用时回退 Unix test -f 探测', async () => {
+      // 模拟非 Windows 环境：PowerShell 探测无输出，POSIX 探测命中
       const executor = mockExecutor({
         'cat package.json': { exitCode: 1 },
-        'test -f tsconfig.json': { exitCode: 1 },
-        'test -f Cargo.toml': { exitCode: 1 },
-        'test -f go.mod': { exitCode: 1 },
-        'test -f requirements.txt -o -f pyproject.toml -o -f setup.py': { exitCode: 1 }
+        'test -f "go.mod" && echo __EXISTS__': { exitCode: 0, stdout: '__EXISTS__' }
+      })
+      const plan = await buildAcceptancePlan('/work', ['/main.go'], executor)
+      expect(plan.checks.length).toBe(2)
+      expect(plan.checks[0].command).toBe('go build ./...')
+    })
+
+    it('无可用检查 → unverified', async () => {
+      const executor = mockExecutor({
+        'cat package.json': { exitCode: 1 }
       })
       const plan = await buildAcceptancePlan('/work', ['/readme.txt'], executor)
       expect(plan.overallState).toBe('unverified')

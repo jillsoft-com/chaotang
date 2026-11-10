@@ -20,14 +20,14 @@ import { appStorage } from '@/services/storage'
  *   - 两者组合：Coordinator 拆解 → 每个 Worker 用 AutonomousEngine 自主执行
  */
 
-import type { ChatMessage, ToolCall, ToolCallResult, ToolDefinition } from '@/types'
+import type { ChatMessage, ToolCall, ToolCallResult, ToolDefinition, ExecSegment } from '@/types'
+import { startThink, endThink, startTool, finishTool, formatToolOutput, getToolDisplayName } from './exec-timeline'
 import type { LLMProvider } from '@/services/llm/types'
 import { createProvider } from '@/services/llm'
 import { llmService } from '@/services/llm-config'
 import { toolExecutor } from '@/services/tools/executor'
 import { compressContext } from './context-compressor'
 import { ContextManager } from './context-manager'
-import { WRITE_TOOLS } from './resource-lock'
 import { invalidateIndexOnWrite } from './repository-context'
 import { runAcceptance, collectChangedFiles } from './acceptance-gate'
 import type { AcceptancePlan, CommandExecutor, RepairConfig } from './acceptance-gate'
@@ -37,12 +37,13 @@ import type { TestLoopResult } from './test-loop'
 import { LintFixEngine } from './lint-fix-loop'
 import type { LintFixResult } from './lint-fix-loop'
 import type { SubAgentProfile } from './subagent-registry'
+import { DEFAULT_MAX_TOOL_ROUNDS } from './round-budget'
 
 // ============ 类型 ============
 
 /** 自主执行引擎配置 */
 export interface AutonomousConfig {
-  /** 最大工具调用迭代轮数（默认 10） */
+  /** 最大工具调用迭代轮数（默认跟随设置项，见 round-budget） */
   maxIterations: number
   /** 是否在每轮后注入验证提示（默认 true） */
   verifyAfterEachRound: boolean
@@ -54,14 +55,12 @@ export interface AutonomousConfig {
   memoryHint?: string
   /** 模型标识（用于 ContextManager 容量判断） */
   modelId?: string
-  /** 是否为只读节点（阻止写工具调用） */
-  readOnly?: boolean
   /** 子 Agent 配置（三期 Phase A）— 追加提示词 + 工具过滤 */
   subAgentProfile?: SubAgentProfile
 }
 
 export const DEFAULT_AUTONOMOUS_CONFIG: AutonomousConfig = {
-  maxIterations: 10,
+  maxIterations: DEFAULT_MAX_TOOL_ROUNDS,
   verifyAfterEachRound: true
 }
 
@@ -241,13 +240,17 @@ export class AutonomousEngine {
     onCheckpoint?: (state: CheckpointState) => void
     /** 每次工具调用后的回调（用于预算追踪）；返回 false 表示预算耗尽，引擎应中止 */
     onToolCall?: () => boolean | void
+    /** 执行时间线（思考/工具交错有序）：传入响应式数组即实时构建，供会话区折叠展示 */
+    timeline?: ExecSegment[]
   }): Promise<AutonomousResult> {
-    const { provider, systemPrompt, goal, taskContext, toolDefs, onContent, onBeforeToolExecute, abortSignal, onCheckpoint, onToolCall } = params
+    const { provider, systemPrompt, goal, taskContext, toolDefs, onContent, onBeforeToolExecute, abortSignal, onCheckpoint, onToolCall, timeline } = params
     const startTime = Date.now()
     const allToolCalls: ToolCallResult[] = []
     let finalContent = ''
     let goalReached = false
     let iterations = 0
+    /** 自动验证的限制说明（没检测到工具 / 验证环节异常）：只告知“没验证”，不参与成败判定 */
+    const verificationNotes: string[] = []
 
     const { workingDirectory, agentsMdHint, memoryHint } = this.config
     this._fileBaselines = undefined
@@ -294,6 +297,9 @@ export class AutonomousEngine {
 
       this.emit({ type: 'executing', data: { round: round + 1, maxRounds: this.config.maxIterations } })
 
+      // 时间线：本轮开始，新建思考段（流式更新 text）
+      const thinkSeg = timeline ? startThink(timeline) : null
+
       const pendingToolCalls: ToolCall[] = []
 
       // 调用 LLM（带工具）
@@ -302,6 +308,7 @@ export class AutonomousEngine {
         (text) => {
           // 流式更新
           finalContent = text
+          if (thinkSeg) thinkSeg.text = text
           onContent(text)
         },
         (tcs) => {
@@ -313,6 +320,9 @@ export class AutonomousEngine {
       if (content) {
         finalContent = content
       }
+
+      // 时间线：本轮 LLM 输出结束；无工具调用轮（最终回复）的思考段会被移除，避免与正文重复
+      if (timeline) endThink(timeline, thinkSeg, pendingToolCalls.length > 0)
 
       // 检查目标达成信号
       if (this.detectGoalReached(content)) {
@@ -350,6 +360,9 @@ export class AutonomousEngine {
           data: { functionName: tc.function.name, status: 'executing' }
         })
 
+        // 时间线：登记工具段（展开可见命令行/参数）
+        if (timeline) startTool(timeline, tc, getToolDisplayName(tc.function.name))
+
         // 危险命令审批
         if (onBeforeToolExecute) {
           const approved = await onBeforeToolExecute(tc)
@@ -364,6 +377,7 @@ export class AutonomousEngine {
               error: '用户拒绝执行危险命令'
             }
             allToolCalls.push(rejectResult)
+            if (timeline) finishTool(timeline, tc.id, 'error', '用户拒绝执行该危险命令')
             messages.push({
               role: 'tool',
               content: JSON.stringify({ success: false, error: '用户拒绝执行该危险命令。请调整方案或使用其他命令。' }),
@@ -390,21 +404,6 @@ export class AutonomousEngine {
           } catch { /* 忽略 */ }
         }
 
-        // P0: 运行时只读授权——在执行前拦截写工具调用
-        if (this.config.readOnly && WRITE_TOOLS.has(tc.function.name)) {
-          allToolCalls.push({
-            toolCallId: tc.id, functionName: tc.function.name, arguments: {},
-            result: { success: false, error: '只读节点不允许调用写工具' },
-            status: 'error', duration: 0, error: '只读权限拦截'
-          })
-          messages.push({
-            role: 'tool',
-            content: JSON.stringify({ success: false, error: '当前任务为只读模式，不允许执行写操作。请改用分析/调研方式完成任务。' }),
-            tool_call_id: tc.id, name: tc.function.name
-          })
-          continue
-        }
-
         // P1: 执行前原子预留预算额度
         if (onToolCall) {
           const reserved = onToolCall()
@@ -415,6 +414,7 @@ export class AutonomousEngine {
               result: { success: false, error: '工具调用预算已耗尽' },
               status: 'error', duration: 0, error: '预算耗尽'
             })
+            if (timeline) finishTool(timeline, tc.id, 'error', '工具调用预算已耗尽')
             aborted = true
             this.emit({ type: 'complete', data: { round: round + 1, reason: 'budget_exhausted' } })
             break
@@ -471,6 +471,15 @@ export class AutonomousEngine {
               }
             }
           } catch { /* 忽略 */ }
+        }
+
+        // 时间线：落定工具段状态与返回内容（展开可见命令输出/diff）
+        if (timeline) {
+          const tlStatus = result.status === 'success' ? 'completed' : (result.status === 'timeout' ? 'timeout' : 'error')
+          const tlOutput = result.status === 'success'
+            ? formatToolOutput(result.result)
+            : (result.error || formatToolOutput(result.result))
+          finishTool(timeline, tc.id, tlStatus, tlOutput, (result as any).diffData)
         }
 
         // 将工具结果加入消息历史
@@ -621,21 +630,6 @@ export class AutonomousEngine {
           for (const tc of repairToolCalls) {
             if (abortSignal?.aborted) break
             this.resolveToolPaths(tc, workingDirectory)
-
-            // P0-fix: 只读权限拦截
-            if (this.config.readOnly && WRITE_TOOLS.has(tc.function.name)) {
-              allToolCalls.push({
-                toolCallId: tc.id, functionName: tc.function.name, arguments: {},
-                result: { success: false, error: '只读节点不允许调用写工具' },
-                status: 'error', duration: 0, error: '只读权限拦截'
-              })
-              messages.push({
-                role: 'tool',
-                content: JSON.stringify({ success: false, error: '修复轮次中当前为只读模式，不允许执行写操作。' }),
-                tool_call_id: tc.id, name: tc.function.name
-              })
-              continue
-            }
 
             // P0-fix: 危险命令审批
             if (onBeforeToolExecute) {
@@ -819,13 +813,20 @@ export class AutonomousEngine {
           }
 
           // P0-fix: 测试失败则回滚 goalReached，确保最终验收反映真实状态
-          if (!testLoopResult.passed) {
+          // 但“未检测到测试命令”不算失败（与 lint 侧同一口径）：检测只看根目录清单，
+          // 子工程（如 web/package.json）的测试会被识别为 none，
+          // 此时只是“没验证”而不是“验证不通过”，不能据此把已完成的任务判为失败
+          if (!testLoopResult.passed && testLoopResult.testCommand !== 'none') {
             goalReached = false
           }
+          if (testLoopResult.testCommand === 'none') {
+            verificationNotes.push('未检测到可自动运行的测试命令（只识别项目根目录的 package.json / Cargo.toml / go.mod / Makefile 等），本次改动未经测试验证')
+          }
         } catch (e) {
-          // P1-fix: 测试循环异常也应回滚 goalReached
+          // 测试循环自身异常属于验证手段不可用（如命令执行器、LLM 调用报错），
+          // 不是被测代码的失败：不回滚 goalReached，但要把限制说清楚写进正文
           console.error('[AutonomousEngine] 测试循环异常:', e)
-          goalReached = false
+          verificationNotes.push(`测试循环执行异常，未能完成测试验证：${e instanceof Error ? e.message : String(e)}`)
         }
       }
     }
@@ -1063,6 +1064,13 @@ export class AutonomousEngine {
           acceptance = { checks: [], overallState: 'unverified' }
         }
       }
+    }
+
+    // 自动验证限制追加到正文：让气泡与交付报告能看到“哪些没验证过”，
+    // 而不是只剩一个笼统的“未验证”标签（[GOAL_REACHED] 已在前面清除，追加不影响解析）
+    if (verificationNotes.length > 0) {
+      finalContent += `\n\n### 自动验证说明\n${verificationNotes.map(n => `- ⚠️ ${n}`).join('\n')}`
+      onContent(finalContent)
     }
 
     return {

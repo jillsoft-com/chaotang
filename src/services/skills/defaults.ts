@@ -323,7 +323,8 @@ export const defaultMinisterSkills: Record<string, string[]> = {
   // 大将军：搜索 + 知识库 + 命令行 + Git + 代码质量 + 类型检查 + 重构 + 记忆（编码核心角色）
   general: ['web_search', 'knowledge_base', 'command_executor', 'git_ops', 'git_workflow', 'memory', 'code_quality', 'type_safety', 'refactoring', 'file_reader', 'file_ops'],
   // 御史：搜索 + 知识库 + 文档解析 + 代码搜索 + 事实核查（御史专属核心能力） + 代码质量
-  censor: ['web_search', 'knowledge_base', 'document_reader', 'code_search', 'memory', 'fact_checking', 'code_quality'],
+  //      + 文件操作/命令行/Git/测试（行业预设将 censor 复用为“后端开发”，需具备写代码与自验证能力）
+  censor: ['web_search', 'knowledge_base', 'document_reader', 'code_search', 'memory', 'fact_checking', 'code_quality', 'file_ops', 'command_executor', 'git_ops', 'test_runner'],
   // 总管：搜索 + 知识库 + 文件读取 + 文件操作 + 文档解析 + 命令行 + 代码搜索 + Git + 记忆
   eunuch: ['web_search', 'knowledge_base', 'file_reader', 'file_ops', 'document_reader', 'command_executor', 'code_search', 'git_ops', 'git_workflow', 'test_runner', 'memory']
 }
@@ -361,6 +362,16 @@ export function initializeSkills(): void {
       }
     }
     appStorage.setItem('skills_initialized_v12', 'true')
+  }
+
+  // 增量补绑：行业预设把 censor 复用为“后端开发”，需写文件/命令/Git/测试能力。
+  // 用独立标记保证老用户（已写过 minister_skill_bindings）也能补上，且不 wipe 自定义绑定。
+  // bindSkillToMinister 向 Set 添加，幂等安全。
+  if (appStorage.getItem('censor_dev_bindings_v1') !== 'true') {
+    for (const skillId of ['file_ops', 'command_executor', 'git_ops', 'test_runner']) {
+      skillRegistry.bindSkillToMinister(skillId, 'censor')
+    }
+    appStorage.setItem('censor_dev_bindings_v1', 'true')
   }
 
   // 3. 加载自定义插件

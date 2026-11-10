@@ -2,7 +2,9 @@
 import { ref, computed, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useDebateStore } from '@/stores/debate'
-import { ArrowLeft, Search, Plus } from '@element-plus/icons-vue'
+import type { ProjectGroup } from '@/stores/debate'
+import { ElMessageBox } from 'element-plus'
+import { ArrowLeft, Search, Plus, FolderOpened, Edit } from '@element-plus/icons-vue'
 
 const router = useRouter()
 const route = useRoute()
@@ -27,6 +29,32 @@ const newTagInput = ref<Record<string, string>>({})  // debateId -> 输入中的
 const filteredDebates = computed(() => {
   return debateStore.searchDebates(searchQuery.value, activeTags.value, 200)
 })
+
+// 会话总数（含已完成历史 + 进行中会话，修复进行中会话不展示的问题）
+const totalSessions = computed(() => debateStore.mergedSessions.length)
+
+// 将筛选后的会话按项目（工作目录）分组
+const projectSections = computed(() => debateStore.groupIntoProjects(filteredDebates.value))
+
+/** 在某个项目下新开会话（直接进入） */
+function newSessionInProject(dir: string | null) {
+  debateStore.createBlankSession(dir || undefined)
+  router.push('/')
+}
+
+/** 重命名项目（设置/清除别名） */
+async function renameProject(group: ProjectGroup) {
+  if (!group.dir) return
+  try {
+    const { value } = await ElMessageBox.prompt('输入项目别名（留空则恢复按目录名显示）', '重命名项目', {
+      confirmButtonText: '确定',
+      cancelButtonText: '取消',
+      inputValue: group.alias || '',
+      message: group.dir
+    })
+    debateStore.setProjectAlias(group.dir, value || '')
+  } catch { /* 取消 */ }
+}
 
 // 全部标签（按使用次数降序）
 const allTags = computed(() => debateStore.getAllTags())
@@ -76,11 +104,11 @@ function useTagAsFilter(tag: string) {
       <header class="history-header">
         <el-button :icon="ArrowLeft" text @click="router.push('/')" />
         <h1 class="history-title">朝议历史</h1>
-        <span class="history-count">{{ filteredDebates.length }} / {{ debateStore.debates.length }}</span>
+        <span class="history-count">{{ filteredDebates.length }} / {{ totalSessions }}</span>
       </header>
 
       <!-- Sprint A - #10：搜索栏 + 标签筛选 -->
-      <div v-if="debateStore.debates.length > 0" class="history-filters">
+      <div v-if="totalSessions > 0" class="history-filters">
         <el-input
           ref="searchInputRef"
           v-model="searchQuery"
@@ -110,7 +138,7 @@ function useTagAsFilter(tag: string) {
         </el-tag>
       </div>
 
-      <el-empty v-if="debateStore.debates.length === 0" description="暂无历史记录">
+      <el-empty v-if="totalSessions === 0" description="暂无历史记录">
         <el-button type="primary" @click="router.push('/')">开始朝议</el-button>
       </el-empty>
 
@@ -121,9 +149,24 @@ function useTagAsFilter(tag: string) {
         <el-button text @click="clearFilters">清除筛选条件</el-button>
       </el-empty>
 
-      <div v-else class="history-list">
+      <div v-else class="project-sections">
+        <section v-for="group in projectSections" :key="group.key || '__temp__'" class="project-section">
+          <div class="project-section-header">
+            <el-icon class="psh-icon"><FolderOpened /></el-icon>
+            <span class="psh-name" :title="group.alias && group.dir ? group.alias + ' — ' + group.dir : (group.dir || '临时议题')">{{ group.name }}</span>
+            <span class="psh-count">{{ group.sessions.length }} 个会话</span>
+            <div class="psh-actions">
+              <el-button v-if="group.dir" class="psh-rename" size="small" text @click="renameProject(group)">
+                <el-icon style="margin-right: 4px"><Edit /></el-icon>重命名
+              </el-button>
+              <el-button class="psh-new" size="small" type="primary" plain @click="newSessionInProject(group.dir)">
+                <el-icon style="margin-right: 4px"><Plus /></el-icon>新开会话
+              </el-button>
+            </div>
+          </div>
+          <div class="history-list">
         <el-card
-          v-for="debate in filteredDebates"
+          v-for="debate in group.sessions"
           :key="debate.id"
           shadow="hover"
           class="history-card"
@@ -211,6 +254,8 @@ function useTagAsFilter(tag: string) {
             <p class="decree-text">{{ debate.imperialDecree }}</p>
           </div>
         </el-card>
+          </div>
+        </section>
       </div>
     </div>
   </div>
@@ -297,6 +342,49 @@ function useTagAsFilter(tag: string) {
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+
+/* 项目分组 */
+.project-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+.project-section-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--ct-border);
+}
+
+.psh-icon {
+  font-size: 18px;
+  color: var(--ct-accent);
+}
+
+.psh-name {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--ct-text-primary);
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.psh-count {
+  font-size: 12px;
+  color: var(--ct-text-muted);
+}
+
+.psh-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .history-card {

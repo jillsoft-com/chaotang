@@ -42,6 +42,7 @@ interface ElectronAPI {
     error?: string
   }>
   createDirectory: (dirPath: string) => Promise<{ success: boolean; path?: string; error?: string }>
+  authorizeWorkspace: (dirPath: string) => Promise<{ success: boolean; root?: string; error?: string }>
   readDirectory: (dirPath: string) => Promise<{
     success: boolean
     path?: string
@@ -54,6 +55,15 @@ interface ElectronAPI {
     success: boolean
     content?: string
     metadata?: Record<string, any>
+    error?: string
+  }>
+  gitFileDiff: (params: { filePath: string; cwd?: string; mode?: 'uncommitted' | 'staged' | 'unstaged' | 'last' }) => Promise<{
+    success: boolean
+    status?: 'modified' | 'unmodified' | 'untracked' | 'notgit' | 'error'
+    diff?: string
+    hasChanges?: boolean
+    path?: string
+    truncated?: boolean
     error?: string
   }>
   executeCommand: (params: {

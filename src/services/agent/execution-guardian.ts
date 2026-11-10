@@ -4,7 +4,7 @@
  * 负责监控任务树执行过程中的异常情况：
  * - 循环检测：连续 3 次相同工具+相同参数 = 疑似循环
  * - 停滞检测：连续 N 轮无有效进展
- * - 全局预算：工具调用数/Token/时间预算监控
+ * - 全局预算：工具调用数/Token/时间预算监控（额度触顶只告警，不中断已进展的工作）
  * - 通知去重：同类通知在冷却期内不重复发送
  * - 成本归因：按节点/分支汇总执行成本
  * - 重试判定：只读任务的自动重试与写入任务的人工确认
@@ -164,14 +164,11 @@ export function isReadOnlyNode(toolCalls: ToolCallResult[]): boolean {
 
 /**
  * 是否可以自动重试
- * 条件：只读任务 + 临时失败 + 未超重试上限
+ * 条件：临时失败/被阻塞 + 未超重试上限
  */
 export function canAutoRetry(node: TaskNode, config: GuardianConfig): boolean {
   // 超过最大重试次数
   if (node.attempt >= config.maxAutoRetries) return false
-
-  // 只有只读节点可自动重试
-  if (!node.readOnly) return false
 
   // 只有失败或被阻塞的节点可重试
   if (node.status !== 'failed' && node.status !== 'blocked') return false
@@ -252,12 +249,14 @@ export class ExecutionGuardian {
     }
 
     // 预算检查（单节点）—— 先检查上限，再检查警告
+    // 额度触顶不再暂停节点：小任务随手就会撞上小额度，一旦暂停会把已经完成的工作作废，
+    // 因此只记录并通知，执行继续推进
     if (node.usage.toolCalls >= node.budget.maxToolCalls) {
       const record = this.addRecord(node.id, {
         type: 'budget_exceeded',
-        detail: `节点工具调用数已达预算上限（${node.usage.toolCalls}/${node.budget.maxToolCalls}）`,
+        detail: `节点工具调用数已达额度上限（${node.usage.toolCalls}/${node.budget.maxToolCalls}），已改为继续执行不中断`,
         evidence: [],
-        action: 'paused'
+        action: 'notified'
       })
       this.createNotification(node.id, 'budget_exceeded', record.detail)
       return record

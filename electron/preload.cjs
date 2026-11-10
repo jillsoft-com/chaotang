@@ -26,6 +26,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   revertFile: (filePath, oldContent, expectedSha256) => ipcRenderer.invoke('revert-file', filePath, oldContent, expectedSha256),
   createDirectory: (dirPath) => ipcRenderer.invoke('create-directory', dirPath),
   readDirectory: (dirPath) => ipcRenderer.invoke('read-directory', dirPath),
+  // git 只读 diff（供工程面板展示文件相对基准的 unified diff）
+  gitFileDiff: (params) => ipcRenderer.invoke('git-file-diff', params),
+  // 用已持久化的工作目录重新授权（重启/重载后恢复，无需重新选择）
+  authorizeWorkspace: (dirPath) => ipcRenderer.invoke('authorize-workspace', dirPath),
   // 文档解析通道
   readDocument: (filePath) => ipcRenderer.invoke('read-document', filePath),
   // 命令行执行通道

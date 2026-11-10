@@ -27,7 +27,7 @@ import { taskScheduler } from './task-scheduler'
 import type { ExecutionContext, LeafExecContext, LeafResult } from './task-scheduler'
 import type { TaskTreeSnapshot, TaskNode } from './task-tree'
 import { createTree, createNode, addNode, transitionStatus } from './task-tree'
-import { filterToolDefinitionsForReadOnlyNode, WRITE_TOOLS } from './resource-lock'
+// 注：写文件能力不再受只读标志约束（只读设计已移除），故不再引入 filterToolDefinitionsForReadOnlyNode / WRITE_TOOLS
 import { runAcceptance, collectChangedFiles } from './acceptance-gate'
 import type { CommandExecutor, AcceptancePlan } from './acceptance-gate'
 import { validateFileBaselines } from './acceptance-gate'
@@ -35,10 +35,12 @@ import { invalidateIndexOnWrite } from './repository-context'
 import { getProjectIndex, generateContextHint, semanticSearch } from './repository-context'
 import { buildRootContext } from './hierarchical-summary'
 import { BudgetTracker } from './budget-display'
+import { DEFAULT_MAX_TOOL_ROUNDS, getMaxToolRounds, getNodeMaxToolCalls, getRunMaxToolCalls, NODE_TIMEOUT_MS } from './round-budget'
 import { ContextManager } from './context-manager'
 import type { NodeCost } from './execution-guardian'
 import { subAgentRegistry } from './subagent-registry'
 import type { SubAgentProfile } from './subagent-registry'
+import { startThink, endThink, startTool, finishTool, formatToolOutput } from './exec-timeline'
 
 // ============ 类型定义 ============
 
@@ -49,8 +51,6 @@ export interface WorkerTask {
   context?: string     // 补充上下文
   /** 是否启用自主执行（由丞相在拆解时决定） */
   autonomous?: boolean
-  /** 是否为只读任务（仅分析/调研，不写文件/执行命令） */
-  readOnly?: boolean
   /** 子 Agent ID（三期 Phase A）— 指定执行策略 */
   subAgentId?: string
 }
@@ -106,9 +106,6 @@ export interface AgentEvent {
 
 type AgentEventCallback = (event: AgentEvent) => void
 
-/** 最大工具调用轮数（防止无限循环） */
-const MAX_TOOL_ROUNDS = 3
-
 /** Agent 编排器配置 */
 export interface CoordinatorConfig {
   /** 是否启用 Agent 模式 */
@@ -119,7 +116,7 @@ export interface CoordinatorConfig {
   continueOnError: boolean
   /** 是否启用 Plan Mode（拆解后等待用户确认） */
   planMode: boolean
-  /** 自主执行的最大迭代轮数（默认 10，由丞相决定是否启用） */
+  /** 自主执行的最大迭代轮数（未显式传入时跟随设置项 max_tool_rounds） */
   autonomousMaxIterations: number
 }
 
@@ -128,7 +125,7 @@ const DEFAULT_CONFIG: CoordinatorConfig = {
   synthesize: true,
   continueOnError: true,
   planMode: false,
-  autonomousMaxIterations: 10
+  autonomousMaxIterations: DEFAULT_MAX_TOOL_ROUNDS
 }
 
 // ============ Coordinator Agent ============
@@ -139,6 +136,10 @@ export class CoordinatorAgent {
 
   constructor(config?: Partial<CoordinatorConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config }
+    // 未显式指定轮次时，读取设置中的「最大工具调用轮次」，避免写死小额度卡住正常任务
+    if (config?.autonomousMaxIterations === undefined) {
+      this.config.autonomousMaxIterations = getMaxToolRounds()
+    }
   }
 
   /**
@@ -239,8 +240,10 @@ export class CoordinatorAgent {
     onRetryNode?: (nodeId: string, reason: string) => Promise<boolean>
     /** 检查是否有遗留的中断任务树，返回用户选择 + 中断的树：{ choice, tree } */
     onRecoverInterrupted?: () => Promise<{ choice: 'resume' | 'restart' | null; tree?: TaskTreeSnapshot }>
+    /** 恢复场景：直接传入已批准的拆解计划，跳过丞相拆解与 Plan Mode 审阅等待，直接进入建树执行 */
+    initialDecomposition?: TaskDecomposition
   }): Promise<void> {
-    const { topic, chancellor, workers, resolveLLM, addSpeech, getReactiveSpeech, shouldContinue, workingDirectory, debateId, onPlanReady, onBeforeToolExecute, saveSnapshot, onRetryNode, onRecoverInterrupted } = params
+    const { topic, chancellor, workers, resolveLLM, addSpeech, getReactiveSpeech, shouldContinue, workingDirectory, debateId, onPlanReady, onBeforeToolExecute, saveSnapshot, onRetryNode, onRecoverInterrupted, initialDecomposition } = params
 
     this.emit({ type: 'start', data: { topic, workerCount: workers.length } })
 
@@ -409,56 +412,63 @@ export class CoordinatorAgent {
       }
     }
 
-    // ── Phase 1: 丞相拆解任务 ──
-    this.emit({ type: 'decomposing' })
-
-    const chancellorSpeechId = `chancellor-plan-${Date.now()}`
-    const planSpeech: Speech = {
-      id: chancellorSpeechId,
-      ministerId: chancellor.id,
-      content: '',
-      timestamp: Date.now(),
-      status: 'streaming'
-    }
-    addSpeech(planSpeech)
-
-    const reactivePlan = getReactiveSpeech(chancellorSpeechId)
     const chancellorLLM = createProvider(resolveLLM(chancellor.llm))
-
     let decomposition: TaskDecomposition
-    try {
-      decomposition = await this.decomposeTask(
-        chancellorLLM,
-        topic,
-        workers,
-        workingDirectory,
-        agentsMdHint,
-        memoryHint,
-        (_text) => { reactivePlan.content = '📋 丞相正在分析议题...' }
-      )
-    } catch (error) {
-      reactivePlan.content = `丞相分析失败：${error instanceof Error ? error.message : '未知错误'}`
-      reactivePlan.status = 'error'
-      this.emit({ type: 'error', data: { phase: 'decompose', error } })
-      return
-    }
 
-    // 将原始 JSON 替换为格式化的 Markdown
-    reactivePlan.content = this.formatDecomposition(decomposition, workers)
-    reactivePlan.status = 'completed'
-    this.emit({ type: 'plan-ready', data: decomposition })
+    if (initialDecomposition) {
+      // 恢复场景：使用已持久化/已批准的拆解计划，跳过丞相拆解与审阅等待，直接进入建树执行
+      decomposition = initialDecomposition
+      this.emit({ type: 'plan-ready', data: decomposition })
+    } else {
+      // ── Phase 1: 丞相拆解任务 ──
+      this.emit({ type: 'decomposing' })
 
-    // Plan Mode: 等待用户审阅和编辑
-    if (this.config.planMode && onPlanReady) {
-      const editedPlan = await onPlanReady(decomposition)
-      if (!editedPlan) {
-        this.emit({ type: 'complete', data: { cancelled: true, reason: '用户取消了执行' } })
+      const chancellorSpeechId = `chancellor-plan-${Date.now()}`
+      const planSpeech: Speech = {
+        id: chancellorSpeechId,
+        ministerId: chancellor.id,
+        content: '',
+        timestamp: Date.now(),
+        status: 'streaming'
+      }
+      addSpeech(planSpeech)
+
+      const reactivePlan = getReactiveSpeech(chancellorSpeechId)
+
+      try {
+        decomposition = await this.decomposeTask(
+          chancellorLLM,
+          topic,
+          workers,
+          workingDirectory,
+          agentsMdHint,
+          memoryHint,
+          (_text) => { reactivePlan.content = '📋 丞相正在分析议题...' }
+        )
+      } catch (error) {
+        reactivePlan.content = `丞相分析失败：${error instanceof Error ? error.message : '未知错误'}`
+        reactivePlan.status = 'error'
+        this.emit({ type: 'error', data: { phase: 'decompose', error } })
         return
       }
-      // 使用用户修改后的计划（可能增删了任务、改了分配者等）
-      decomposition = editedPlan
-      // 更新丞相发言内容以反映修改
+
+      // 将原始 JSON 替换为格式化的 Markdown
       reactivePlan.content = this.formatDecomposition(decomposition, workers)
+      reactivePlan.status = 'completed'
+      this.emit({ type: 'plan-ready', data: decomposition })
+
+      // Plan Mode: 等待用户审阅和编辑
+      if (this.config.planMode && onPlanReady) {
+        const editedPlan = await onPlanReady(decomposition)
+        if (!editedPlan) {
+          this.emit({ type: 'complete', data: { cancelled: true, reason: '用户取消了执行' } })
+          return
+        }
+        // 使用用户修改后的计划（可能增删了任务、改了分配者等）
+        decomposition = editedPlan
+        // 更新丞相发言内容以反映修改
+        reactivePlan.content = this.formatDecomposition(decomposition, workers)
+      }
     }
 
     if (!shouldContinue()) return
@@ -469,6 +479,8 @@ export class CoordinatorAgent {
     if (taskTree) {
       decomposition.taskTree = taskTree
       this.emit({ type: 'tree-created', data: { tree: taskTree } })
+      // 建树即落一次快照：驱动右侧面板展示与 docs/任务分解.md 首次生成
+      try { saveSnapshot?.(taskTree) } catch { /* 快照失败不影响执行 */ }
     }
 
     if (taskTree && Object.keys(taskTree.nodes).length > 1) {
@@ -796,7 +808,6 @@ ${workerDesc}
       "task": "具体子任务描述，包含明确的交付物要求",
       "context": "补充说明（可选）",
       "autonomous": true,
-      "readOnly": false,
       "subAgentId": "子 Agent ID（可选，指定执行策略）"
     }
   ]
@@ -806,10 +817,6 @@ ${workerDesc}
 - true = 该成员需要自主执行（可迭代多轮：写代码→编译→报错→改代码→重跑）
 - false = 一次性输出即可（如输出方案文档、分析报告）
 - 判断规则：如果任务需要创建实际文件并验证结果正确性，设为 true；如果只需输出文字方案，设为 false
-
-关于 readOnly 字段：
-- true = 纯分析/调研任务，不需要创建或修改任何文件
-- false = 需要创建、修改文件或执行命令
 
 要求：
 1. 每个任务分配给最合适的成员
@@ -832,7 +839,6 @@ ${workerDesc}
       "task": "具体子任务描述，清晰明确",
       "context": "补充说明（可选）",
       "autonomous": false,
-      "readOnly": false,
       "subAgentId": "子 Agent ID（可选，指定执行策略）"
     }
   ]
@@ -842,10 +848,6 @@ ${workerDesc}
 - true = 该大臣需要自主执行（可迭代多轮：执行工具→检查结果→修正→重试）
 - false = 一次性分析即可（只需输出意见和建议）
 - 判断规则：如果任务需要执行实际操作（创建文件、运行命令、修改代码等），设为 true；如果只需分析和建议，设为 false
-
-关于 readOnly 字段：
-- true = 纯调研/分析任务，不需要创建或修改任何文件、不执行命令
-- false = 需要执行实际操作
 
 要求：
 1. 每个任务分配给最合适的大臣
@@ -862,63 +864,78 @@ ${workerDesc}
 
     const content = await provider.chatStream(messages, onContent)
 
-    return this.parseTaskDecomposition(content, workers)
+    return this.parseTaskDecomposition(content, workers, topic)
   }
 
   /**
    * 解析任务拆解结果
+   *
+   * 修复要点：
+   * - 兼容 task/description/content/title 等字段别名，避免模型换了 key 就解析不出任务
+   * - 丢弃空描述任务，防止审阅面板因“无有效任务”而永久禁用“批准执行”按钮
+   * - plan 缺失或整体解析失败时不再把原始 JSON 铺到界面上，改用可读文案 + 可编辑占位任务
    */
-  private parseTaskDecomposition(content: string, workers: Minister[]): TaskDecomposition {
-    // 尝试从回复中提取 JSON
-    try {
-      // 先尝试直接解析
-      let jsonStr = content
-
-      // 尝试提取 ```json ... ``` 代码块
-      const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/)
-      if (jsonMatch) {
-        jsonStr = jsonMatch[1].trim()
-      }
-
-      // 尝试提取 { ... } 块
-      const braceMatch = jsonStr.match(/\{[\s\S]*\}/)
-      if (braceMatch) {
-        jsonStr = braceMatch[0]
-      }
-
-      const parsed = JSON.parse(jsonStr)
-
-      if (parsed.tasks && Array.isArray(parsed.tasks)) {
-        const validIds = workers.map(w => w.id)
-        const validTasks = parsed.tasks
-          .filter((t: any) => validIds.includes(t.ministerId) && typeof t.task === 'string')
-          .map((t: any) => ({
-            ministerId: t.ministerId,
-            task: t.task,
-            context: t.context || undefined,
-            autonomous: t.autonomous === true,  // 只有明确为 true 才启用
-            readOnly: 'readOnly' in t ? t.readOnly === true : undefined,  // 保留 undefined 让 buildTaskTree 推断默认值
-            subAgentId: typeof t.subAgentId === 'string' ? t.subAgentId : undefined  // 三期 Phase A
-          }))
-
-        if (validTasks.length > 0) {
-          return {
-            plan: parsed.plan || content,
-            tasks: validTasks
-          }
-        }
-      }
-    } catch {
-      // JSON 解析失败，使用降级方案
+  private parseTaskDecomposition(content: string, workers: Minister[], topic: string): TaskDecomposition {
+    // 从回复中提取 JSON 文本（兼容裸 JSON、```json 代码块、夹带前后说明文字）
+    let jsonStr = content
+    const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/)
+    if (jsonMatch) {
+      jsonStr = jsonMatch[1].trim()
+    }
+    const braceMatch = jsonStr.match(/\{[\s\S]*\}/)
+    if (braceMatch) {
+      jsonStr = braceMatch[0]
     }
 
-    // 降级：将原始内容作为 plan，平均分配任务
+    let parsed: any = null
+    try {
+      parsed = JSON.parse(jsonStr)
+    } catch {
+      parsed = null
+    }
+
+    const validIds = workers.map(w => w.id)
+
+    if (parsed && Array.isArray(parsed.tasks)) {
+      // 归一化每条任务：task 字段兼容常见别名，取第一个非空字符串
+      const validTasks = parsed.tasks
+        .map((t: any) => {
+          const rawTask = [t.task, t.description, t.content, t.title].find(
+            (v: any) => typeof v === 'string' && v.trim()
+          )
+          return {
+            ministerId: t.ministerId,
+            task: rawTask ? rawTask.trim() : '',
+            context: typeof t.context === 'string' && t.context.trim() ? t.context.trim() : undefined,
+            autonomous: t.autonomous === true,  // 只有明确为 true 才启用
+            subAgentId: typeof t.subAgentId === 'string' ? t.subAgentId : undefined  // 三期 Phase A
+          }
+        })
+        // 仅保留分配给有效大臣且描述非空的任务
+        .filter((t: any) => validIds.includes(t.ministerId) && t.task.length > 0)
+
+      if (validTasks.length > 0) {
+        // plan 缺失时给出可读提示，绝不回退成原始 JSON
+        const planText = (typeof parsed.plan === 'string' && parsed.plan.trim())
+          ? parsed.plan.trim()
+          : `丞相已完成任务拆解，共 ${validTasks.length} 个子任务，请审阅后批准执行。`
+        return { plan: planText, tasks: validTasks }
+      }
+    }
+
+    // 兜底：解析失败或无有效任务。不把原始 JSON 铺到界面上，
+    // 生成一条基于议题的可编辑占位任务，保证审阅面板可用、可继续编辑
+    const fallbackTasks: WorkerTask[] = validIds.length > 0
+      ? [{
+          ministerId: validIds[0],
+          task: `请围绕议题展开分析并给出方案：${topic}`,
+          autonomous: false
+        }]
+      : []
+
     return {
-      plan: content,
-      tasks: workers.slice(0, 3).map(w => ({
-        ministerId: w.id,
-        task: `请从你的专业角度分析以下议题：${content.slice(0, 100)}`
-      }))
+      plan: '丞相的输出未能解析为规范的任务计划（模型可能未按约定的 JSON 格式返回）。已按当前议题生成一条可编辑的占位任务，请在下方补充或调整后批准执行。',
+      tasks: fallbackTasks
     }
   }
 
@@ -932,19 +949,22 @@ ${workerDesc}
 
     for (let i = 0; i < decomposition.tasks.length; i++) {
       const task = decomposition.tasks[i]
-      const isReadOnly = task.readOnly ?? !task.autonomous
+      // 只读设计已移除：所有任务节点均按 action 处理，写文件工具一律可用。
+      // decomposition 默认 'unexamined'：按原始设计（修订版 §5.1），每个一级节点在即将执行时
+      // 由其 Worker 判断"直接执行"还是"拆成子任务"，autonomous 仅决定叶子节点的执行策略，二者不可耦合。
+      // 例外：显式绑定 subAgentId 的任务指定了执行策略，保持叶子直接执行，不再拆解。
       const node = createNode({
         title: task.task.slice(0, 50) || `任务 ${i + 1}`,
         description: task.task,
         parentId: tree.rootId,
         createdBy: 'chancellor',
         assigneeId: task.ministerId,
-        mode: task.autonomous ? 'action' : 'analysis',
+        mode: 'action',
         autonomous: task.autonomous === true,
-        readOnly: isReadOnly,
-        decomposition: task.autonomous ? 'leaf' : 'unexamined',
+        readOnly: false,
+        decomposition: task.subAgentId ? 'leaf' : 'unexamined',
         priority: 0,
-        budget: { maxIterations: this.config.autonomousMaxIterations, maxToolCalls: 50, timeoutMs: 5 * 60 * 1000 },
+        budget: { maxIterations: this.config.autonomousMaxIterations, maxToolCalls: getNodeMaxToolCalls(), timeoutMs: NODE_TIMEOUT_MS },
         subAgentId: task.subAgentId  // 三期 Phase A
       })
       const result = addNode(tree, node)
@@ -974,6 +994,10 @@ ${workerDesc}
   ): Promise<{ content: string; toolCalls: ToolCallResult[] }> {
     const dirHint = workingDirectory
       ? `\n项目工作目录: ${workingDirectory}\n创建文件时请使用相对路径（如 src/components/xxx.vue），系统会自动解析到工作目录下。`
+      : ''
+
+    const taskDocHint = workingDirectory
+      ? `\n\nℹ️ 工程内 docs/任务分解.md 记录了丞相拆解的完整任务清单、职责分工、验收标准与实时执行状态。开始前建议用 read_file 查阅，了解整体进度、你所依赖的前序任务是否完成，以及最新要求。`
       : ''
 
     // Phase 5: 语义检索增强 — 为 Worker 注入相关代码上下文
@@ -1011,7 +1035,7 @@ ${workerDesc}
 协调者分配给你的任务：${workerTask.task}
 ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
 
-请认真执行任务。如果任务要求你创建文件，请使用 write_file 和 create_directory 工具生成实际的项目文件。完成后给出你的交付物总结。${agentsMdHint || ''}${memoryHint || ''}${workerSemanticHint}`
+请认真执行任务。如果任务要求你创建文件，请使用 write_file 和 create_directory 工具生成实际的项目文件。完成后给出你的交付物总结。${agentsMdHint || ''}${memoryHint || ''}${workerSemanticHint}${taskDocHint}`
           }
           return `${minister.systemPrompt}
 
@@ -1020,7 +1044,7 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
 丞相分配给你的任务：${workerTask.task}
 ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
 
-请认真执行任务，必要时使用可用的工具获取信息。完成后给出你的分析结论。${agentsMdHint || ''}${memoryHint || ''}${workerSemanticHint}`
+请认真执行任务，必要时使用可用的工具获取信息。完成后给出你的分析结论。${agentsMdHint || ''}${memoryHint || ''}${workerSemanticHint}${taskDocHint}`
         })()
       },
       {
@@ -1032,8 +1056,14 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
     const allToolCalls: ToolCallResult[] = []
     let finalContent = ''
     let budgetExhausted = false  // P1: 预算耗尽标志，用于终止整个任务循环
+    // 工具调用轮次上限取自设置项（默认 500），正常任务不应再被小额度截断
+    const maxToolRounds = getMaxToolRounds()
 
-    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    // 时间线：实时构建“思考→执行工具”交错序列，会话区气泡内折叠展示
+    if (!reactiveSpeech.execTimeline) reactiveSpeech.execTimeline = []
+    const timeline = reactiveSpeech.execTimeline
+
+    for (let round = 0; round < maxToolRounds; round++) {
       // P1: 如果预算已耗尽，终止整个任务循环
       if (budgetExhausted) {
         messages.push({
@@ -1045,11 +1075,15 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
 
       const pendingToolCalls: ToolCall[] = []
 
+      // 时间线：本轮开始，新建思考段（流式更新 text）
+      const thinkSeg = timeline ? startThink(timeline) : null
+
       const content = await provider.chatStreamWithTools(
         messages,
         // onChunk：流式更新 UI
         (text) => {
           reactiveSpeech.content = text
+          if (thinkSeg) thinkSeg.text = text
         },
         // onToolCalls：收集工具调用请求
         (tcs) => {
@@ -1057,6 +1091,9 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
         },
         { tools: toolDefs.length > 0 ? toolDefs : undefined }
       )
+
+      // 时间线：本轮 LLM 输出结束；无工具调用轮（最终回复）的思考段会被移除，避免与正文重复
+      if (timeline) endThink(timeline, thinkSeg, pendingToolCalls.length > 0)
 
       // 如果没有工具调用，这就是最终回复
       if (pendingToolCalls.length === 0) {
@@ -1128,6 +1165,9 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
           data: { functionName: tc.function.name, status: 'executing' }
         })
 
+        // 时间线：登记工具段（展开可见命令行/参数）
+        if (timeline) startTool(timeline, tc, this.getToolDisplayName(tc.function.name))
+
         // Approval Mode: 危险命令需确认
         if (onBeforeToolExecute) {
           const approved = await onBeforeToolExecute(tc)
@@ -1142,6 +1182,7 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
               error: '用户拒绝执行危险命令'
             }
             allToolCalls.push(rejectResult)
+            if (timeline) finishTool(timeline, tc.id, 'error', '用户拒绝执行该危险命令')
 
             if (!reactiveSpeech.toolStatuses) reactiveSpeech.toolStatuses = []
             reactiveSpeech.toolStatuses.push({
@@ -1177,22 +1218,6 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
           } catch { /* 读取失败不影响执行 */ }
         }
 
-        // P0: 运行时只读授权——在执行前拦截写工具调用
-        if (workerTask.readOnly && WRITE_TOOLS.has(tc.function.name)) {
-          const rejected: ToolCallResult = {
-            toolCallId: tc.id, functionName: tc.function.name, arguments: {},
-            result: { success: false, error: '只读节点不允许调用写工具' },
-            status: 'error', duration: 0, error: '只读权限拦截'
-          }
-          allToolCalls.push(rejected)
-          messages.push({
-            role: 'tool',
-            content: JSON.stringify({ success: false, error: '当前任务为只读模式，不允许执行写操作。请改用分析/调研方式完成任务。' }),
-            tool_call_id: tc.id, name: tc.function.name
-          })
-          continue
-        }
-
         // P1: 执行前原子预留预算额度
         if (onToolCall) {
           try {
@@ -1205,6 +1230,7 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
                 status: 'error', duration: 0, error: '预算耗尽'
               }
               allToolCalls.push(rejected)
+              if (timeline) finishTool(timeline, tc.id, 'error', '工具调用预算已耗尽')
               budgetExhausted = true
               break
             }
@@ -1254,6 +1280,15 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
 
         reactiveSpeech.toolStatuses.push(toolStatus)
 
+        // 时间线：落定工具段状态与返回内容（展开可见命令输出/diff）
+        if (timeline) {
+          const tlStatus = result.status === 'success' ? 'completed' : (result.status === 'timeout' ? 'timeout' : 'error')
+          const tlOutput = result.status === 'success'
+            ? formatToolOutput(result.result)
+            : (result.error || formatToolOutput(result.result))
+          finishTool(timeline, tc.id, tlStatus, tlOutput, toolStatus.diffData)
+        }
+
         // 将工具结果加入消息历史
         messages.push({
           role: 'tool',
@@ -1266,7 +1301,7 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
       }
 
       // 上下文压缩（R8：通过 ContextManager 按模型容量管理）
-      if (round < MAX_TOOL_ROUNDS - 1) {
+      if (round < maxToolRounds - 1) {
         const ctxMgr = new ContextManager(minister.llm?.model || 'unknown')
         const ctxMessages = messages.map(m => ({ role: m.role as 'system' | 'user' | 'assistant', content: typeof m.content === 'string' ? m.content : '' }))
         if (ctxMgr.exceedsContextLimit(ctxMessages)) {
@@ -1295,7 +1330,7 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
       }
 
       // 如果这是最后一轮，获取最终回复
-      if (round === MAX_TOOL_ROUNDS - 1) {
+      if (round === maxToolRounds - 1) {
         // 最终总结前再做一次容量检查（最后一轮工具结果可能使上下文超限）
         const ctxMgr = new ContextManager(minister.llm?.model || 'unknown')
         const ctxMessages = messages.map(m => ({ role: m.role as 'system' | 'user' | 'assistant', content: typeof m.content === 'string' ? m.content : '' }))
@@ -1537,6 +1572,185 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
   }
 
   /**
+   * 手动续跑任务树：把未完成/失败的节点重新纳入执行。
+   * - 不传 nodeId：整树一键，将所有 failed/blocked/partial/paused/interrupted/waiting 节点置回 ready，
+   *   连同本就 pending/ready 的未执行节点一起续跑。
+   * - 传 nodeId：仅重试该节点（须处于可重试状态）。
+   * 续跑不重走丞相拆解与 Plan 审阅，直接进入调度器执行。
+   */
+  async resumeTaskTree(params: {
+    tree: TaskTreeSnapshot
+    nodeId?: string
+    workers: Minister[]
+    resolveLLM: (llm: LLMConfig) => LLMConfig
+    addSpeech: (speech: Speech) => void
+    getReactiveSpeech: (id: string) => Speech
+    shouldContinue: () => boolean
+    workingDirectory?: string
+    onBeforeToolExecute?: (tc: ToolCall) => Promise<boolean>
+    saveSnapshot?: (tree: TaskTreeSnapshot) => void
+    onRetryNode?: (nodeId: string, reason: string) => Promise<boolean>
+    topic: string
+  }): Promise<{ ok: boolean; requeued: number; reason?: string }> {
+    const { tree, nodeId, workers, resolveLLM, addSpeech, getReactiveSpeech, shouldContinue, workingDirectory, onBeforeToolExecute, saveSnapshot, onRetryNode, topic } = params
+
+    const RESUMABLE_FROM = ['failed', 'blocked', 'partial', 'paused', 'interrupted', 'waiting']
+    let requeued = 0
+
+    if (nodeId) {
+      const node = tree.nodes[nodeId]
+      if (!node) return { ok: false, requeued: 0, reason: '任务节点不存在' }
+      if (!RESUMABLE_FROM.includes(node.status)) {
+        return { ok: false, requeued: 0, reason: `该任务当前状态（${node.status}）无需重试` }
+      }
+      const r = transitionStatus(tree, nodeId, 'ready', '用户手动重试')
+      if (!r.ok) return { ok: false, requeued: 0, reason: r.error }
+      requeued = 1
+    } else {
+      for (const node of Object.values(tree.nodes)) {
+        if (node.id === tree.rootId) continue
+        if (RESUMABLE_FROM.includes(node.status)) {
+          const r = transitionStatus(tree, node.id, 'ready', '用户继续执行')
+          if (r.ok) requeued++
+        }
+      }
+      // 即便没有可回退状态，也可能仍有 pending/ready 节点从未被执行
+      const runnable = Object.values(tree.nodes).some(
+        n => n.id !== tree.rootId && ['ready', 'pending', 'waiting'].includes(n.status)
+      )
+      if (requeued === 0 && !runnable) {
+        return { ok: false, requeued: 0, reason: '没有未完成或失败的任务需要继续' }
+      }
+    }
+
+    // 恢复安全校验：文件基线冲突/写入丢失处理 + 验收重跑（复用中断恢复的 P0-fix 策略）
+    if (workingDirectory) {
+      const validation = await this.validateResumeSafety(tree, workingDirectory, saveSnapshot)
+      if (!validation.ok) {
+        tree.state = 'interrupted'
+        try { saveSnapshot?.(tree) } catch { /* ignore */ }
+        this.emit({ type: 'error', data: { phase: 'resume', message: validation.reason } })
+        return { ok: false, requeued, reason: validation.reason }
+      }
+    }
+
+    tree.state = 'running'
+    try { saveSnapshot?.(tree) } catch { /* ignore */ }
+
+    // 载入项目指令与记忆提示（与正常流程一致）
+    const agentsMd = await this.readAgentsMd(workingDirectory)
+    const agentsMdHint = agentsMd
+      ? `\n\n=== 项目指令 (AGENTS.md) ===\n${agentsMd.slice(0, 5000)}\n=== 项目指令结束 ===`
+      : ''
+    const memorySummary = memoryStore.getContextSummary(workingDirectory, topic)
+    const memoryHint = memorySummary
+      ? `\n\n=== 历史记忆（跨会话持久记忆） ===\n${memorySummary}\n=== 记忆结束 ===\n重要提示：以上是你之前会话中保存的记忆，请参考这些信息来回答。如果你发现了新的重要信息，可以使用 save_memory 工具保存。`
+      : ''
+
+    await this.startSchedulerAndWait(tree, {
+      workers, resolveLLM, addSpeech, getReactiveSpeech, shouldContinue,
+      workingDirectory, onBeforeToolExecute, saveSnapshot, onRetryNode,
+      agentsMdHint, memoryHint, topic
+    })
+
+    this.emit({ type: 'complete', data: { resumed: true, requeued } })
+    return { ok: true, requeued }
+  }
+
+  /**
+   * 续跑/恢复前的安全校验：
+   * - 基线校验异常或文件被外部修改（冲突）→ 阻断，避免覆盖用户改动；
+   * - 写入未落盘（write_lost）的已完成节点 → 置回 ready 重新执行；
+   * - 对未完成验收的节点补跑验收检查。
+   */
+  private async validateResumeSafety(
+    tree: TaskTreeSnapshot,
+    workingDirectory: string,
+    saveSnapshot?: (tree: TaskTreeSnapshot) => void
+  ): Promise<{ ok: boolean; reason?: string }> {
+    const cmdExecutor: CommandExecutor = {
+      execute: async (cmd: string, cwd?: string, timeoutMs?: number) => {
+        if (window.electronAPI?.executeCommand) {
+          const r = await window.electronAPI.executeCommand({
+            command: cmd,
+            cwd: cwd || workingDirectory,
+            timeout: timeoutMs || 120000
+          })
+          return {
+            exitCode: r.exitCode ?? (r.success ? 0 : 1),
+            stdout: r.stdout || '',
+            stderr: r.stderr || '',
+            timedOut: r.timedOut || false
+          }
+        }
+        return { exitCode: 1, stdout: '', stderr: '无命令执行能力', timedOut: false }
+      }
+    }
+
+    const conflictNodes: string[] = []
+    const lostNodes: string[] = []
+    const baselineErrors: string[] = []
+    for (const node of Object.values(tree.nodes)) {
+      if (!node.fileBaselines || Object.keys(node.fileBaselines).length === 0) continue
+      try {
+        const results = await validateFileBaselines(
+          node.fileBaselines,
+          async (path: string) => {
+            if (window.electronAPI?.readFile) {
+              const r = await window.electronAPI.readFile(path)
+              if (r.success && r.sha256) return { content: r.content || '', sha256: r.sha256 }
+            }
+            return null
+          }
+        )
+        for (const r of results) {
+          if (r.status === 'conflict') conflictNodes.push(`${node.title}: ${r.path} 被外部修改`)
+          else if (r.status === 'write_lost') lostNodes.push(`${node.title}: ${r.path} 写入未落盘`)
+        }
+      } catch (e) {
+        const errMsg = e instanceof Error ? e.message : String(e)
+        baselineErrors.push(`${node.title}: 基线校验异常 — ${errMsg}`)
+      }
+    }
+
+    if (baselineErrors.length > 0) {
+      return { ok: false, reason: `文件基线校验失败，已暂停续跑。请检查后重试：\n${baselineErrors.join('\n')}` }
+    }
+    if (conflictNodes.length > 0) {
+      return { ok: false, reason: `检测到文件冲突（可能被外部修改），已暂停续跑。请手动检查后重试：\n${conflictNodes.join('\n')}` }
+    }
+    if (lostNodes.length > 0) {
+      this.emit({ type: 'error', data: { phase: 'resume', message: '以下文件写入未落盘，相关节点将重新执行', lost: lostNodes } })
+      for (const node of Object.values(tree.nodes)) {
+        if (!node.fileBaselines) continue
+        for (const [path] of Object.entries(node.fileBaselines)) {
+          if (lostNodes.some(l => l.includes(path)) && node.status === 'completed') {
+            const r = transitionStatus(tree, node.id, 'ready', '写入未落盘，需重新执行')
+            if (!r.ok) return { ok: false, reason: `状态迁移失败：${r.error}` }
+          }
+        }
+      }
+    }
+
+    // 验收重跑：对未完成验收的节点补跑检查
+    for (const node of Object.values(tree.nodes)) {
+      if (node.acceptanceState === 'running' || node.acceptanceState === 'pending') {
+        const changedFiles = node.fileBaselines ? Object.keys(node.fileBaselines) : []
+        if (changedFiles.length > 0) {
+          try {
+            const acceptance = await runAcceptance(workingDirectory, changedFiles, cmdExecutor)
+            node.acceptanceState = acceptance.overallState
+            node.acceptanceChecks = acceptance.checks
+          } catch { /* 验收失败不影响续跑 */ }
+        }
+      }
+    }
+
+    try { saveSnapshot?.(tree) } catch { /* ignore */ }
+    return { ok: true }
+  }
+
+  /**
    * 启动调度器并等待任务树完成（复用于恢复和正常流程）
    */
   private async startSchedulerAndWait(
@@ -1553,9 +1767,11 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
   ): Promise<{ workerResults: WorkerResult[] }> {
     const { workers, resolveLLM, addSpeech, getReactiveSpeech, shouldContinue, workingDirectory, onBeforeToolExecute, saveSnapshot, onRetryNode, agentsMdHint, memoryHint, topic } = params
     const workerResults: WorkerResult[] = []
-    // 预算追踪器：追踪整棵树和每个节点的工具调用消耗
-    const defaultMaxIterations = 10
-    const budgetTracker = new BudgetTracker(tree.limits.maxToolCallsPerRun, defaultMaxIterations)
+    // 预算追踪器：跟踪整棵树和每个节点的工具调用消耗
+    // 整树额度取树内记录值与当前换算额度的较大者，兼容旧会话里写死的小额度（200），
+    // 避免恢复到旧任务树时执行到一半被判“预算耗尽”而中断
+    const runToolCallCap = Math.max(tree.limits.maxToolCallsPerRun, getRunMaxToolCalls())
+    const budgetTracker = new BudgetTracker(runToolCallCap, this.config.autonomousMaxIterations)
     budgetTracker.onWarning((w) => {
       this.emit({ type: 'guardian-alert', data: { runId: tree.runId, nodeId: w.nodeId, record: { type: 'budget', message: w.message }, schedulerType: 'budget-warning' } })
     })
@@ -1564,11 +1780,11 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
     let liveToolCallCount = tree.usage.toolCalls
     const onToolCall = (): boolean => {
       // P1: 原子预留——在执行前检查并递增，并行场景下同步操作保证原子性
-      if (liveToolCallCount >= tree.limits.maxToolCallsPerRun) {
+      if (liveToolCallCount >= runToolCallCap) {
         return false  // 预算已耗尽，不执行
       }
       liveToolCallCount++
-      const remaining = tree.limits.maxToolCallsPerRun - liveToolCallCount
+      const remaining = runToolCallCap - liveToolCallCount
       // P1: 即时同步预留用量到快照，防止崩溃丢失
       tree.usage.toolCalls = liveToolCallCount
       try { saveSnapshot?.(tree) } catch { /* 快照保存失败不影响执行 */ }
@@ -1633,7 +1849,7 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
           nodeId: evt.nodeId || '__unknown__',
           nodeUsage: evt.data.nodeUsage,
           treeUsage: { iterations: evt.data.treeUsage.iterations, toolCalls: liveToolCallCount, elapsedMs: evt.data.treeUsage.elapsedMs },
-          remaining: { toolCalls: tree.limits.maxToolCallsPerRun - liveToolCallCount, iterations: evt.data.remaining.iterations },
+          remaining: { toolCalls: runToolCallCap - liveToolCallCount, iterations: evt.data.remaining.iterations },
           timestamp: Date.now()
         })
       }
@@ -1684,6 +1900,10 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
       taskScheduler.start(tree, context)
     })
 
+    // 收尾再落一次快照：确保调度器最后的终态推导与父节点收束结果都反映到任务树面板
+    // 与 docs/任务分解.md，不致于让面板停在最后一次工具调用时的中间快照上
+    try { saveSnapshot?.(tree) } catch { /* 快照失败不影响主流程 */ }
+
     return { workerResults }
   }
 
@@ -1702,16 +1922,13 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
     if (!worker) return { content: `未找到执行者: ${node.assigneeId}`, toolCalls: [], duration: 0, status: 'error' }
 
     const workerSpeechId = `${worker.id}-tree-${Date.now()}`
-    const workerSpeech: Speech = { id: workerSpeechId, ministerId: worker.id, content: '', timestamp: Date.now(), status: 'streaming', toolStatuses: [] }
+    const workerSpeech: Speech = { id: workerSpeechId, ministerId: worker.id, content: '', timestamp: Date.now(), status: 'streaming', toolStatuses: [], execTimeline: [] }
     addSpeech(workerSpeech)
     const reactiveWorker = getReactiveSpeech(workerSpeechId)
     const workerLLM = createProvider(resolveLLM(worker.llm))
     // 动态工具选择：根据任务描述智能筛选相关工具
     const maxTools = parseInt(appStorage.getItem('max_tools_per_turn') || '12', 10)
-    let toolDefs = await selectToolsForTopic(worker.id, node.description, maxTools)
-    if (node.readOnly) {
-      toolDefs = filterToolDefinitionsForReadOnlyNode(toolDefs)
-    }
+    const toolDefs = await selectToolsForTopic(worker.id, node.description, maxTools)
     const taskContextWithHistory = leafContext.previousResultsSummary
       ? `${node.description}\n\n${leafContext.previousResultsSummary}`
       : node.description
@@ -1728,6 +1945,8 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
           }
         }
       } catch { /* 索引构建失败不影响执行 */ }
+      // 任务文档指引（供自主执行分支使用；非自主分支由 executeWorkerTask 注入）
+      contextHint += `\n\nℹ️ 工程内 docs/任务分解.md 记录了完整任务清单与实时状态，可用 read_file 查阅整体进度、前序依赖任务完成情况与最新要求。`
     }
 
     const startTime = Date.now()
@@ -1743,11 +1962,14 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
         if (node.subAgentId) {
           subAgentProfile = subAgentRegistry.getSubAgent(node.subAgentId)
         }
-        const engine = new AutonomousEngine({ maxIterations: node.budget.maxIterations, verifyAfterEachRound: true, workingDirectory, agentsMdHint, memoryHint, modelId: worker.llm?.model, readOnly: node.readOnly, subAgentProfile })
+        // 旧任务树快照里的 budget.maxIterations 可能还是 10 的小额度，
+        // 取较大值保证恢复执行时不会被轮次上限截断
+        const engine = new AutonomousEngine({ maxIterations: Math.max(node.budget.maxIterations, this.config.autonomousMaxIterations), verifyAfterEachRound: true, workingDirectory, agentsMdHint, memoryHint, modelId: worker.llm?.model, subAgentProfile })
         engine.onEvent((evt: AutonomousEvent) => { this.emit({ type: 'worker-autonomous', ministerId: worker.id, data: evt }) })
         const execResult = await engine.execute({
           provider: workerLLM, systemPrompt: worker.systemPrompt, goal: topic, taskContext: taskContextWithHistory + contextHint, toolDefs,
-          onContent: (text) => { reactiveWorker.content = text }, onBeforeToolExecute, abortSignal, onToolCall
+          onContent: (text) => { reactiveWorker.content = text }, onBeforeToolExecute, abortSignal, onToolCall,
+          timeline: reactiveWorker.execTimeline
         })
         autoResult = execResult  // 保存验收结果引用
         if (!reactiveWorker.toolStatuses) reactiveWorker.toolStatuses = []
@@ -1757,7 +1979,7 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
         result = { content: execResult.content, toolCalls: execResult.toolCalls }
         goalReached = execResult.goalReached
       } else {
-        const wt: WorkerTask = { ministerId: worker.id, task: node.description, readOnly: node.readOnly }
+        const wt: WorkerTask = { ministerId: worker.id, task: node.description }
         result = await this.executeWorkerTask(workerLLM, worker, wt, topic, toolDefs, reactiveWorker, workingDirectory, onBeforeToolExecute, agentsMdHint, memoryHint, onToolCall)
         // 非自主路径：检查关键写操作是否失败（同一工具同参数只看最后一次结果）
         const criticalTools = new Set(['write_file', 'create_directory', 'execute_command', 'run_tests', 'git_operation', 'git_auto_commit', 'git_create_branch'])
@@ -1778,6 +2000,8 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
         }
       }
       reactiveWorker.status = 'completed'
+      // 记录执行耗时，供会话区“正在执行中 · Ns”完成后冻结显示
+      reactiveWorker.durationMs = Date.now() - reactiveWorker.timestamp
       reactiveWorker.toolCalls = result.toolCalls.length > 0 ? result.toolCalls : undefined
 
       // P2: 检测 LLM 输出中的复杂度信号（明确表明任务过于复杂需要更深拆解）
@@ -1785,6 +2009,8 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
 
       // 验收判定：自主引擎的 goalReached 为 false 时视为失败
       if (!goalReached) {
+        // 气泡状态必须与任务树一致：否则会话区显示“执行完成”而右侧节点为“失败”
+        reactiveWorker.status = 'error'
         // 提取验收结果
         let acceptance: AcceptancePlan | undefined
         if (node.autonomous && autoResult) {
@@ -1798,6 +2024,7 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
 
       // 非自主路径：关键写操作失败时视为未达标
       if (hasToolFailure) {
+        reactiveWorker.status = 'error'
         return { content: result.content, toolCalls: result.toolCalls, duration: Date.now() - startTime, status: 'error', goalReached: false, complexitySignal }
       }
 
@@ -1814,6 +2041,7 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
       const errMsg = error instanceof Error ? error.message : '未知错误'
       reactiveWorker.content = errMsg
       reactiveWorker.status = 'error'
+      reactiveWorker.durationMs = Date.now() - reactiveWorker.timestamp
       return { content: errMsg, toolCalls: [], duration: Date.now() - startTime, status: 'error' }
     }
   }
@@ -1834,8 +2062,33 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
 
     const messages: ChatMessage[] = [{
       role: 'system',
-      content: `${worker.systemPrompt}\n\n你被分配了一个任务，请将其拆解为 2-4 个具体子任务。\n\n父任务：${node.description}\n总体目标：${topic}\n\n请按 JSON 格式输出：\n{\n  "subtasks": [\n    { "title": "子任务标题", "description": "详细描述", "assigneeId": "执行者ID（可留空表示自己）", "autonomous": true }\n  ]\n}`
-    }, { role: 'user', content: `请拆解任务：${node.title}` }]
+      content: `${worker.systemPrompt}
+
+你收到了丞相分配的一项任务。请先判断它的粒度，再决定如何处理（只输出 JSON，不要额外解释）：
+
+- 如果任务是单一、原子性的操作，或只需输出一段分析/方案即可一次性完成：不要拆解，直接执行。
+  输出：{"needDecompose": false}
+- 如果任务包含多个可独立验收、或存在明确先后关系的步骤：把它拆解为 2-5 个子任务。
+  每个子任务必须有清晰的交付物和可逐项核查的验收标准。
+  输出：
+{
+  "needDecompose": true,
+  "subtasks": [
+    {
+      "title": "子任务标题",
+      "description": "详细描述与交付物",
+      "acceptance": ["可核查的验收标准1", "可核查的验收标准2"],
+      "autonomous": true
+    }
+  ]
+}
+
+判断原则：只有"独立可验收"或"有先后依赖"的工作才值得成为子任务；子任务并非越多越好。
+子任务需要创建实际文件并验证结果时 autonomous 设为 true，只需一次性文字输出时设为 false。
+
+父任务：${node.description}
+总体目标：${topic}`
+    }, { role: 'user', content: `请分析任务"${node.title}"的粒度，决定直接执行还是拆解。` }]
 
     try {
       const content = await provider.chatStream(messages, (t) => { reactive.content = t })
@@ -1843,10 +2096,19 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
       const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/) || content.match(/\{[\s\S]*\}/)
       const jsonStr = jsonMatch ? (jsonMatch[1] || jsonMatch[0]) : content
       const parsed = JSON.parse(jsonStr)
-      if (parsed.subtasks && Array.isArray(parsed.subtasks) && parsed.subtasks.length > 0) {
-        for (const st of parsed.subtasks) {
-          const child = createNode({ title: st.title || '子任务', description: st.description || '', parentId: node.id, createdBy: worker.id, assigneeId: st.assigneeId || worker.id, autonomous: st.autonomous === true, readOnly: st.readOnly === true || (!st.autonomous), decomposition: 'leaf', mode: 'action' })
-          addNode(tree, child)
+      // needDecompose:false 或无有效子任务 → childIds 保持为空 → 调度器将本节点标为叶子直接执行
+      if (parsed && parsed.needDecompose === true && Array.isArray(parsed.subtasks)) {
+        const maxChildren = tree.limits?.maxChildren ?? 5
+        for (const st of parsed.subtasks.slice(0, maxChildren)) {
+          const title = typeof st.title === 'string' && st.title.trim() ? st.title.trim() : '子任务'
+          const description = typeof st.description === 'string' ? st.description.trim() : ''
+          if (!description) continue
+          const acceptance = Array.isArray(st.acceptance)
+            ? st.acceptance.filter((a: any) => typeof a === 'string' && a.trim()).map((a: string) => a.trim())
+            : []
+          const child = createNode({ title, description, parentId: node.id, createdBy: worker.id, assigneeId: worker.id, autonomous: st.autonomous === true, readOnly: false, decomposition: 'leaf', mode: 'action', acceptance })
+          const r = addNode(tree, child)
+          if (!r.ok) break
         }
       }
     } catch { /* 拆解失败，保持为叶子 */ }
@@ -1963,8 +2225,7 @@ ${topic}
       "title": "子任务标题",
       "description": "子任务描述，应针对目标中尚未达成的部分",
       "assigneeId": "执行者角色 ID",
-      "autonomous": true,
-      "readOnly": false
+      "autonomous": true
     }
   ]
 }
@@ -1992,7 +2253,7 @@ ${topic}
             createdBy: 'chancellor',
             assigneeId: st.assigneeId || 'general',
             autonomous: st.autonomous !== false,
-            readOnly: st.readOnly === true,
+            readOnly: false,
             decomposition: 'leaf',
             mode: 'action'
           })

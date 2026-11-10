@@ -1,5 +1,6 @@
 import type { LLMProvider, LLMChatOptions } from './types'
 import type { ChatMessage, ToolCall } from '@/types'
+import { resolveLlmUrl } from './proxy'
 
 export class OpenAIProvider implements LLMProvider {
   private apiKey: string
@@ -26,7 +27,7 @@ export class OpenAIProvider implements LLMProvider {
   }
 
   async chat(messages: ChatMessage[], options?: LLMChatOptions) {
-    const response = await fetch(`${this.baseURL}/chat/completions`, {
+    const response = await fetch(resolveLlmUrl(`${this.baseURL}/chat/completions`), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -49,7 +50,7 @@ export class OpenAIProvider implements LLMProvider {
 
   async chatStream(messages: ChatMessage[], onChunk: (text: string) => void, options?: LLMChatOptions) {
     console.log('[chatStream] 开始, messages 数量:', messages.length)
-    const response = await fetch(`${this.baseURL}/chat/completions`, {
+    const response = await fetch(resolveLlmUrl(`${this.baseURL}/chat/completions`), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -132,7 +133,7 @@ export class OpenAIProvider implements LLMProvider {
     onToolCalls: (toolCalls: ToolCall[]) => void,
     options?: LLMChatOptions
   ): Promise<string> {
-    const response = await fetch(`${this.baseURL}/chat/completions`, {
+    const response = await fetch(resolveLlmUrl(`${this.baseURL}/chat/completions`), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

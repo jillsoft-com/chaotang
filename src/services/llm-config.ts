@@ -1,6 +1,7 @@
 import type { LLMConfig, LLMTestResult } from '@/types/llm'
 import { ref } from 'vue'
 import { getStorageBackend } from '@/services/storage'
+import { resolveLlmUrl } from '@/services/llm/proxy'
 
 const STORAGE_KEY = 'llm_configs'
 
@@ -141,7 +142,7 @@ class LLMService {
     }
 
     try {
-      const response = await fetch(`${baseURL}/models`, {
+      const response = await fetch(resolveLlmUrl(`${baseURL}/models`), {
         method: 'GET',
         headers
       })
@@ -207,7 +208,7 @@ class LLMService {
         headers['Authorization'] = `Bearer ${config.apiKey}`
       }
 
-      const response = await fetch(`${baseURL}/chat/completions`, {
+      const response = await fetch(resolveLlmUrl(`${baseURL}/chat/completions`), {
         method: 'POST',
         headers,
         body: JSON.stringify({

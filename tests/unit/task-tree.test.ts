@@ -234,6 +234,49 @@ describe('transitionStatus', () => {
     expect(tree.nodes[nodeId].waitingReason).toBe('依赖失败')
   })
 
+  it('failed 保留终态原因', () => {
+    transitionStatus(tree, nodeId, 'ready')
+    transitionStatus(tree, nodeId, 'running')
+    const result = transitionStatus(tree, nodeId, 'failed', '自主引擎未达成目标：自动测试或验收未通过')
+    expect(result.ok).toBe(true)
+    expect(tree.nodes[nodeId].failureReason).toBe('自主引擎未达成目标：自动测试或验收未通过')
+    // 失败原因不复用 waitingReason，避免与等待类语义混淆
+    expect(tree.nodes[nodeId].waitingReason).toBeUndefined()
+  })
+
+  it('重试路径清空上一次的失败原因', () => {
+    transitionStatus(tree, nodeId, 'ready')
+    transitionStatus(tree, nodeId, 'running')
+    transitionStatus(tree, nodeId, 'failed', '执行报错')
+    transitionStatus(tree, nodeId, 'ready', '用户手动重试')
+    expect(tree.nodes[nodeId].failureReason).toBeUndefined()
+    transitionStatus(tree, nodeId, 'running', '执行中')
+    expect(tree.nodes[nodeId].failureReason).toBeUndefined()
+  })
+
+  it('interrupted 记录原因且不写入 waitingReason', () => {
+    transitionStatus(tree, nodeId, 'ready')
+    transitionStatus(tree, nodeId, 'running')
+    transitionStatus(tree, nodeId, 'interrupted', '执行中断，未产生结果')
+    expect(tree.nodes[nodeId].failureReason).toBe('执行中断，未产生结果')
+    expect(tree.nodes[nodeId].waitingReason).toBeUndefined()
+  })
+
+  it('completed 不留失败原因', () => {
+    transitionStatus(tree, nodeId, 'ready')
+    transitionStatus(tree, nodeId, 'running')
+    transitionStatus(tree, nodeId, 'completed', '所有子任务完成')
+    expect(tree.nodes[nodeId].failureReason).toBeUndefined()
+  })
+
+  it('failureReason 随快照序列化保留', () => {
+    transitionStatus(tree, nodeId, 'ready')
+    transitionStatus(tree, nodeId, 'running')
+    transitionStatus(tree, nodeId, 'failed', 'API error 400')
+    const restored = deserializeSnapshot(serializeSnapshot(tree))
+    expect(restored?.nodes[nodeId].failureReason).toBe('API error 400')
+  })
+
   it('非法迁移返回错误', () => {
     // pending → completed 不在迁移表中
     const result = transitionStatus(tree, nodeId, 'completed')

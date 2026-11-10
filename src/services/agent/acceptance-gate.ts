@@ -106,6 +106,36 @@ function detectPackageJsonChecks(scripts: Record<string, string>): CheckRecord[]
 }
 
 /**
+ * 跨平台检测工作目录下的文件是否存在
+ *
+ * 不能沿用 POSIX 专有的 `test -f X && echo exists`：Windows 下命令走 powershell.exe，
+ * `test` 会被当成 Test-Path 的位置参数、`&&` 也不是 PowerShell 5.1 的合法分隔符，
+ * 探测必然失败 → 整个项目被判 unverified → 交付报告不生成。
+ * 与 test-loop / lint-fix-loop 保持同一做法：先试 PowerShell，再试 Unix，只看输出标记。
+ */
+async function crossPlatformFileExists(
+  filePath: string,
+  workingDir: string,
+  executor: CommandExecutor
+): Promise<boolean> {
+  try {
+    const ps = await executor.execute(
+      `if (Test-Path "${filePath}") { echo __EXISTS__ }`,
+      workingDir, 3000
+    )
+    if (ps.stdout.includes('__EXISTS__')) return true
+  } catch { /* 换下一种探测方式 */ }
+  try {
+    const unix = await executor.execute(
+      `test -f "${filePath}" && echo __EXISTS__`,
+      workingDir, 3000
+    )
+    if (unix.stdout.includes('__EXISTS__')) return true
+  } catch { /* 探测失败按不存在处理 */ }
+  return false
+}
+
+/**
  * 根据工作目录推断检查命令
  *
  * 检测顺序：
@@ -146,12 +176,7 @@ export async function buildAcceptancePlan(
 
     // 2. 检测 tsconfig.json（仅当没有 typecheck 检查时）
     if (!checks.some(c => c.kind === 'typecheck')) {
-      const tsconfigResult = await executor.execute(
-        'test -f tsconfig.json && echo exists',
-        workingDir,
-        3000
-      )
-      if (tsconfigResult.stdout.trim() === 'exists') {
+      if (await crossPlatformFileExists('tsconfig.json', workingDir, executor)) {
         // 检查是否有 tsc 可用
         const tscResult = await executor.execute(
           'npx tsc --version',
@@ -171,12 +196,7 @@ export async function buildAcceptancePlan(
 
     // 3. 检测 Cargo.toml (Rust)
     if (checks.length === 0) {
-      const cargoResult = await executor.execute(
-        'test -f Cargo.toml && echo exists',
-        workingDir,
-        3000
-      )
-      if (cargoResult.stdout.trim() === 'exists') {
+      if (await crossPlatformFileExists('Cargo.toml', workingDir, executor)) {
         checks.push({
           kind: 'build',
           command: 'cargo build',
@@ -194,12 +214,7 @@ export async function buildAcceptancePlan(
 
     // 4. 检测 go.mod (Go)
     if (checks.length === 0) {
-      const goResult = await executor.execute(
-        'test -f go.mod && echo exists',
-        workingDir,
-        3000
-      )
-      if (goResult.stdout.trim() === 'exists') {
+      if (await crossPlatformFileExists('go.mod', workingDir, executor)) {
         checks.push({
           kind: 'build',
           command: 'go build ./...',
@@ -217,18 +232,17 @@ export async function buildAcceptancePlan(
 
     // 5. 检测 Python 项目
     if (checks.length === 0) {
-      const pyResult = await executor.execute(
-        'test -f requirements.txt -o -f pyproject.toml -o -f setup.py && echo exists',
-        workingDir,
-        3000
-      )
-      if (pyResult.stdout.trim() === 'exists') {
+      const hasPyManifest = await crossPlatformFileExists('requirements.txt', workingDir, executor)
+        || await crossPlatformFileExists('pyproject.toml', workingDir, executor)
+        || await crossPlatformFileExists('setup.py', workingDir, executor)
+      if (hasPyManifest) {
         const pytestResult = await executor.execute(
           'python -m pytest --version',
           workingDir,
           5000
         )
-        if (pytestResult.exitCode === 0) {
+        // 部分 Windows 环境下 python 入口会写入 stderr 但不置退出码，兼容两种信号
+        if (pytestResult.exitCode === 0 || /pytest/i.test(pytestResult.stdout)) {
           checks.push({
             kind: 'test',
             command: 'python -m pytest',

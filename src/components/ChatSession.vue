@@ -1,15 +1,16 @@
 <script setup lang="ts">
 import { appStorage } from '@/services/storage'
 import { ref, nextTick, computed, onMounted, onUnmounted, watch } from 'vue'
+import type { Directive } from 'vue'
 import { useDebateStore } from '@/stores/debate'
 import { createProvider } from '@/services/llm'
 import { llmService } from '@/services/llm-config'
-import { Promotion, User, FolderOpened, Loading, CircleCloseFilled, Stamp, Download } from '@element-plus/icons-vue'
+import { Promotion, User, FolderOpened, Loading, CircleCloseFilled, Stamp, Download, CircleCheck, CircleClose, ArrowDown } from '@element-plus/icons-vue'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import { renderSafeMarkdown } from '@/utils/sanitize-markdown'
 import { estimateTokens } from '@/utils/token-utils'
 import { exportDebateToMarkdown } from '@/utils/export-markdown'
-import type { Speech, LLMConfig, ToolCall, Attachment } from '@/types'
+import type { Speech, LLMConfig, ToolCall, Attachment, ExecSegment } from '@/types'
 import { CoordinatorAgent } from '@/services/agent'
 import { taskScheduler } from '@/services/agent'
 import { compressContext, getCompressThreshold, countMessageChars } from '@/services/agent/context-compressor'
@@ -22,88 +23,20 @@ import { runAcceptance, collectChangedFiles } from '@/services/agent/acceptance-
 import type { CommandExecutor } from '@/services/agent/acceptance-gate'
 import { buildDeliveryReport } from '@/services/agent/delivery-report'
 import type { DeliveryReport, FileChange } from '@/services/agent/delivery-report'
+import { writeTaskDoc } from '@/services/agent/task-doc'
+import { getMaxToolRounds } from '@/services/agent/round-budget'
 import DeliveryPanel from '@/components/DeliveryPanel.vue'
-import PlanReviewPanel from '@/components/PlanReviewPanel.vue'
 
-// ============ 危险命令审批 (Approval Mode) ============
-
-/** 危险命令模式检测 */
-const DANGEROUS_CMD_PATTERNS = [
-  /\brm\b/i, /\brmdir\b/i, /\bdel\b/i,
-  /\bdrop\b/i, /\btruncate\b/i, /\bdelete\b/i,
-  /\bformat\b/i, /\bfdisk\b/i, /\bdiskpart\b/i,
-  /\bgit\s+reset\s+--hard/i, /\bgit\s+clean\b/i, /\bgit\s+push\s+--force/i,
-  /\bnpm\s+uninstall\b/i, /\bpip\s+uninstall\b/i,
-  /\bshutdown\b/i, /\breboot\b/i, /\bhalt\b/i,
-  /\bmkfs\b/i, /\bdd\s+if=/i,
-  /\breg\s+delete\b/i, /\brd\s+\/s/i,
-  /\bRemove-Item\b/i, /\bClear-RecycleBin\b/i
-]
-
-/** 检查命令是否危险 — P0-fix: 扩展到 git_auto_commit / git_create_branch 等工具 */
-function isDangerousCommand(toolCall: ToolCall): boolean {
-  // P0-fix: git_auto_commit 和 git_create_branch 始终需要审批
-  if (toolCall.function.name === 'git_auto_commit' || toolCall.function.name === 'git_create_branch') {
-    return true
-  }
-  if (toolCall.function.name !== 'execute_command') return false
-  try {
-    const args = JSON.parse(toolCall.function.arguments)
-    const cmd = args.command || ''
-    return DANGEROUS_CMD_PATTERNS.some(p => p.test(cmd))
-  } catch {
-    return false
-  }
-}
-
-/** 弹出确认框，返回 true 表示用户批准 */
-async function confirmDangerousCommand(toolCall: ToolCall): Promise<boolean> {
-  // P1-fix: 根据工具类型展示有意义的审批信息
-  let title = '⚠️ 危险命令确认'
-  let detail = ''
-
-  try {
-    const args = JSON.parse(toolCall.function.arguments)
-
-    if (toolCall.function.name === 'git_auto_commit') {
-      title = '🚀 Git 自动提交确认'
-      const files = args.files || []
-      const msg = args.message || '(自动生成)'
-      detail = `操作: git add + commit\n提交信息: ${msg}\n文件范围: ${files.length > 0 ? files.join(', ') : '(全部变更)'}`
-    } else if (toolCall.function.name === 'git_create_branch') {
-      title = '🌿 Git 创建分支确认'
-      detail = `操作: git checkout -b ${args.branch_name || '(未知)'}\n将从当前分支创建新分支`
-    } else {
-      // execute_command 等其他工具
-      const cmd = args.command || ''
-      detail = `即将执行以下命令：\n\n${cmd}`
-    }
-  } catch {
-    detail = '无法解析工具参数'
-  }
-
-  try {
-    await ElMessageBox.confirm(
-      detail,
-      title,
-      {
-        confirmButtonText: '批准执行',
-        cancelButtonText: '拒绝',
-        type: 'warning',
-        distinguishCancelAndClose: true
-      }
-    )
-    return true
-  } catch {
-    return false
-  }
-}
+// ============ 命令免确认策略 ============
+// 产品决策：工具调用与本地命令执行不再弹出任何人工确认对话框。
+// 安全边界仍由主进程 resolveAuthorizedPath 约束（命令与文件操作限定在已授权工作目录内）。
+// 如需恢复人工确认：恢复 electron/main.cjs 中 approveCommand 的 dialog.showMessageBox 分支，
+// 并在下方 onBeforeToolExecute 处恢复 ElMessageBox 确认逻辑。
 
 const props = defineProps<{ sessionId: string }>()
 
 const emit = defineEmits<{
-  (e: 'open-task-panel'): void
-  (e: 'open-attachment-panel'): void
+  (e: 'open-task-tree-panel'): void
 }>()
 
 const debateStore = useDebateStore()
@@ -114,8 +47,16 @@ const courtInput = ref('')
 const isSending = ref(false)
 const hasStartedCourt = ref(false)
 
-// P1-B: 交付报告
-const deliveryReport = ref<DeliveryReport | null>(null)
+// P1-B: 交付审阅面板的展开状态（报告本体见下方 deliveryReport，随会话持久化）
+const deliveryReportVisible = ref(false)
+
+// 决策报告折叠状态（默认折叠，避免充满会话区遮挡输入）
+const decisionReportExpanded = ref(false)
+
+// 决策报告暂时停用（当前价值不大）。如需恢复：置为 true，并在 debate store 的 completeDebate 里重新开启自动生成
+const enableDecisionReport = false
+
+// 任务树刷新计数器已上提至 debate store（taskTreeTick），供右侧面板共享
 
 // Phase 1: Plan Mode 审阅面板
 const planReviewData = ref<{ plan: { plan: string; tasks: any[] }; workers: any[]; resolve: (result: any) => void } | null>(null)
@@ -124,6 +65,8 @@ const planReviewData = ref<{ plan: { plan: string; tasks: any[] }; workers: any[
 function createPlanReviewCallback(workers: any[]) {
   return async (plan: any): Promise<any> => {
     return new Promise((resolve) => {
+      // 持久化待批准计划：离开/重进会话后可恢复审阅面板，避免卡在 PM 拆解后无后续
+      if (session.value) session.value.pendingPlan = plan
       planReviewData.value = { plan, workers, resolve }
     })
   }
@@ -132,17 +75,105 @@ function createPlanReviewCallback(workers: any[]) {
 /** Phase 1: 用户批准计划 */
 function handlePlanApprove(editedPlan: any) {
   if (planReviewData.value) {
-    planReviewData.value.resolve(editedPlan)
+    const resolve = planReviewData.value.resolve
     planReviewData.value = null
+    if (session.value) session.value.pendingPlan = undefined
+    resolve(editedPlan)
   }
 }
 
 /** Phase 1: 用户取消计划 */
 function handlePlanCancel() {
   if (planReviewData.value) {
-    planReviewData.value.resolve(null)
+    const resolve = planReviewData.value.resolve
     planReviewData.value = null
+    if (session.value) session.value.pendingPlan = undefined
+    resolve(null)
   }
+}
+
+// 判断当前发言是否为“待批准的丞相拆解发言”：确认/取消条内联在该气泡底部
+function isPendingPlanSpeech(speech: Speech): boolean {
+  if (!planReviewData.value || !session.value) return false
+  if (speech.ministerId !== 'chancellor' || !speech.id.startsWith('chancellor-plan-')) return false
+  const s = session.value.speeches
+  return s.length > 0 && s[s.length - 1].id === speech.id
+}
+
+/** Phase 1: 直接采用丞相已拆解的原计划批准执行（不做编辑） */
+function approveCurrentPlan() {
+  if (planReviewData.value) handlePlanApprove(planReviewData.value.plan)
+}
+
+/** Agent 模式：计算与 runAgentDebate 一致的 workers 列表（丞相以外的执行者，无则丞相兼任） */
+function resolveAgentWorkers(): any[] | null {
+  const s = session.value
+  if (!s) return null
+  const allMinisters = debateStore.sortedMinisters
+  const mentioned = s.mentionedMinisters
+  const ministers = mentioned && mentioned.length > 0
+    ? allMinisters.filter(m => mentioned.includes(m.id))
+    : allMinisters
+  const chancellor = ministers.find(m => m.id === 'chancellor')
+  if (!chancellor) return null
+  const execMinisters = ministers.filter(m => m.id !== 'chancellor')
+  return execMinisters.length > 0 ? execMinisters : [chancellor]
+}
+
+/**
+ * 恢复场景：进入会话时，若存在 PM 已拆解但未批准的计划（pendingPlan）且尚未建树，
+ * 则重建「执行计划审阅」面板。批准后复用已存计划直接建树执行（不重复调 LLM）。
+ */
+function tryResumePendingPlan() {
+  if (planReviewData.value) return
+  const s = session.value
+  if (!s || s.mode !== 'court' || s.status !== 'running') return
+  if (!s.pendingPlan || s.taskTreeSnapshot) return
+  const workers = resolveAgentWorkers()
+  if (!workers) return
+  planReviewData.value = {
+    plan: s.pendingPlan,
+    workers,
+    resolve: (editedPlan: any) => {
+      // handlePlanApprove/Cancel 已清理 pendingPlan；此处仅触发后续动作
+      if (!editedPlan) {
+        debateStore.completeDebate(undefined, true)
+        return
+      }
+      void runAgentDebate({ approvedPlan: editedPlan })
+    }
+  }
+}
+
+/**
+ * 进入会话时的统一恢复入口：
+ * 1) 若持久化了 pendingPlan → 直接用已存计划重建审阅面板（不重新拆解）；
+ * 2) 否则识别“卡在丞相拆解发言、既未建树也未开始执行”的 Agent 会话（典型为持久化机制上线前的旧会话），
+ *    自动重新触发一次拆解，把审阅面板恢复回来（会多一次 LLM 拆解，但可解锁流程）。
+ */
+function resumeStuckAgentPlan() {
+  if (planReviewData.value) return
+  const s = session.value
+  if (!s || s.mode !== 'court' || s.status !== 'running') return
+  // 已在执行/已建树的交给中断任务树恢复机制处理
+  if (s.taskTreeSnapshot) return
+  // 优先用持久化计划恢复
+  if (s.pendingPlan) {
+    tryResumePendingPlan()
+    return
+  }
+  // 特征：最后一条发言是丞相已完成的拆解发言（chancellor-plan-*），之后无任何执行发言
+  const last = s.speeches[s.speeches.length - 1]
+  const pausedAtPlan = !!last && last.ministerId === 'chancellor' && last.id.startsWith('chancellor-plan-') && last.status === 'completed'
+  if (!pausedAtPlan) return
+  if (!resolveAgentWorkers()) return
+  // 移除旧的卡住拆解发言，避免重跑后重复
+  while (s.speeches.length && s.speeches[s.speeches.length - 1].id.startsWith('chancellor-plan-')) {
+    s.speeches.pop()
+  }
+  hasStartedCourt.value = true
+  isDebating.value = true
+  runAgentDebate().finally(() => { isDebating.value = false })
 }
 
 /** P1-B: 撤销交付 — 尝试恢复文件到修改前状态 */
@@ -224,7 +255,9 @@ async function handleDeliveryRevert() {
   } else {
     ElMessage.error(messages.join('，'))
   }
+  // 撤销完成后这批改动已回到撤销前，报告不再成立：清除持久化记录并收起
   deliveryReport.value = null
+  deliveryReportVisible.value = false
 }
 
 // 消息字体大小（从 localStorage 读取，在设置页面中调节）
@@ -272,28 +305,6 @@ function handleDismiss() {
   debateStore.completeDebate(undefined, true)
   isNearBottom = true
   nextTick(() => scrollToBottom())
-}
-
-/** 停止朝议（中途终止，然后进入拍板流程） */
-function handleStopDebate() {
-  if (session.value) {
-    session.value.status = 'running' // 确保 shouldContinue 返回 false
-    // 将还在 streaming 的发言标记为 completed
-    for (const s of session.value.speeches) {
-      if (s.status === 'streaming') s.status = 'completed'
-    }
-  }
-  isDebating.value = false
-  // 如果有大臣已完成发言，进入拍板等待
-  const hasAnyCompleted = session.value?.speeches.some(
-    s => s.ministerId !== 'emperor' && s.status === 'completed'
-  )
-  if (hasAnyCompleted) {
-    awaitingDecree.value = true
-  } else {
-    // 没有大臣发言，直接强制退朝
-    debateStore.completeDebate(undefined, true)
-  }
 }
 
 // ============ 导出 Markdown ============
@@ -562,6 +573,284 @@ function toggleToolCallsExpand(speechId: string) {
   expandedToolCalls.value = s
 }
 
+// ============ 圣谕（自己发的内容）超长折叠 ============
+// 皇帝消息文本超过阈值时默认折叠，点击「展开全文」展开
+const EMPEROR_COLLAPSE_THRESHOLD = 160
+const expandedEmperorMsgs = ref<Set<string>>(new Set())
+
+function shouldCollapseEmperor(speech: Speech): boolean {
+  return speech.ministerId === 'emperor' && (speech.content || '').length > EMPEROR_COLLAPSE_THRESHOLD
+}
+
+function isEmperorExpanded(speechId: string): boolean {
+  return expandedEmperorMsgs.value.has(speechId)
+}
+
+function toggleEmperorExpand(speechId: string) {
+  const s = new Set(expandedEmperorMsgs.value)
+  if (s.has(speechId)) {
+    s.delete(speechId)
+  } else {
+    s.add(speechId)
+  }
+  expandedEmperorMsgs.value = s
+}
+
+// ============ Agent 模式 worker 执行折叠 + 右侧详情抽屉 ============
+// coordinator 生成的 worker 执行发言 id 形如 `${workerId}-tree|agent|decompose-<ts>`，
+// 多角色并发执行时把会话区收敛为一条状态条，详情（实时内容/工具调用/diff）点击后在右侧抽屉查看，
+// 避免会话区内容不断膨胀。串行/并行/丞相规划与汇总发言不受影响。
+const WORKER_EXEC_ID_RE = /-(?:tree|agent|decompose)-\d/
+const activeDetailSpeechId = ref<string | null>(null)
+
+function isWorkerExecutionSpeech(speech: Speech): boolean {
+  return speech.ministerId !== 'emperor' && WORKER_EXEC_ID_RE.test(speech.id)
+}
+
+const activeDetailSpeech = computed<Speech | null>(() => {
+  if (!activeDetailSpeechId.value || !session.value) return null
+  return session.value.speeches.find(s => s.id === activeDetailSpeechId.value) || null
+})
+
+// el-drawer 需要布尔 v-model：有选中发言即打开，关闭时清理选中
+const execDetailVisible = computed<boolean>({
+  get: () => !!activeDetailSpeechId.value,
+  set: (v) => { if (!v) activeDetailSpeechId.value = null }
+})
+
+function openExecDetail(speechId: string) {
+  activeDetailSpeechId.value = speechId
+}
+
+// 执行详情抽屉内仍可用工具调用摘要定位最新动态
+
+// ============ Agent 执行过程时间线（扁平步骤列表 + 整块折叠） ============
+// 对齐主流 Agent 界面的执行过程样式：一行一个步骤（状态图标 + 动作名 + 一句话摘要），
+// 点击行展开看命令行/入参与返回内容；标题行显示累计耗时，可整体折叠。
+const expandedExecSegs = ref<Set<string>>(new Set())
+/** 用户手动切换过的折叠状态：speechId -> 是否折叠；未记录时走默认策略 */
+const execFoldState = ref<Map<string, boolean>>(new Map())
+
+/** 默认：执行中展开便于看进度，执行完成后收起保持会话区紧凑 */
+function isExecBlockCollapsed(speech: Speech): boolean {
+  const override = execFoldState.value.get(speech.id)
+  if (override !== undefined) return override
+  return speech.status !== 'streaming'
+}
+
+function toggleExecBlock(speech: Speech) {
+  const m = new Map(execFoldState.value)
+  m.set(speech.id, !isExecBlockCollapsed(speech))
+  execFoldState.value = m
+}
+
+function toggleExecSeg(key: string) {
+  const s = new Set(expandedExecSegs.value)
+  if (s.has(key)) {
+    s.delete(key)
+  } else {
+    s.add(key)
+  }
+  expandedExecSegs.value = s
+}
+
+/**
+ * 步骤列表限高内部滚动时自动贴住最新一步：
+ * 首次挂载滚到底部，之后仅当视图本来就在底部附近时才跟随新步骤下滚，
+ * 用户主动上滑查历史时不被强行拉回
+ */
+const vAutoScrollBottom: Directive<HTMLElement> = {
+  mounted(el) {
+    el.scrollTop = el.scrollHeight
+  },
+  updated(el) {
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60
+    if (nearBottom) el.scrollTop = el.scrollHeight
+  }
+}
+
+/** 执行耗时秒表：仅当存在 streaming 的 worker 执行发言时每秒刷新，避免无谓重渲染 */
+const execNow = ref(Date.now())
+let execTimer: ReturnType<typeof setInterval> | null = null
+
+function syncExecTimer() {
+  const needTick = !!session.value?.speeches.some(s => s.status === 'streaming' && isWorkerExecutionSpeech(s))
+  if (needTick && !execTimer) {
+    execNow.value = Date.now()
+    execTimer = setInterval(() => { execNow.value = Date.now() }, 1000)
+  } else if (!needTick && execTimer) {
+    stopExecTimer()
+  }
+}
+
+function stopExecTimer() {
+  if (execTimer) {
+    clearInterval(execTimer)
+    execTimer = null
+  }
+}
+
+function execElapsedMs(speech: Speech): number {
+  if (speech.status === 'streaming') return Math.max(0, execNow.value - (speech.timestamp || execNow.value))
+  return speech.durationMs ?? 0
+}
+
+/** 耗时文案：1 分钟内显示秒，超过显示分秒；历史会话无 durationMs 时不显示 */
+function execElapsedText(speech: Speech): string {
+  const ms = execElapsedMs(speech)
+  if (ms <= 0) return ''
+  const sec = Math.round(ms / 1000)
+  if (sec < 60) return `${sec}s`
+  return `${Math.floor(sec / 60)}m${String(sec % 60).padStart(2, '0')}s`
+}
+
+function execHeaderLabel(speech: Speech): string {
+  if (speech.status === 'streaming') return '正在执行中'
+  if (speech.status === 'error') return '执行失败'
+  return '执行完成'
+}
+
+/** 命令/检索类工具完成后措辞用“已运行”，其余用“已完成” */
+const RUN_VERB_TOOLS = new Set([
+  'execute_command', 'run_tests', 'git_operation', 'git_auto_commit', 'git_create_branch',
+  'git_diff_summary', 'search_code', 'web_search', 'knowledge_query', 'search_memory'
+])
+
+type ExecRowState = 'ok' | 'run' | 'fail'
+
+function execRowState(seg: ExecSegment, speech: Speech): ExecRowState {
+  // 发言已收尾（完成或失败）却仍有未落定的段：说明这一轮是被异常打断的（如 API 502 直接抛错，
+  // 没人替它调 endThink / finishTool）。此时不得再挂转圈标签，
+  // 否则气泡中途会永远留一个假的“踌躇中…”，看起来像卡住且位置不在底部
+  const settled = speech.status !== 'streaming'
+  if (seg.type === 'think') return seg.done || settled ? 'ok' : 'run'
+  if (seg.status === 'completed') return 'ok'
+  if (seg.status === 'executing') return settled ? 'fail' : 'run'
+  return 'fail'
+}
+
+/**
+ * 思考中的轮换措辞：长时间执行时文案一直挂“思考中”看起来像卡住了，
+ * 按执行耗时定时往下换（从平静到绞尽脑汁），首个固定为「思考中」
+ */
+const THINK_WORDS = [
+  '思考中', '思忖中', '沉吟中', '斟酌中', '踌躇中', '揣摩中',
+  '寻思中', '权衡中', '三思中', '苦思冥想中', '冥思苦想中',
+  '绞尽脑汁中', '搜肠刮肚中', '左思右想中', '眉头紧锁中'
+]
+
+/** 每个措辞停留时长，一轮循环约 45 秒 */
+const THINK_ROTATE_MS = 3000
+
+/** 思考段 id 形如 think-<起始毫秒>-<序号>（见 exec-timeline.nextSegId），据此还原本轮思考的开始时刻 */
+function thinkStartedAtMs(seg: ExecSegment): number {
+  const m = /^think-(\d+)-/.exec(seg.id)
+  const ms = m ? Number(m[1]) : NaN
+  return Number.isFinite(ms) ? ms : 0
+}
+
+function execRowLabel(seg: ExecSegment, speech: Speech): string {
+  if (seg.type !== 'think') return seg.displayName
+  if (seg.done || speech.status !== 'streaming') return '已思考'
+  // 每轮思考都从「思考中」起跳，拖得越久措辞越吃力；id 解析不出时退回整段执行耗时
+  const started = thinkStartedAtMs(seg)
+  const elapsed = started ? Math.max(0, execNow.value - started) : execElapsedMs(speech)
+  return `${THINK_WORDS[Math.floor(elapsed / THINK_ROTATE_MS) % THINK_WORDS.length]}…`
+}
+
+/** 行内状态后缀：思考行不显示（标签本身已含状态），工具行显示 已运行/已完成/运行中/失败 */
+function execRowStateText(seg: ExecSegment, speech: Speech): string {
+  if (seg.type === 'think') return ''
+  if (seg.status === 'completed') return RUN_VERB_TOOLS.has(seg.functionName) ? '已运行' : '已完成'
+  if (seg.status === 'executing') return speech.status === 'streaming' ? '运行中' : '失败'
+  return seg.status === 'timeout' ? '超时' : '失败'
+}
+
+/** 错误正文常内嵌整页 HTML（502 网关页等），摘要里先剥掉标签，否则只剩一串尖括号 */
+function stripHtmlTags(text: string): string {
+  return (text || '').replace(/<[^>]*>/g, ' ')
+}
+
+function resultPreview(speech: Speech): string {
+  const raw = speech.status === 'error' ? stripHtmlTags(speech.content || '') : (speech.content || '')
+  return clipLine(raw)
+}
+
+function clipLine(text: string, max = 120): string {
+  const t = (text || '').replace(/\s+/g, ' ').trim()
+  if (!t) return ''
+  return t.length > max ? `${t.slice(0, max)}…` : t
+}
+
+/** 摘要优先取“做了什么”的关键入参（命令行、路径、查询词），其次取返回首行 */
+const ARG_HINT_KEYS = ['command', 'path', 'file_path', 'directory', 'query', 'pattern', 'url', 'message', 'goal']
+
+function extractArgHint(input?: string): string {
+  if (!input) return ''
+  let args: Record<string, any>
+  try {
+    args = JSON.parse(input)
+  } catch {
+    return clipLine(input)
+  }
+  if (!args || typeof args !== 'object') return ''
+  for (const key of ARG_HINT_KEYS) {
+    const v = args[key]
+    if (typeof v === 'string' && v.trim()) return clipLine(v)
+  }
+  for (const v of Object.values(args)) {
+    if (typeof v === 'string' && v.trim()) return clipLine(v)
+  }
+  return ''
+}
+
+function execRowPreview(seg: ExecSegment): string {
+  if (seg.type === 'think') return clipLine(seg.text)
+  return extractArgHint(seg.input) || clipLine((seg.output || '').split('\n').find(l => l.trim()) || '')
+}
+
+/**
+ * 当前正在执行的一步（未完成的思考行 / 正在执行的工具行）
+ * 与已完成步骤严格分开：单独常驻在滚动列表之外，不折叠也不会被滚动条滚走
+ */
+function execLiveSeg(speech: Speech): ExecSegment | null {
+  if (speech.status !== 'streaming') return null
+  const timeline = speech.execTimeline || []
+  const last = timeline[timeline.length - 1]
+  if (!last) return null
+  if (last.type === 'think' && !last.done) return last
+  if (last.type === 'tool' && last.status === 'executing') return last
+  return null
+}
+
+/** 常驻行以「零或一个元素」返回，便于模板 v-for 内局部绑定当前步 */
+function execLiveSegs(speech: Speech): ExecSegment[] {
+  const live = execLiveSeg(speech)
+  return live ? [live] : []
+}
+
+/** 滚动列表只渲染已完成的历史步骤，当前步不混在里面 */
+function execHistorySegs(speech: Speech): ExecSegment[] {
+  const timeline = speech.execTimeline || []
+  const live = execLiveSeg(speech)
+  return live ? timeline.filter(s => s.id !== live.id) : timeline
+}
+
+/** 工具入参展示：execute_command 直接显示命令行，其余显示格式化 JSON */
+function formatToolInput(seg: ExecSegment): string {
+  if (seg.type !== 'tool') return ''
+  try {
+    const args = JSON.parse(seg.input || '{}')
+    if (seg.functionName === 'execute_command' && typeof args.command === 'string') {
+      return `$ ${args.command}`
+    }
+    return JSON.stringify(args, null, 2)
+  } catch {
+    // 参数被截断导致解析失败时，直接展示原文
+    return seg.input || ''
+  }
+}
+
 // ============ Diff 预览 ============
 
 /** diff 展开状态（按 toolCallId 跟踪） */
@@ -778,19 +1067,9 @@ function forkFromSpeech(speechId: string) {
 async function copySpeechContent(content: string) {
   try {
     await navigator.clipboard.writeText(content)
-    ElMessageBox.alert('已复制到剪贴板', '', {
-      showClose: false,
-      showConfirmButton: false,
-      type: 'success',
-      callback: () => {}
-    })
-    // 自动关闭提示
-    setTimeout(() => {
-      const overlay = document.querySelector('.el-overlay')
-      if (overlay) (overlay as HTMLElement).click()
-    }, 800)
+    ElMessage.success('已复制到剪贴板')
   } catch {
-    ElMessageBox.alert('复制失败，请手动选择复制', '提示', { type: 'warning' })
+    ElMessage.warning('复制失败，请手动选择复制')
   }
 }
 
@@ -916,6 +1195,36 @@ function getSummaryProvider() {
 
 const isPrivate = computed(() => session.value?.mode === 'private')
 
+/**
+ * P1-B: 交付报告 — 读写都落到会话对象上，由 store 同步到历史归档。
+ *
+ * 以前是组件内的一次性 ref：点“确认交付”或切换标签页（ChatSession 按 sessionId 重建）
+ * 就永久丢失，现在随会话持久化，任何时候都能回到“交付审阅”面板重看成果。
+ */
+const deliveryReport = computed<DeliveryReport | null>({
+  get: () => (session.value?.deliveryReport as DeliveryReport) || null,
+  set: (report) => {
+    if (!session.value) return
+    debateStore.saveDeliveryReport(session.value.id, report)
+    if (!report) session.value.deliveryConfirmedAt = undefined
+  }
+})
+
+const deliveryStateLabel = computed(() => {
+  switch (deliveryReport.value?.acceptanceState) {
+    case 'passed': return '验收通过'
+    case 'failed': return '验收未通过'
+    case 'unverified': return '未验证'
+    default: return '验收待定'
+  }
+})
+
+/** 确认交付：保留报告与成果记录，只收起面板并打上已确认标记 */
+function handleDeliveryConfirm() {
+  if (session.value) debateStore.markDeliveryConfirmed(session.value.id)
+  deliveryReportVisible.value = false
+}
+
 // 角色管理
 const activeMinisterIds = computed(() => {
   if (!session.value) return []
@@ -947,6 +1256,24 @@ const sessionDirName = computed(() => {
   const lastSep = Math.max(normalized.lastIndexOf('\\'), normalized.lastIndexOf('/'))
   return lastSep >= 0 ? normalized.slice(lastSep + 1) : normalized
 })
+
+/**
+ * 进入会话/开始执行时，用会话持久化的工作目录重新授权主进程。
+ * 主进程的目录授权（authorizedRoots）是内存态，按 webContents.id 存储，
+ * 应用重启或渲染进程重载后会丢失，而会话里的 workingDirectory 字符串仍持久化。
+ * 不重新授权会导致大臣执行文件工具时报“请先在首页选择工作目录”。
+ */
+async function ensureWorkspaceAuthorized() {
+  const dir = session.value?.workingDirectory
+  if (!dir) return
+  if (!window.electronAPI?.authorizeWorkspace) return
+  try {
+    const res = await window.electronAPI.authorizeWorkspace(dir)
+    if (!res?.success) {
+      console.warn('[Workspace] 工作目录授权失败:', res?.error)
+    }
+  } catch { /* 忽略：后续工具调用会给出明确错误 */ }
+}
 
 const progress = computed(() => {
   if (!session.value) return 0
@@ -984,12 +1311,19 @@ onMounted(() => {
   if (session.value) {
     nextTick(() => scrollToBottom())
   }
+  // 用会话持久化的工作目录重新授权主进程（重启/重载后授权会丢失）
+  void ensureWorkspaceAuthorized()
+  // Agent 模式：重进会话时恢复未批准的执行计划审阅面板（含旧会话兼容）
+  resumeStuckAgentPlan()
   // 监听用户手动滚动
   speechesContainer.value?.addEventListener('scroll', checkScrollPosition, { passive: true })
   // Ctrl+F 打开搜索
   window.addEventListener('keydown', handleGlobalKeydown)
   // 粘贴图片
   window.addEventListener('paste', handlePaste)
+  // 执行过程耗时秒表：仅在有 worker 执行发言 streaming 时走秒
+  syncExecTimer()
+  watch(() => session.value?.speeches.map(s => s.status).join(','), syncExecTimer)
 })
 
 function handleGlobalKeydown(e: KeyboardEvent) {
@@ -1012,6 +1346,7 @@ onUnmounted(() => {
   speechObserver?.disconnect()
   window.removeEventListener('keydown', handleGlobalKeydown)
   window.removeEventListener('paste', handlePaste)
+  stopExecTimer()
 })
 
 /**
@@ -1033,6 +1368,7 @@ async function runMinisterTurn(params: {
 
   // P1-fix: 每次执行开始时清空旧的交付报告，避免失败轮次展示上次报告
   deliveryReport.value = null
+  deliveryReportVisible.value = false
 
   // 没有工作目录，走普通无工具对话
   if (!workingDir) {
@@ -1109,7 +1445,8 @@ async function runMinisterTurn(params: {
     { role: 'user', content: userMessage }
   ]
 
-  const MAX_ROUNDS = parseInt(appStorage.getItem('max_tool_rounds') || '30', 10)
+  // 工具调用轮次上限：取设置项（默认 500），触顶后只要求总结，不再因小额度截断任务
+  const MAX_ROUNDS = getMaxToolRounds()
   let finalContent = ''
   let accumulatedContent = ''
   const allToolCallResults: Array<{ functionName: string; status: string; arguments?: Record<string, any> }> = []
@@ -1213,24 +1550,7 @@ async function runMinisterTurn(params: {
         summary: ''
       })
 
-      // Approval Mode: 危险命令需人工确认
-      if (isDangerousCommand(tc)) {
-        const approved = await confirmDangerousCommand(tc)
-        if (!approved) {
-          const statusEntry = reactiveSpeech.toolStatuses.find(s => s.toolCallId === tc.id)
-          if (statusEntry) {
-            statusEntry.status = 'error'
-            statusEntry.summary = '用户拒绝执行危险命令'
-          }
-          messages.push({
-            role: 'tool',
-            content: JSON.stringify({ success: false, error: '用户拒绝执行该危险命令' }),
-            tool_call_id: tc.id,
-            name: tc.function.name
-          })
-          continue
-        }
-      }
+      // 命令免确认：危险命令不再弹出人工确认框，直接执行
 
       // Diff 预览：write_file / search_replace 执行前读取旧内容
       let preWriteOldContent: string | null = null
@@ -1427,38 +1747,40 @@ async function runMinisterTurn(params: {
       }
       try {
         const acceptance = await runAcceptance(workingDir, changedFiles, cmdExecutor)
-        // P1-fix: 验收失败时作为硬门槛，在回复中明确标注，并阻断交付
+        // 验收结果如实标注在回复里，但不再据此隐藏成果：
+        // 未通过 / 未验证时用户同样需要知道这一次到底改了什么
         if (acceptance.overallState === 'failed') {
           const failedChecks = acceptance.checks.filter(c => c.status === 'failed')
           const diagnostics = failedChecks.map(c => `- [${c.kind}] ${c.command}: ${c.summary}`).join('\n')
-          const warningText = `\n\n---\n\u274c **\u9a8c\u6536\u68c0\u67e5\u672a\u901a\u8fc7**\n\n${diagnostics}\n\n\u4ee5\u4e0a\u68c0\u67e5\u672a\u901a\u8fc7\uff0c\u4ee3\u7801\u53ef\u80fd\u5b58\u5728\u95ee\u9898\uff0c\u8bf7\u4ed4\u7ec6\u68c0\u67e5\u540e\u518d\u91c7\u7eb3\u3002\n\n**\u5df2\u963b\u65ad\u4ea4\u4ed8**\uff0c\u8bf7\u4fee\u590d\u4ee5\u4e0a\u95ee\u9898\u540e\u91cd\u65b0\u6267\u884c\u3002`
-          finalContent += warningText
+          finalContent += `\n\n---\n❌ **验收检查未通过**\n\n${diagnostics}\n\n以上检查未通过，代码可能存在问题，请仔细检查后再采纳。\n\n文件变更已列入下方「📦 交付审阅」，采纳前可逐文件查看并撤销。`
           onContent(finalContent)
-          // P1-fix: 验收失败时不构建交付报告，阻断交付
-          // deliveryReport.value 不设置
         } else if (acceptance.overallState === 'passed') {
-          const passedSummary = acceptance.checks.map(c => `- [${c.kind}] ${c.command}: \u2705 \u901a\u8fc7`).join('\n')
-          const passText = `\n\n---\n\u2705 **\u9a8c\u6536\u68c0\u67e5\u5168\u90e8\u901a\u8fc7**\n\n${passedSummary}`
-          finalContent += passText
+          const passedSummary = acceptance.checks.map(c => `- [${c.kind}] ${c.command}: ✅ 通过`).join('\n')
+          finalContent += `\n\n---\n✅ **验收检查全部通过**\n\n${passedSummary}`
           onContent(finalContent)
-          // P1-B: 验收通过才构建交付报告
-          deliveryReport.value = buildDeliveryReport({
-            toolCalls: allToolCallResults as any,
-            acceptance,
-            nodeTitle: '会话'
-          })
         } else if (acceptance.overallState === 'unverified') {
           // P1-fix: 未验证状态也明确告知用户
-          finalContent += '\n\n---\n\u26a0\ufe0f **\u9a8c\u6536\u68c0\u67e5\u672a\u6267\u884c**\n\n\u672a\u914d\u7f6e\u81ea\u52a8\u68c0\u67e5\uff0c\u65e0\u6cd5\u9a8c\u8bc1\u5b8c\u6210\u72b6\u6001\u3002'
+          finalContent += '\n\n---\n⚠️ **验收检查未执行**\n\n未配置自动检查，无法验证完成状态。'
           onContent(finalContent)
-          // P1-fix: 未验证状态也不构建交付报告，避免无法撤销的风险
         }
+        // P1-B: 构建交付报告（不再被验收状态阻断）并展开审阅面板
+        deliveryReport.value = buildDeliveryReport({
+          toolCalls: allToolCallResults as any,
+          acceptance,
+          nodeTitle: '会话'
+        })
+        deliveryReportVisible.value = true
       } catch (acceptanceError) {
-        // P1-fix: 验收过程抛错时不再静默忽略，而是在回复中展示，并阻断交付
+        // P1-fix: 验收过程抛错时不再静默忽略，而是在回复中展示
         const errMsg = acceptanceError instanceof Error ? acceptanceError.message : String(acceptanceError)
-        finalContent += `\n\n---\n\u26a0\ufe0f **\u9a8c\u6536\u8fc7\u7a0b\u51fa\u9519**\n\n${errMsg}\n\n\u8bf7\u6ce8\u610f\u4ee5\u4e0a\u9519\u8bef\uff0c\u5efa\u8bae\u624b\u52a8\u68c0\u67e5\u4ee3\u7801\u3002\n\n**\u5df2\u963b\u65ad\u4ea4\u4ed8**\u3002`
+        finalContent += `\n\n---\n⚠️ **验收过程出错**\n\n${errMsg}\n\n请注意以上错误，建议手动检查代码。`
         onContent(finalContent)
-        // P1-fix: 验收出错时也不构建交付报告
+        // 验收没跑成，但文件变更清单仍有价值：不带验收信息构建报告
+        deliveryReport.value = buildDeliveryReport({
+          toolCalls: allToolCallResults as any,
+          nodeTitle: '会话'
+        })
+        deliveryReportVisible.value = true
       }
     }
   }
@@ -1471,6 +1793,9 @@ async function runMinisterTurn(params: {
 
 async function runCourtDebate() {
   if (!session.value) return
+
+  // 确保工具可访问工作目录（串行/并行/Agent 均依赖）
+  await ensureWorkspaceAuthorized()
 
   // Agent 模式委托给 runAgentDebate
   if (debateMode.value === 'agent') {
@@ -1586,14 +1911,155 @@ async function runCourtDebate() {
   awaitingDecree.value = true
 }
 
+// ============ 任务快照统一处理 + 任务文档落盘（docs/任务分解.md） ============
+let taskDocTimer: ReturnType<typeof setTimeout> | null = null
+
+/** 统一的快照写入入口：更新会话/持久化，并在首次建树时拉出面板 + 调度文档落盘 */
+function applyTreeSnapshot(tree: any) {
+  if (!session.value) return
+  const isFirstTree = !session.value.taskTreeSnapshot
+  // 调度器的 tree 是原地修改的同一引用：直接赋值因引用不变而不触发 Vue 更新，
+  // 面板会停在初次建树的状态。深拷贝脱离可变源，任务树面板才能随执行实时同步节点状态
+  const snapshot = JSON.parse(JSON.stringify(tree))
+  session.value.taskTreeSnapshot = snapshot
+  debateStore.saveTaskTreeSnapshot(session.value.id, snapshot)
+  if (isFirstTree) emit('open-task-tree-panel')
+  scheduleTaskDocWrite(snapshot)
+}
+
+/** 去抖写文档：状态高频变化时合并，避免频繁磁盘写入 */
+function scheduleTaskDocWrite(tree: any) {
+  if (!session.value?.workingDirectory) return
+  if (taskDocTimer) clearTimeout(taskDocTimer)
+  taskDocTimer = setTimeout(() => { void doWriteTaskDoc(tree) }, 400)
+}
+
+async function doWriteTaskDoc(tree: any) {
+  const wd = session.value?.workingDirectory
+  if (!wd || !tree || !window.electronAPI?.writeFile) return
+  try {
+    const res = await writeTaskDoc(wd, tree, session.value?.topic || '', debateStore.sortedMinisters)
+    if (!res.ok && res.error) console.warn('[TaskDoc] 写入失败:', res.error)
+  } catch (e) {
+    console.warn('[TaskDoc] 写入异常:', e)
+  }
+}
+
+/**
+ * 继续/重试任务树：不传 nodeId 时整树续跑（重跑所有未完成/失败节点），
+ * 传 nodeId 时仅重试该节点。不重走丞相拆解与 Plan 审阅。
+ * 由右侧任务树面板通过 HomeView 调用。
+ */
+async function continueTaskTree(nodeId?: string) {
+  if (!session.value) return
+  const snapshot = session.value.taskTreeSnapshot
+
+  // 任务树已暂停但调度器仍驻留该 run（tick 循环还在、isDebating 仍为 true）：
+  // 必须优先走就地恢复，否则会被下面的“任务正在执行中”守卫拦住，无法重试已暂停任务
+  if (snapshot && snapshot.state === 'paused') {
+    const runId = taskScheduler.findRunIdByDebateId(session.value.id)
+    if (runId) {
+      let retried = false
+      if (nodeId) {
+        // 用户明确点击了重试按钮，视作已确认（写操作安全闸门）
+        retried = taskScheduler.retryNode(runId, nodeId, true)
+      }
+      taskScheduler.resume(runId)
+      if (nodeId) {
+        retried
+          ? ElMessage.success('已重新排队该任务并恢复执行')
+          : ElMessage.warning('该节点当前状态不可重试，已恢复整树执行')
+      } else {
+        ElMessage.success('已恢复执行')
+      }
+      return
+    }
+  }
+
+  if (isDebating.value) { ElMessage.info('任务正在执行中，请稍候'); return }
+  const tree = snapshot
+  if (!tree) { ElMessage.warning('当前会话没有任务树，无法继续'); return }
+  if (tree.state === 'running') { ElMessage.info('任务树仍在执行中'); return }
+
+  await ensureWorkspaceAuthorized()
+
+  const allMinisters = debateStore.sortedMinisters
+  const mentioned = session.value.mentionedMinisters
+  const ministers = mentioned && mentioned.length > 0
+    ? allMinisters.filter(m => mentioned.includes(m.id))
+    : allMinisters
+  const chancellor = ministers.find(m => m.id === 'chancellor')
+  if (!chancellor) { ElMessage.error('缺少丞相角色，无法继续'); return }
+  const execMinisters = ministers.filter(m => m.id !== 'chancellor')
+  const workers = execMinisters.length > 0 ? execMinisters : [chancellor]
+
+  const agent = new CoordinatorAgent({ planMode: false })
+  agent.onEvent((event) => {
+    if (['worker-start', 'worker-done', 'node-completed', 'node-failed', 'tree-completed', 'tree-failed', 'guardian-alert', 'complete'].includes(event.type)) {
+      nextTick(() => { isNearBottom = true; scrollToBottom() })
+    }
+  })
+
+  // 命令免确认：所有工具调用直接放行
+  const onBeforeToolExecute = async () => true
+  const onRetryNode = async (_nid: string, reason: string) => {
+    try {
+      await ElMessageBox.confirm(
+        `监护器检测到问题：${reason}\n\n是否重试该节点？`,
+        '🛡️ 执行监护报警',
+        { confirmButtonText: '重试', cancelButtonText: '跳过', distinguishCancelAndClose: true, type: 'warning' }
+      )
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  isDebating.value = true
+  hasStartedCourt.value = true
+  if (session.value.status !== 'running') session.value.status = 'running'
+
+  let res: { ok: boolean; requeued: number; reason?: string }
+  try {
+    res = await agent.resumeTaskTree({
+      tree,
+      nodeId,
+      workers,
+      resolveLLM: resolveLLMConfig,
+      addSpeech: (speech) => debateStore.addSpeech(speech, props.sessionId),
+      getReactiveSpeech: (speechId) => session.value!.speeches.find(s => s.id === speechId)!,
+      shouldContinue: () => !!session.value && session.value.status === 'running',
+      workingDirectory: session.value.workingDirectory,
+      onBeforeToolExecute,
+      saveSnapshot: (t: any) => applyTreeSnapshot(t),
+      onRetryNode,
+      topic: session.value.topic + getAttachmentContext()
+    })
+  } finally {
+    isDebating.value = false
+    if (session.value) debateStore.completeDebate()
+    isNearBottom = true
+    scrollToBottom()
+  }
+
+  if (res.ok) ElMessage.success(`已继续执行 ${res.requeued} 个任务`)
+  else ElMessage.warning(res.reason || '未能继续执行')
+}
+
+defineExpose({ continueTaskTree })
+
 /**
  * Agent 模式：丞相拆解 → Workers 执行 → 丞相汇总
  */
-async function runAgentDebate() {
+async function runAgentDebate(options?: { approvedPlan?: any }) {
   if (!session.value) return
+
+  // 执行前确保工作目录已授权（重启/重载后主进程内存态授权会丢）
+  await ensureWorkspaceAuthorized()
 
   // P1-fix: 每次执行开始时清空旧的交付报告，避免失败轮次展示上次报告
   deliveryReport.value = null
+  deliveryReportVisible.value = false
 
   const allMinisters = debateStore.sortedMinisters
   const mentioned = session.value.mentionedMinisters
@@ -1645,25 +2111,23 @@ async function runAgentDebate() {
     return
   }
 
-  const workers = ministers.filter(m => m.id !== 'chancellor')
+  // 除丞相外的大臣作为执行者；若无可用执行者，则由丞相召集（亲自兼任执行者），避免任务派发死锁
+  const execMinisters = ministers.filter(m => m.id !== 'chancellor')
+  const workers = execMinisters.length > 0 ? execMinisters : [chancellor]
 
   isNearBottom = true
   await nextTick()
   scrollToBottom()
 
   const agent = new CoordinatorAgent({
-    planMode: true,
-    autonomousMaxIterations: 10
+    planMode: !options?.approvedPlan
   })
 
-  // Phase 1: Plan Mode 审阅回调 — 弹出可视化编辑面板
+  // Phase 1: Plan Mode 审阅回调 — 弹出可视化编辑面板（恢复已批准计划时不需要）
   const onPlanReady = createPlanReviewCallback(workers)
 
-  // Approval Mode 回调
-  const onBeforeToolExecute = async (tc: ToolCall) => {
-    if (!isDangerousCommand(tc)) return true
-    return confirmDangerousCommand(tc)
-  }
+  // 命令免确认回调：所有工具调用直接放行
+  const onBeforeToolExecute = async () => true
 
   // 监听 Agent 事件，自动滚动
   agent.onEvent((event) => {
@@ -1687,13 +2151,9 @@ async function runAgentDebate() {
       workingDirectory: session.value.workingDirectory,
       debateId: session.value.id,
       onPlanReady,
+      ...(options?.approvedPlan ? { initialDecomposition: options.approvedPlan } : {}),
       onBeforeToolExecute,
-      saveSnapshot: (tree: any) => {
-        if (session.value) {
-          session.value.taskTreeSnapshot = tree
-          debateStore.saveTaskTreeSnapshot(session.value.id, tree)
-        }
-      },
+      saveSnapshot: (tree: any) => applyTreeSnapshot(tree),
       onRetryNode: async (_nodeId: string, reason: string) => {
         try {
           await ElMessageBox.confirm(
@@ -1762,7 +2222,7 @@ async function runAgentDebate() {
     const allChecks: any[] = []
     let hasFailed = false
     let hasAnyChecks = false
-    // P1-fix: 检查任务树终态，如果有 failed/interrupted 状态则不交付
+    // P1-fix: 检查任务树终态：failed/interrupted 会把汇总验收判为未通过
     const treeState = tree.state
     // P1-fix: 逐一核对所有 action 模式叶节点的验收状态
     let allActionNodesPassed = true
@@ -1848,18 +2308,17 @@ async function runAgentDebate() {
         }
       }
     }
-    // P1-fix: Agent 模式也受硬门槛约束：只有验收通过才构建交付报告
-    // unverified 和 failed 都阻断交付
-    if (overallState === 'passed') {
-      deliveryReport.value = {
-        changedFiles: allChangedFiles,
-        acceptanceState: overallState,
-        acceptanceChecks: allChecks,
-        unresolvedQuestions: nodes.filter((n: any) => n.status === 'failed').map((n: any) => `${n.title}: ${n.resultSummary || '执行失败'}`),
-        repairsUsed: 0,
-        nodeTitle: 'Agent 协作'
-      }
+    // P1-fix: 交付报告不再被验收状态阻断：未验证 / 未通过也要让用户看到这次的成果，
+    // 验收状态在面板顶部标注，是否采纳由人判断（撤销能力按每个文件的数据完整性自行把关）
+    deliveryReport.value = {
+      changedFiles: allChangedFiles,
+      acceptanceState: overallState,
+      acceptanceChecks: allChecks,
+      unresolvedQuestions: nodes.filter((n: any) => n.status === 'failed').map((n: any) => `${n.title}: ${n.resultSummary || '执行失败'}`),
+      repairsUsed: 0,
+      nodeTitle: 'Agent 协作'
     }
+    deliveryReportVisible.value = true
   }
 }
 
@@ -1964,6 +2423,9 @@ async function sendMessage() {
 async function sendCourtMessage() {
   if (!courtInput.value.trim() || isSending.value || !session.value) return
 
+  // 追问同样需要工作目录授权（主进程内存态可能已丢）
+  await ensureWorkspaceAuthorized()
+
   // 解析@提及的大臣
   const mentionedIds = parseCourtMentions(courtInput.value)
   const allMinisters = debateStore.sortedMinisters
@@ -1983,6 +2445,10 @@ async function sendCourtMessage() {
     timestamp: Date.now(),
     status: 'completed'
   }
+  // 空白会话（从项目新建进入）：用首条圣谕作为议题标题
+  if (!session.value.topic || session.value.topic === '新会话') {
+    session.value.topic = courtInput.value.trim().slice(0, 30) || '新会话'
+  }
   debateStore.addSpeech(emperorSpeech, props.sessionId)
   courtInput.value = ''
   showCourtMentionPopup.value = false
@@ -1992,30 +2458,28 @@ async function sendCourtMessage() {
 
   // 被@的大臣回复
   isSending.value = true
-  // 重新打开已完成的朝议
-  if (session.value.status === 'completed') {
+  // 重新打开已完成的朝议；空白会话（idle）首条消息也进入运行态
+  if (session.value.status === 'completed' || session.value.status === 'idle') {
     session.value.status = 'running'
   }
 
   if (debateMode.value === 'agent') {
     // Agent 模式：丞相拆解 + Workers 执行 + 丞相汇总
     const chancellor = ministers.find(m => m.id === 'chancellor')
-    const workers = ministers.filter(m => m.id !== 'chancellor')
+    // 除丞相外的大臣作为执行者；若无可用执行者，则由丞相召集（亲自兼任执行者）
+    const execMinisters = ministers.filter(m => m.id !== 'chancellor')
+    const workers = execMinisters.length > 0 ? execMinisters : (chancellor ? [chancellor] : [])
 
     if (chancellor && workers.length > 0) {
       const agent = new CoordinatorAgent({
-        planMode: true,
-        autonomousMaxIterations: 10
+        planMode: true
       })
 
       // Phase 1: Plan Mode 审阅回调 — 弹出可视化编辑面板
       const onPlanReady = createPlanReviewCallback(workers)
 
-      // Approval Mode 回调
-      const onBeforeToolExecute = async (tc: ToolCall) => {
-        if (!isDangerousCommand(tc)) return true
-        return confirmDangerousCommand(tc)
-      }
+      // 命令免确认回调：所有工具调用直接放行
+      const onBeforeToolExecute = async () => true
 
       agent.onEvent((event) => {
         if (['worker-start', 'worker-done', 'node-completed', 'node-failed', 'tree-created', 'tree-completed', 'tree-failed', 'guardian-alert', 'synthesizing', 'complete'].includes(event.type)) {
@@ -2036,12 +2500,7 @@ async function sendCourtMessage() {
           debateId: session.value!.id,
           onPlanReady,
           onBeforeToolExecute,
-          saveSnapshot: (tree: any) => {
-            if (session.value) {
-              session.value.taskTreeSnapshot = tree
-              debateStore.saveTaskTreeSnapshot(session.value.id, tree)
-            }
-          },
+          saveSnapshot: (tree: any) => applyTreeSnapshot(tree),
           onRetryNode: async (_nodeId: string, reason: string) => {
             try {
               await ElMessageBox.confirm(
@@ -2319,8 +2778,8 @@ function renderMarkdown(content: string): string {
               <span v-if="getMinisterModel(speech.ministerId)" class="minister-model">{{ getMinisterModel(speech.ministerId) }}</span>
               <el-tag v-if="speech.ministerId === 'emperor'" type="warning" size="small" effect="dark">圣谕</el-tag>
               <el-tag v-if="speech.status === 'streaming'" type="warning" size="small" effect="plain" class="status-tag">
-                <span class="typing-dots"><span></span><span></span><span></span></span>
-                进言中
+                {{ isWorkerExecutionSpeech(speech) ? '执行中' : '进言中' }}
+                <span class="typing-dots typing-dots-trailing"><span></span><span></span><span></span></span>
               </el-tag>
               <el-tag v-else-if="speech.status === 'error'" type="danger" size="small" effect="plain" class="status-tag">
                 错误
@@ -2328,8 +2787,122 @@ function renderMarkdown(content: string): string {
             </div>
 
             <div class="message-body" :style="{ fontSize: messageFontSize + 'px' }">
+              <!-- Agent worker 执行过程：扁平步骤列表（图标 + 动作名 + 一句话摘要），点击行展开详情 -->
+              <div v-if="isWorkerExecutionSpeech(speech)" class="exec-flow">
+                <div class="exec-flow-head">
+                  <button
+                    class="exec-flow-fold"
+                    :title="isExecBlockCollapsed(speech) ? '展开执行过程' : '折叠执行过程'"
+                    @click="toggleExecBlock(speech)"
+                  >
+                    <el-icon class="exec-flow-chev" :class="{ 'is-folded': isExecBlockCollapsed(speech) }"><ArrowDown /></el-icon>
+                  </button>
+                  <span class="exec-flow-title" :class="`exec-flow-title-${speech.status}`">
+                    {{ execHeaderLabel(speech) }}<template v-if="execElapsedText(speech)"> · {{ execElapsedText(speech) }}</template>
+                  </span>
+                  <span class="exec-flow-link" @click="openExecDetail(speech.id)">查看详情 ›</span>
+                </div>
+
+                <div v-if="!isExecBlockCollapsed(speech)" class="exec-flow-rows" v-auto-scroll-bottom>
+                  <div v-for="seg in execHistorySegs(speech)" :key="seg.id" class="exec-row">
+                    <div class="exec-row-line" @click="toggleExecSeg(seg.id)">
+                      <span class="exec-row-icon">
+                        <el-icon v-if="execRowState(seg, speech) === 'ok'" class="exec-ico-ok"><CircleCheck /></el-icon>
+                        <el-icon v-else-if="execRowState(seg, speech) === 'run'" class="exec-ico-run is-loading"><Loading /></el-icon>
+                        <el-icon v-else class="exec-ico-fail"><CircleClose /></el-icon>
+                      </span>
+                      <span class="exec-row-label">{{ execRowLabel(seg, speech) }}</span>
+                      <span v-if="execRowStateText(seg, speech)" class="exec-row-state">{{ execRowStateText(seg, speech) }}</span>
+                      <template v-if="execRowPreview(seg)">
+                        <span class="exec-row-dot">·</span>
+                        <span class="exec-row-preview" :class="{ 'is-code': seg.type === 'tool' }" :title="execRowPreview(seg)">{{ execRowPreview(seg) }}</span>
+                      </template>
+                    </div>
+
+                    <div v-if="expandedExecSegs.has(seg.id)" class="exec-row-detail">
+                      <pre v-if="seg.type === 'think'" class="exec-think-text">{{ seg.text || '（本轮无思考文本输出）' }}</pre>
+                      <template v-else>
+                        <div class="exec-tool-section">
+                          <div class="exec-tool-section-title">命令 / 参数</div>
+                          <pre class="exec-tool-input">{{ formatToolInput(seg) }}</pre>
+                        </div>
+                        <div class="exec-tool-section">
+                          <div class="exec-tool-section-title">
+                            返回内容
+                            <span v-if="seg.status === 'executing'" class="exec-tool-running">（执行中…）</span>
+                            <span v-else-if="seg.status !== 'completed'" class="exec-tool-failed">（失败）</span>
+                          </div>
+                          <pre class="exec-tool-output">{{ seg.output || (seg.status === 'executing' ? '…' : '（无输出）') }}</pre>
+                        </div>
+                        <div v-if="seg.diffData" class="exec-tool-section">
+                          <div class="exec-tool-section-title">
+                            文件变更
+                            <span v-if="seg.diffData.isNew" class="diff-badge diff-new">+新文件</span>
+                            <span v-else class="diff-badge diff-modified">
+                              <span class="diff-added">+{{ getDiffStats(seg.diffData.oldContent, seg.diffData.newContent).added }}</span>
+                              <span class="diff-removed">-{{ getDiffStats(seg.diffData.oldContent, seg.diffData.newContent).removed }}</span>
+                            </span>
+                          </div>
+                          <div class="diff-file-path">{{ seg.diffData.filePath }}</div>
+                          <div v-if="seg.diffData.isNew" class="diff-new-file">
+                            <pre class="diff-content diff-all-added">{{ seg.diffData.newContent }}</pre>
+                          </div>
+                          <div v-else class="diff-changes">
+                            <div
+                              v-for="(line, idx) in computeSimpleDiff(seg.diffData.oldContent, seg.diffData.newContent)"
+                              :key="idx"
+                              class="diff-line"
+                              :class="`diff-line-${line.type}`"
+                            >
+                              <span class="diff-line-marker">{{ line.type === 'added' ? '+' : line.type === 'removed' ? '-' : ' ' }}</span>
+                              <span class="diff-line-num" v-if="line.lineNum">{{ line.lineNum }}</span>
+                              <span class="diff-line-text">{{ line.line }}</span>
+                            </div>
+                          </div>
+                        </div>
+                      </template>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 当前正在执行的一步：常驻在滚动列表之外，不折叠也不随步骤滚动，点击看右侧详情 -->
+                <div
+                  v-for="liveSeg in execLiveSegs(speech)"
+                  :key="liveSeg.id"
+                  class="exec-flow-live"
+                  title="查看执行详情"
+                  @click="openExecDetail(speech.id)"
+                >
+                  <span class="exec-row-icon">
+                    <el-icon class="exec-ico-run is-loading"><Loading /></el-icon>
+                  </span>
+                  <span class="exec-row-label">{{ execRowLabel(liveSeg, speech) }}</span>
+                  <span v-if="execRowStateText(liveSeg, speech)" class="exec-row-state">{{ execRowStateText(liveSeg, speech) }}</span>
+                  <template v-if="execRowPreview(liveSeg)">
+                    <span class="exec-row-dot">·</span>
+                    <span class="exec-row-preview" :class="{ 'is-code': liveSeg.type === 'tool' }" :title="execRowPreview(liveSeg)">{{ execRowPreview(liveSeg) }}</span>
+                  </template>
+                </div>
+
+                <!-- 执行结果正文：完成后常驻展示一行摘要（不随步骤列表折叠），点击展开完整正文 -->
+                <div v-if="speech.content && speech.status !== 'streaming'" class="exec-flow-result">
+                  <div class="exec-row-line" @click="toggleExecSeg(speech.id + '-result')">
+                    <el-icon v-if="speech.status === 'error'" class="exec-ico-fail"><CircleClose /></el-icon>
+                    <el-icon v-else class="exec-ico-ok"><CircleCheck /></el-icon>
+                    <span class="exec-row-label">{{ speech.status === 'error' ? '错误详情' : '执行结果' }}</span>
+                    <span class="exec-row-dot">·</span>
+                    <span class="exec-row-preview" :title="resultPreview(speech)">{{ resultPreview(speech) }}</span>
+                  </div>
+                  <div v-if="expandedExecSegs.has(speech.id + '-result')" class="exec-row-detail">
+                    <!-- 报错正文按纯文本展示：走 markdown 渲染会被 sanitize-markdown 当作非法标签整棵删掉，详情就“看不见”了 -->
+                    <pre v-if="speech.status === 'error'" class="exec-error-text">{{ speech.content }}</pre>
+                    <div v-else class="message-text markdown-body" v-html="renderMarkdown(speech.content)"></div>
+                  </div>
+                </div>
+              </div>
+
               <!-- 工具调用状态展示 -->
-              <div v-if="speech.toolStatuses && speech.toolStatuses.length > 0" class="tool-calls-section">
+              <div v-if="!isWorkerExecutionSpeech(speech) && speech.toolStatuses && speech.toolStatuses.length > 0" class="tool-calls-section">
                 <div
                   v-for="tc in isToolCallsExpanded(speech.id, speech.toolStatuses.length) ? speech.toolStatuses : speech.toolStatuses.slice(0, TOOL_CALL_VISIBLE_COUNT)"
                   :key="tc.toolCallId"
@@ -2384,11 +2957,36 @@ function renderMarkdown(content: string): string {
                 </div>
               </div>
 
-              <div class="message-text markdown-body" v-html="renderMarkdown(speech.content)"></div>
+              <pre
+                v-if="!isWorkerExecutionSpeech(speech) && speech.status === 'error'"
+                class="message-text exec-error-text"
+              >{{ speech.content }}</pre>
+              <div
+                v-else-if="!isWorkerExecutionSpeech(speech)"
+                class="message-text markdown-body"
+                :class="{ 'emperor-collapsed': shouldCollapseEmperor(speech) && !isEmperorExpanded(speech.id) }"
+                v-html="renderMarkdown(speech.content)"
+              ></div>
+              <div
+                v-if="shouldCollapseEmperor(speech)"
+                class="emperor-collapse-toggle"
+                @click="toggleEmperorExpand(speech.id)"
+              >
+                {{ isEmperorExpanded(speech.id) ? '收起 ▲' : '展开全文 ▼' }}
+              </div>
+            </div>
+
+            <!-- Phase 1: Plan Mode 审阅 — 确定/取消内联在丞相拆解发言气泡底部 -->
+            <div v-if="isPendingPlanSpeech(speech)" class="plan-review-inline">
+              <span class="plan-review-hint">📋 是否批准按以上拆解执行？</span>
+              <div class="plan-review-actions">
+                <el-button size="small" @click="handlePlanCancel">取消</el-button>
+                <el-button size="small" type="primary" @click="approveCurrentPlan">✅ 确定执行</el-button>
+              </div>
             </div>
 
             <!-- 消息操作栏（底部） -->
-            <div v-if="speech.status === 'completed'" class="message-actions">
+            <div v-if="speech.status === 'completed' && !isWorkerExecutionSpeech(speech)" class="message-actions">
               <span
                 v-if="session.speeches.indexOf(speech) > 0"
                 class="speech-fork-btn"
@@ -2470,9 +3068,9 @@ function renderMarkdown(content: string): string {
       </template>
     </el-dialog>
 
-    <!-- Sprint A - #1：决策质量报告（四象限） -->
+    <!-- Sprint A - #1：决策质量报告（四象限）（暂时停用，见 enableDecisionReport） -->
     <div
-      v-if="session.mode === 'court' && session.status === 'completed'"
+      v-if="enableDecisionReport && session.mode === 'court' && session.status === 'completed'"
       class="decision-report-wrapper"
     >
       <div v-if="!session.decisionReport" class="decision-report-loading">
@@ -2480,12 +3078,13 @@ function renderMarkdown(content: string): string {
         <span>丞相正在整理决策报告（共识 / 分歧 / 风险 / 假设）…</span>
       </div>
       <div v-else class="decision-report">
-        <header class="decision-report-header">
-          <h3 class="decision-report-title">📜 决策报告</h3>
+        <header class="decision-report-header" @click="decisionReportExpanded = !decisionReportExpanded">
+          <h3 class="decision-report-title">📜 决策报告 <span class="decision-report-caret">{{ decisionReportExpanded ? '▾ 收起' : '▸ 展开' }}</span></h3>
           <span class="decision-report-time">
             {{ new Date(session.decisionReport.generatedAt).toLocaleTimeString('zh-CN') }}
           </span>
         </header>
+        <div v-show="decisionReportExpanded" class="decision-report-body">
         <p v-if="session.decisionReport.verdict" class="decision-report-verdict">
           <strong>🎯 决策结论：</strong>{{ session.decisionReport.verdict }}
         </p>
@@ -2543,33 +3142,136 @@ function renderMarkdown(content: string): string {
             <li v-for="(step, i) in session.decisionReport.nextSteps" :key="i">{{ step }}</li>
           </ol>
         </section>
+        </div>
       </div>
     </div>
 
-    <!-- Phase 1: Plan Mode 审阅面板 -->
-    <div v-if="planReviewData" class="plan-review-container">
-      <PlanReviewPanel
-        :plan="planReviewData.plan"
-        :workers="planReviewData.workers"
-        @approve="handlePlanApprove"
-        @cancel="handlePlanCancel"
-      />
-    </div>
-
-    <!-- P1-B: 交付审阅面板 -->
+    <!-- P1-B: 交付审阅面板（报告随会话持久化，可通过输入框上方的入口反复展开） -->
     <div
-      v-if="deliveryReport && session?.status === 'completed' && deliveryReport.changedFiles.length + deliveryReport.acceptanceChecks.length > 0"
+      v-if="deliveryReportVisible && deliveryReport && deliveryReport.changedFiles.length + deliveryReport.acceptanceChecks.length > 0"
       class="delivery-panel-wrapper"
     >
       <DeliveryPanel
         :report="deliveryReport"
-        @confirm="deliveryReport = null"
+        @confirm="handleDeliveryConfirm"
         @revert="handleDeliveryRevert"
       />
     </div>
 
+    <!-- Agent worker 执行详情抽屉（右侧）：实时内容 + 工具调用 + diff -->
+    <el-drawer
+      v-model="execDetailVisible"
+      :with-header="false"
+      direction="rtl"
+      size="min(520px, 92vw)"
+      class="exec-detail-drawer"
+    >
+      <div v-if="activeDetailSpeech" class="exec-detail-inner">
+        <header class="exec-detail-header">
+          <div class="exec-detail-identity">
+            <div class="avatar-content exec-detail-avatar">
+              <img v-if="isImageAvatar(getMinisterAvatar(activeDetailSpeech.ministerId))" :src="getMinisterAvatar(activeDetailSpeech.ministerId)" class="avatar-img" />
+              <span v-else>{{ getMinisterAvatar(activeDetailSpeech.ministerId) }}</span>
+            </div>
+            <div class="exec-detail-titlenote">
+              <div class="exec-detail-name">{{ getMinisterName(activeDetailSpeech.ministerId) }}</div>
+              <div class="exec-detail-sub">
+                {{ getMinisterTitle(activeDetailSpeech.ministerId) }}
+                <span v-if="getMinisterModel(activeDetailSpeech.ministerId)"> · {{ getMinisterModel(activeDetailSpeech.ministerId) }}</span>
+              </div>
+            </div>
+          </div>
+          <div class="exec-detail-headright">
+            <el-tag v-if="activeDetailSpeech.status === 'streaming'" type="warning" size="small" effect="plain">
+              执行中<span class="typing-dots typing-dots-trailing"><span></span><span></span><span></span></span>
+            </el-tag>
+            <el-tag v-else-if="activeDetailSpeech.status === 'error'" type="danger" size="small" effect="plain">失败</el-tag>
+            <el-tag v-else type="success" size="small" effect="plain">已完成</el-tag>
+            <el-button text size="small" @click="execDetailVisible = false">✕ 关闭</el-button>
+          </div>
+        </header>
+
+        <div class="exec-detail-body">
+          <!-- 工具调用完整列表 -->
+          <section v-if="activeDetailSpeech.toolStatuses && activeDetailSpeech.toolStatuses.length > 0" class="exec-detail-section">
+            <h4 class="exec-detail-section-title">🔧 执行步骤（{{ activeDetailSpeech.toolStatuses.length }}）</h4>
+            <div
+              v-for="tc in activeDetailSpeech.toolStatuses"
+              :key="tc.toolCallId"
+              class="tool-call-item"
+              :class="`tool-call-${tc.status}`"
+            >
+              <span class="tool-call-icon">
+                <span v-if="tc.status === 'calling' || tc.status === 'executing'" class="typing-dots"><span></span><span></span><span></span></span>
+                <span v-else-if="tc.status === 'completed'">✅</span>
+                <span v-else>❌</span>
+              </span>
+              <span class="tool-call-name">{{ tc.displayName }}</span>
+              <span v-if="tc.summary" class="tool-call-summary">{{ tc.summary }}</span>
+              <span
+                v-if="tc.diffData"
+                class="tool-diff-toggle"
+                @click.stop="toggleDiffExpand(tc.toolCallId)"
+              >
+                <span v-if="tc.diffData.isNew" class="diff-badge diff-new">+新文件</span>
+                <span v-else class="diff-badge diff-modified">
+                  <span class="diff-added">+{{ getDiffStats(tc.diffData.oldContent, tc.diffData.newContent).added }}</span>
+                  <span class="diff-removed">-{{ getDiffStats(tc.diffData.oldContent, tc.diffData.newContent).removed }}</span>
+                </span>
+              </span>
+              <div v-if="tc.diffData && expandedDiffs.has(tc.toolCallId)" class="tool-diff-panel" @click.stop>
+                <div class="diff-file-path">{{ tc.diffData.filePath }}</div>
+                <div v-if="tc.diffData.isNew" class="diff-new-file">
+                  <pre class="diff-content diff-all-added">{{ tc.diffData.newContent }}</pre>
+                </div>
+                <div v-else class="diff-changes">
+                  <div
+                    v-for="(line, idx) in computeSimpleDiff(tc.diffData.oldContent, tc.diffData.newContent)"
+                    :key="idx"
+                    class="diff-line"
+                    :class="`diff-line-${line.type}`"
+                  >
+                    <span class="diff-line-marker">{{ line.type === 'added' ? '+' : line.type === 'removed' ? '-' : ' ' }}</span>
+                    <span class="diff-line-num" v-if="line.lineNum">{{ line.lineNum }}</span>
+                    <span class="diff-line-text">{{ line.line }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- 实时输出内容 -->
+          <section class="exec-detail-section">
+            <h4 class="exec-detail-section-title">📄 执行输出</h4>
+            <pre
+              v-if="activeDetailSpeech.content && activeDetailSpeech.status === 'error'"
+              class="exec-error-text"
+            >{{ activeDetailSpeech.content }}</pre>
+            <div
+              v-else-if="activeDetailSpeech.content"
+              class="message-text markdown-body"
+              v-html="renderMarkdown(activeDetailSpeech.content)"
+            ></div>
+            <p v-else class="exec-detail-empty">（暂无输出内容）</p>
+          </section>
+        </div>
+      </div>
+    </el-drawer>
+
     <!-- 底部 -->
     <footer class="session-footer">
+      <!-- 交付成果常驻入口：报告随会话持久化，确认交付或切换标签页后仍能重新查看 -->
+      <div v-if="deliveryReport" class="delivery-entry">
+        <span class="delivery-entry-icon">📦</span>
+        <span class="delivery-entry-text">
+          交付成果：{{ deliveryReport.changedFiles.length }} 个文件变更
+          <span class="delivery-entry-state" :class="`delivery-entry-${deliveryReport.acceptanceState}`">{{ deliveryStateLabel }}</span>
+          <span v-if="session?.deliveryConfirmedAt" class="delivery-entry-confirmed">已确认交付</span>
+        </span>
+        <button class="delivery-entry-btn" @click="deliveryReportVisible = !deliveryReportVisible">
+          {{ deliveryReportVisible ? '收起 ▾' : '查看 ▴' }}
+        </button>
+      </div>
       <!-- 召见模式 - 聊天输入 -->
       <div v-if="isPrivate" class="chat-input">
         <div
@@ -2620,14 +3322,6 @@ function renderMarkdown(content: string): string {
               <el-button size="small" circle :loading="attachingSessionFile" @click="addSessionAttachment" class="toolbar-icon-btn">
                 <template v-if="!attachingSessionFile">📎</template>
               </el-button>
-            </el-tooltip>
-            <el-badge :value="session?.attachments?.length || 0" :hidden="!session?.attachments?.length" type="primary">
-              <el-tooltip content="附件列表" placement="top">
-                <el-button size="small" circle @click="emit('open-attachment-panel')" class="toolbar-icon-btn">📂</el-button>
-              </el-tooltip>
-            </el-badge>
-            <el-tooltip content="关联任务" placement="top">
-              <el-button size="small" circle @click="emit('open-task-panel')" class="toolbar-icon-btn">📋</el-button>
             </el-tooltip>
             <el-tooltip content="搜索 (Ctrl+F)" placement="top">
               <el-button size="small" circle @click="toggleSearch" class="toolbar-icon-btn" :class="{ 'search-active': showSearch }">🔍</el-button>
@@ -2725,14 +3419,6 @@ function renderMarkdown(content: string): string {
                 <template v-if="!attachingSessionFile">📎</template>
               </el-button>
             </el-tooltip>
-            <el-badge :value="session?.attachments?.length || 0" :hidden="!session?.attachments?.length" type="primary">
-              <el-tooltip content="附件列表" placement="top">
-                <el-button size="small" circle @click="emit('open-attachment-panel')" class="toolbar-icon-btn">📂</el-button>
-              </el-tooltip>
-            </el-badge>
-            <el-tooltip content="关联任务" placement="top">
-              <el-button size="small" circle @click="emit('open-task-panel')" class="toolbar-icon-btn">📋</el-button>
-            </el-tooltip>
             <el-tooltip content="搜索 (Ctrl+F)" placement="top">
               <el-button size="small" circle @click="toggleSearch" class="toolbar-icon-btn" :class="{ 'search-active': showSearch }">🔍</el-button>
             </el-tooltip>
@@ -2772,14 +3458,6 @@ function renderMarkdown(content: string): string {
             </el-tooltip>
           </div>
         </div>
-
-        <!-- 朝议进行中：停止按钮 -->
-        <div v-if="isDebating && !isPrivate" class="debate-stop-bar">
-          <el-button type="danger" plain size="small" @click="handleStopDebate">
-            ⏹ 停止朝议
-          </el-button>
-          <span class="debate-stop-hint">可随时拍板结束，已完成的发言将被保留</span>
-        </div>
       </div>
     </footer>
   </div>
@@ -2792,6 +3470,11 @@ function renderMarkdown(content: string): string {
   flex: 1;
   overflow: hidden;
   position: relative;
+  /* 头像列宽度（头像 48px + 间距 16px）：消息区与底部输入框共用的单一来源，
+     气泡左右各让出一列，输入框按同一口径限宽，两者边缘对齐 */
+  --avatar-col: 64px;
+  /* 气泡与输入框的最小宽度：面板拉到再窄也不再缩于此值，超出部分横向滚动 */
+  --bubble-min-w: 400px;
 }
 
 /* 轮次索引 */
@@ -3004,11 +3687,50 @@ function renderMarkdown(content: string): string {
 .session-messages {
   flex: 1;
   overflow-y: auto;
+  /* 窄面板下气泡不再被挤压，而是整列保持下限宽度，靠横向滚动看完 */
+  overflow-x: auto;
   padding: 24px;
 }
 
+/* 任务树可视化容器：不被长消息挤压，居中对齐、限宽 */
+.task-tree-container {
+  flex-shrink: 0;
+  padding: 0 24px 10px;
+  max-width: 1100px;
+  margin: 0 auto;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* Phase 1: Plan Mode 审阅确认条（内联在丞相拆解发言气泡底部）
+   - 只保留确定/取消，不再重复展示拆解内容 */
+.plan-review-inline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--ct-border);
+}
+
+.plan-review-hint {
+  font-size: 13px;
+  color: var(--ct-text-primary);
+}
+
+.plan-review-actions {
+  display: flex;
+  gap: 8px;
+}
+
 .messages-inner {
-  max-width: 900px;
+  /* 消息流容器限宽 80% 居中，气泡在容器内铺满 */
+  max-width: 80%;
+  /* 下限按“气泡最小宽 + 左右两个头像列”倒推：容器到这个宽度后不再收窄，
+     气泡可用宽度恰好是 var(--bubble-min-w)（max-width 为 100% 减去两列头像） */
+  min-width: calc(var(--bubble-min-w) + var(--avatar-col) * 2);
   margin: 0 auto;
   display: flex;
   flex-direction: column;
@@ -3049,7 +3771,9 @@ function renderMarkdown(content: string): string {
 }
 
 .message-content {
-  max-width: 80%;
+  /* 气泡向另一侧延伸到对方头像列之前为止：左右各让出一个头像列宽度，不压到对方头像 */
+  flex: 1;
+  max-width: calc(100% - var(--avatar-col) * 2);
   background: var(--ct-bg-secondary);
   border: 1px solid var(--ct-border);
   border-radius: 12px;
@@ -3145,10 +3869,15 @@ function renderMarkdown(content: string): string {
   color: #f59e0b;
 }
 
+/* 跳动省略号：限定容器高度并缩小跳动幅度，避免小尺寸 el-tag 内三点越出边框 */
 .typing-dots {
-  display: flex;
+  display: inline-flex;
+  align-items: center;
   gap: 3px;
+  height: 12px;
   margin-right: 4px;
+  flex-shrink: 0;
+  overflow: hidden;
 }
 
 .typing-dots span {
@@ -3162,9 +3891,12 @@ function renderMarkdown(content: string): string {
 .typing-dots span:nth-child(2) { animation-delay: 0.2s; }
 .typing-dots span:nth-child(3) { animation-delay: 0.4s; }
 
+/* 跟在文字后面（如“执行中…”）时改用左侧间距 */
+.typing-dots-trailing { margin-right: 0; margin-left: 4px; }
+
 @keyframes typing {
   0%, 60%, 100% { transform: translateY(0); }
-  30% { transform: translateY(-8px); }
+  30% { transform: translateY(-3px); }
 }
 
 .message-body {
@@ -3291,6 +4023,304 @@ function renderMarkdown(content: string): string {
   overflow-wrap: break-word;
 }
 
+/* 圣谕（自己发的内容）超长折叠：限高 + 底部渐隐，点击展开全文后解除 */
+.message-text.emperor-collapsed {
+  max-height: 96px;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 60%, transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 60%, transparent 100%);
+}
+
+.emperor-collapse-toggle {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--ct-accent);
+  cursor: pointer;
+  user-select: none;
+  text-align: right;
+  opacity: 0.85;
+}
+
+.emperor-collapse-toggle:hover {
+  opacity: 1;
+  text-decoration: underline;
+}
+
+/* ===== Agent 执行过程（扁平步骤列表） ===== */
+.exec-flow {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.exec-flow-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--ct-text-secondary);
+}
+
+.exec-flow-fold {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--ct-border);
+  border-radius: 5px;
+  background: var(--ct-bg-secondary);
+  color: var(--ct-text-muted);
+  cursor: pointer;
+}
+
+.exec-flow-fold:hover { background: var(--ct-bg-tertiary); }
+
+.exec-flow-chev { transition: transform 0.15s ease; }
+.exec-flow-chev.is-folded { transform: rotate(-90deg); }
+
+.exec-flow-title { font-weight: 600; }
+.exec-flow-title-streaming { color: var(--ct-text-primary); }
+.exec-flow-title-completed { color: #2e7d32; }
+.exec-flow-title-error { color: #ef4444; }
+
+.exec-flow-link {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--ct-accent);
+  cursor: pointer;
+  opacity: 0.85;
+}
+
+.exec-flow-link:hover { opacity: 1; }
+
+.exec-flow-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  /* 步骤过多时限高内部滚动，避免气泡被拉得过长看不清当前位置 */
+  max-height: 320px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 4px;
+}
+
+.exec-row-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 3px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 12.5px;
+}
+
+.exec-row-line:hover { background: var(--ct-bg-tertiary); }
+
+.exec-row-icon {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  font-size: 13px;
+}
+
+.exec-ico-ok { color: #2e7d32; }
+.exec-ico-run { color: var(--ct-text-muted); }
+.exec-ico-fail { color: #ef4444; }
+
+.exec-row-label {
+  flex-shrink: 0;
+  font-weight: 600;
+  color: var(--ct-text-primary);
+}
+
+.exec-row-state { flex-shrink: 0; color: var(--ct-text-secondary); }
+.exec-row-dot { flex-shrink: 0; color: var(--ct-text-muted); }
+
+.exec-row-preview {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ct-text-muted);
+}
+
+.exec-row-preview.is-code {
+  font-family: ui-monospace, Consolas, 'Courier New', monospace;
+  font-size: 11.5px;
+}
+
+.exec-row-detail {
+  margin: 2px 0 6px 26px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--ct-border);
+  border-radius: 0 6px 6px 0;
+  background: var(--ct-bg-secondary);
+}
+
+/* 当前正在执行的一步：常驻在滚动列表下方的独立区域，不折叠、不参与滚动 */
+.exec-flow-live {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  margin-top: 6px;
+  padding: 4px 6px;
+  border-top: 1px dashed var(--ct-border);
+  border-radius: 6px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 12.5px;
+}
+
+.exec-flow-live:hover { background: var(--ct-bg-tertiary); }
+
+.exec-flow-live .exec-row-label {
+  color: var(--ct-accent);
+}
+
+.exec-flow-result { margin-top: 2px; }
+
+.exec-think-text {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--ct-text-secondary);
+  font-family: inherit;
+}
+
+.exec-tool-section { margin-bottom: 8px; }
+.exec-tool-section:last-child { margin-bottom: 0; }
+
+/* 报错正文：不参与 markdown 渲染，原样可见并可滚动 */
+.exec-error-text {
+  display: block;
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--ct-bg-tertiary);
+  border: 1px solid var(--ct-border);
+  border-left: 2px solid #ef4444;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: #ef4444;
+  font-family: ui-monospace, Consolas, 'Courier New', monospace;
+  max-height: 300px;
+  overflow: auto;
+}
+
+.exec-tool-section-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ct-text-muted);
+}
+
+.exec-tool-running { color: var(--ct-accent); font-weight: 400; }
+.exec-tool-failed { color: #ef4444; font-weight: 400; }
+
+.exec-tool-input,
+.exec-tool-output {
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--ct-bg-tertiary);
+  border: 1px solid var(--ct-border);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--ct-text-primary);
+  max-height: 260px;
+  overflow: auto;
+}
+
+.exec-tool-output { color: var(--ct-text-secondary); }
+
+/* ===== 右侧执行详情抽屉内容 ===== */
+.exec-detail-inner {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.exec-detail-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 12px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--ct-border);
+}
+
+.exec-detail-identity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.exec-detail-avatar {
+  width: 40px;
+  height: 40px;
+  font-size: 22px;
+  flex-shrink: 0;
+}
+
+.exec-detail-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ct-text-primary);
+}
+
+.exec-detail-sub {
+  font-size: 12px;
+  color: var(--ct-text-muted);
+}
+
+.exec-detail-headright {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.exec-detail-body {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.exec-detail-section {
+  margin-bottom: 18px;
+}
+
+.exec-detail-section-title {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ct-accent);
+}
+
+.exec-detail-empty {
+  font-size: 13px;
+  color: var(--ct-text-muted);
+  font-style: italic;
+  margin: 0;
+}
+
 /* Tool Calls Section */
 .tool-calls-section {
   margin-bottom: 12px;
@@ -3380,6 +4410,8 @@ function renderMarkdown(content: string): string {
   background: var(--ct-bg-secondary);
   border-top: 1px solid var(--ct-border);
   padding: 8px 24px;
+  /* 输入框有最小宽度下限，窄面板下靠横向滚动而不是被外层 overflow:hidden 裁掉 */
+  overflow-x: auto;
 }
 
 /* 拍板/退朝 操作栏 */
@@ -3429,21 +4461,75 @@ function renderMarkdown(content: string): string {
   text-align: right;
 }
 
-/* 停止朝议按钮 */
-.debate-stop-bar {
+.chat-input {
+  /* 与气泡同宽：消息流限宽 80% 后再让出左右两个头像列；
+     .session-messages 与 .session-footer 左右内边距同为 24px，宽度基准一致 */
+  max-width: calc(80% - var(--avatar-col) * 2);
+  min-width: var(--bubble-min-w);
+  margin: 0 auto;
+}
+
+/* 交付成果入口条：与输入框同宽同轴，有报告时常驻在输入框上方 */
+.delivery-entry {
+  max-width: calc(80% - var(--avatar-col) * 2);
+  min-width: var(--bubble-min-w);
+  margin: 0 auto 6px;
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin-top: 6px;
-  padding-top: 4px;
-}
-
-.debate-stop-hint {
+  gap: 8px;
+  padding: 4px 10px;
+  border: 1px solid var(--ct-border);
+  border-radius: 10px;
+  background: var(--ct-bg);
   font-size: 12px;
-  color: var(--ct-text-muted);
+  color: var(--ct-text-secondary);
 }
 
-.chat-input { max-width: 900px; margin: 0 auto; }
+.delivery-entry-icon {
+  flex-shrink: 0;
+}
+
+.delivery-entry-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.delivery-entry-state {
+  padding: 0 6px;
+  border-radius: 8px;
+  font-size: 11px;
+  border: 1px solid var(--ct-border);
+}
+
+.delivery-entry-passed { color: #10b981; border-color: rgba(16, 185, 129, 0.4); }
+.delivery-entry-failed { color: #ef4444; border-color: rgba(239, 68, 68, 0.4); }
+.delivery-entry-unverified { color: #f59e0b; border-color: rgba(245, 158, 11, 0.4); }
+
+.delivery-entry-confirmed {
+  color: var(--ct-text-muted);
+  font-size: 11px;
+}
+
+.delivery-entry-btn {
+  flex-shrink: 0;
+  padding: 1px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--ct-accent);
+  background: transparent;
+  color: var(--ct-accent);
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.delivery-entry-btn:hover {
+  background: var(--ct-accent);
+  color: #fff;
+}
 
 .chat-input-container {
   display: flex;
@@ -3634,9 +4720,14 @@ function renderMarkdown(content: string): string {
 }
 
 @media (max-width: 768px) {
-  .message-item { gap: 12px; }
+  .session-container {
+    /* 头像 40px + 间距 12px，气泡与输入框同步收窄 */
+    --avatar-col: 52px;
+  }
+  .message-item {
+    gap: 12px;
+  }
   .avatar-content { width: 40px; height: 40px; font-size: 24px; }
-  .message-content { max-width: 85%; }
 }
 
 /* Diff 预览样式 */
@@ -3756,6 +4847,7 @@ function renderMarkdown(content: string): string {
 
 /* Sprint A - #1：决策报告（四象限） */
 .decision-report-wrapper {
+  flex-shrink: 0;
   padding: 0 24px 12px;
   max-width: 1100px;
   margin: 0 auto;
@@ -3789,6 +4881,20 @@ function renderMarkdown(content: string): string {
   border-bottom: 1px solid var(--ct-border);
   padding-bottom: 10px;
   margin-bottom: 12px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.decision-report-body {
+  max-height: 42vh;
+  overflow-y: auto;
+}
+
+.decision-report-caret {
+  margin-left: 6px;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--ct-text-muted);
 }
 
 .decision-report-title {

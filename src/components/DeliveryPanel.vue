@@ -14,6 +14,9 @@
         </div>
       </header>
 
+      <!-- 验收未通过 / 未验证时的提示：不再隐藏成果，但要把风险说在前头 -->
+      <div v-if="gateNote" class="delivery-gate-note">{{ gateNote }}</div>
+
       <!-- 1. 文件变更列表 -->
       <section class="delivery-section">
         <h4 class="delivery-section-title" @click="filesExpanded = !filesExpanded">
@@ -97,8 +100,12 @@
 
       <!-- 4. 操作按钮 -->
       <footer class="delivery-actions">
-        <el-button type="primary" size="small" @click="handleConfirm">
-          ✅ 确认交付
+        <el-button
+          :type="report.acceptanceState === 'passed' ? 'primary' : 'warning'"
+          size="small"
+          @click="handleConfirm"
+        >
+          {{ report.acceptanceState === 'passed' ? '✅ 确认交付' : '⚠️ 仍要采纳' }}
         </el-button>
         <el-button
           v-if="canRevert"
@@ -148,6 +155,18 @@ const acceptanceIcon = computed(() => {
     case 'failed': return '❌'
     case 'unverified': return '⚠️'
     default: return '⏳'
+  }
+})
+
+// 验收未把关时的提示文案（passed 时为空，不渲染提示条）
+const gateNote = computed(() => {
+  switch (props.report.acceptanceState) {
+    case 'failed':
+      return '❌ 验收检查未通过：下面的文件变更仍然完整列出，便于逐个查看与撤销；建议先修复失败项再采纳。'
+    case 'unverified':
+      return '⚠️ 未配置可用的自动检查（或当前环境无法探测），本次改动尚未经工具验证；成果清单照常展示，请自行确认后再采纳。'
+    default:
+      return ''
   }
 })
 
@@ -252,6 +271,22 @@ function computeDiffLines(file: FileChange): DiffLine[] {
 }
 
 async function handleConfirm() {
+  // 验收未通过/未验证时不直接采纳：再确认一次，但不再把成果隐藏起来
+  if (props.report.acceptanceState !== 'passed') {
+    try {
+      await ElMessageBox.confirm(
+        `当前验收状态为「${stateLabel(props.report.acceptanceState)}」，确定仍要采纳这批改动吗？`,
+        '⚠️ 采纳确认',
+        {
+          confirmButtonText: '仍要采纳',
+          cancelButtonText: '再看看',
+          type: 'warning'
+        }
+      )
+    } catch {
+      return
+    }
+  }
   emit('confirm')
   ElMessage.success('已确认交付')
 }
@@ -292,6 +327,18 @@ async function handleRevert() {
   border-radius: 12px;
   padding: 18px;
   background: var(--ct-bg-secondary);
+}
+
+/* 验收未把关时的提示条 */
+.delivery-gate-note {
+  margin: -2px 0 12px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  background: rgba(245, 158, 11, 0.08);
+  color: var(--ct-text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .delivery-header {

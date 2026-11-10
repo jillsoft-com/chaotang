@@ -21,6 +21,7 @@ import { estimateTokens, estimateCost, formatCost, formatTokens, formatDuration 
 import type { Debate } from '@/types'
 import { gepaEngine } from '@/services/learning'
 import type { GEPAExport } from '@/services/learning/gepa-export'
+import { DEFAULT_MAX_TOOL_ROUNDS } from '@/services/agent/round-budget'
 
 const router = useRouter()
 const debateStore = useDebateStore()
@@ -97,7 +98,7 @@ const enableErrorAttribution = ref(true)
 const enableReportCheck = ref(true)
 
 // 工具调用最大轮次
-const maxToolRounds = ref(30)
+const maxToolRounds = ref(DEFAULT_MAX_TOOL_ROUNDS)
 
 // 上下文压缩阈值（字符数）
 const contextCompressThreshold = ref(50000)
@@ -371,7 +372,7 @@ function loadMaxToolRounds() {
   const saved = appStorage.getItem('max_tool_rounds')
   if (saved) {
     const val = parseInt(saved, 10)
-    if (val > 0 && val <= 100) maxToolRounds.value = val
+    if (val > 0 && val <= DEFAULT_MAX_TOOL_ROUNDS) maxToolRounds.value = val
   }
 }
 
@@ -1155,14 +1156,14 @@ async function exportGEPAData() {
               <div class="settings-item">
                 <div class="settings-item-info">
                   <span class="settings-item-label">最大工具调用轮次</span>
-                  <span class="settings-item-desc">大臣使用工具的最大回合数，超出后要求总结（默认 30）</span>
+                  <span class="settings-item-desc">大臣与 Agent 每轮任务的工具调用轮次上限（默认 500）。额度只作兜底，触顶后仅告警、不再中断执行</span>
                 </div>
                 <div class="max-rounds-control">
                   <el-input-number
                     v-model="maxToolRounds"
                     :min="1"
-                    :max="100"
-                    :step="1"
+                    :max="DEFAULT_MAX_TOOL_ROUNDS"
+                    :step="10"
                     size="small"
                     @change="saveMaxToolRounds"
                   />
