@@ -15,6 +15,7 @@ import type { ChatMessage, ToolCall, ToolCallResult, ToolDefinition } from '@/ty
 import type { LLMProvider } from '@/services/llm/types'
 import { toolExecutor } from '@/services/tools/executor'
 import type { CommandExecutor } from './acceptance-gate'
+import { pushToolResultMessage, attachRoundImages } from './vision-bridge'
 
 // ============ 类型 ============
 
@@ -649,6 +650,7 @@ ${changedFiles.join('\n')}
         tool_calls: pendingToolCalls
       })
 
+      const roundImages: string[] = []
       for (const tc of pendingToolCalls) {
         // 中止信号检查
         if (abortSignal?.aborted) break
@@ -739,13 +741,11 @@ ${changedFiles.join('\n')}
           } catch { /* 解析失败忽略 */ }
         }
 
-        messages.push({
-          role: 'tool',
-          content: typeof result.result === 'string' ? result.result : JSON.stringify(result.result, null, 2),
-          tool_call_id: tc.id,
-          name: tc.function.name
-        })
+        const imageUrl = pushToolResultMessage(messages, result, tc.id, tc.function.name, provider.visionCapable === true)
+        if (imageUrl) roundImages.push(imageUrl)
       }
+
+      attachRoundImages(messages, roundImages)
     }
 
     return { toolCalls, fileBaselines: Object.keys(fileBaselines).length > 0 ? fileBaselines : undefined }

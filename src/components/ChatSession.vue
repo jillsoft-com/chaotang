@@ -10,7 +10,7 @@ import { ElMessageBox, ElMessage } from 'element-plus'
 import { renderSafeMarkdown } from '@/utils/sanitize-markdown'
 import { estimateTokens } from '@/utils/token-utils'
 import { exportDebateToMarkdown } from '@/utils/export-markdown'
-import type { Speech, LLMConfig, ToolCall, Attachment, ExecSegment } from '@/types'
+import type { Speech, LLMConfig, ToolCall, Attachment, ExecSegment, ChatMessage } from '@/types'
 import { CoordinatorAgent } from '@/services/agent'
 import { taskScheduler } from '@/services/agent'
 import { compressContext, getCompressThreshold, countMessageChars } from '@/services/agent/context-compressor'
@@ -25,6 +25,7 @@ import { buildDeliveryReport } from '@/services/agent/delivery-report'
 import type { DeliveryReport, FileChange } from '@/services/agent/delivery-report'
 import { writeTaskDoc } from '@/services/agent/task-doc'
 import { getMaxToolRounds } from '@/services/agent/round-budget'
+import { pushToolResultMessage, attachRoundImages, visionPromptHint } from '@/services/agent/vision-bridge'
 import DeliveryPanel from '@/components/DeliveryPanel.vue'
 
 // ============ 命令免确认策略 ============
@@ -455,6 +456,28 @@ function getAttachmentContext(): string {
     hint += `\n（另有 ${imageCount} 张图片附件，如你的模型支持多模态视觉分析，请参考图片内容。）`
   }
   return hint
+}
+
+/** 图片附件的 data URL 列表（支持视觉的模型直接看图，最多 3 张） */
+function getAttachmentImages(): string[] {
+  const attachments = session.value?.attachments
+  if (!attachments || attachments.length === 0) return []
+  return attachments
+    .filter(a => a.content && a.content.startsWith('data:image'))
+    .slice(0, 3)
+    .map(a => a.content as string)
+}
+
+/**
+ * 把图片附件挂到首条用户消息上（仅当模型开启视觉）。
+ * 非视觉模型保持原样：附件只以 [图片附件: xxx] 占位文本体现。
+ */
+function attachUserImages(messages: ChatMessage[], visionCapable: boolean): void {
+  if (!visionCapable || messages.length < 2) return
+  const images = getAttachmentImages()
+  if (images.length === 0) return
+  messages[1].images = images
+  messages[1].content = `${messages[1].content}\n\n（本条消息附有 ${images.length} 张用户提供的图片，请直接观察图片内容作答。）`
 }
 
 function formatAttSize(bytes: number): string {
@@ -1363,7 +1386,7 @@ function resolveLLMConfig(ministerLLM: LLMConfig): LLMConfig {
   if (llmId) {
     const fullConfig = llmService.getById(llmId)
     if (fullConfig) {
-      return { provider: fullConfig.provider, model: fullConfig.model, apiKey: fullConfig.apiKey, baseURL: fullConfig.baseURL }
+      return { provider: fullConfig.provider, model: fullConfig.model, apiKey: fullConfig.apiKey, baseURL: fullConfig.baseURL, supportsVision: fullConfig.supportsVision }
     }
   }
   return ministerLLM
@@ -1561,10 +1584,11 @@ async function runMinisterTurn(params: {
 
   // 没有工作目录，走普通无工具对话
   if (!workingDir) {
-    const messages = [
-      { role: 'system' as const, content: systemPrompt },
-      { role: 'user' as const, content: userMessage }
+    const messages: ChatMessage[] = [
+      { role: 'system', content: systemPrompt + visionPromptHint(provider.visionCapable === true) },
+      { role: 'user', content: userMessage }
     ]
+    attachUserImages(messages, provider.visionCapable === true)
     await provider.chatStream(messages, onContent)
     return
   }
@@ -1629,10 +1653,11 @@ async function runMinisterTurn(params: {
   // 确保至少有基础文件工具
   const allToolDefs = combinedDefs.length > 0 ? combinedDefs : skillRegistry.getToolDefinitionsForMinister('chancellor')
 
-  const messages: Array<{ role: 'system' | 'user' | 'assistant' | 'tool'; content: string; tool_calls?: any; tool_call_id?: string; name?: string }> = [
-    { role: 'system', content: systemPrompt + dirHint + agentsMdHint + memoryHint + repoContextHint },
+  const messages: ChatMessage[] = [
+    { role: 'system', content: systemPrompt + dirHint + agentsMdHint + memoryHint + repoContextHint + visionPromptHint(provider.visionCapable === true) },
     { role: 'user', content: userMessage }
   ]
+  attachUserImages(messages, provider.visionCapable === true)
 
   // 工具调用轮次上限：取设置项（默认 500），触顶后只要求总结，不再因小额度截断任务
   const MAX_ROUNDS = getMaxToolRounds()
@@ -1670,6 +1695,7 @@ async function runMinisterTurn(params: {
 
     messages.push({ role: 'assistant', content: content || '', tool_calls: pendingToolCalls })
 
+    const roundImages: string[] = []
     for (const tc of pendingToolCalls) {
       // 相对路径解析
       if (tc.function.name === 'write_file' || tc.function.name === 'create_directory' ||
@@ -1798,13 +1824,13 @@ async function runMinisterTurn(params: {
         }
       }
 
-      messages.push({
-        role: 'tool',
-        content: typeof result.result === 'string' ? result.result : JSON.stringify(result.result, null, 2),
-        tool_call_id: tc.id,
-        name: tc.function.name
-      })
+      // 工具结果入栈（图像结果单独挂载，不把 base64 灌进 content）
+      const imageUrl = pushToolResultMessage(messages, result, tc.id, tc.function.name, provider.visionCapable === true)
+      if (imageUrl) roundImages.push(imageUrl)
     }
+
+    // 本轮截图统一作为一条带图 user 消息交给模型（须在全部 tool 应答之后）
+    attachRoundImages(messages, roundImages)
 
     // 上下文压缩：工具执行完后检查是否需要压缩
     if (round < MAX_ROUNDS - 1) {

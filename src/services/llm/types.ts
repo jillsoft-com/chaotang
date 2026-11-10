@@ -7,6 +7,8 @@ export interface LLMChatOptions {
 }
 
 export interface LLMProvider {
+  /** 该 provider 对应的模型是否开启视觉（图片识别）能力 */
+  readonly visionCapable?: boolean
   chat(messages: ChatMessage[], options?: LLMChatOptions): Promise<string | ReadableStream>
   chatStream(messages: ChatMessage[], onChunk: (text: string) => void, options?: LLMChatOptions): Promise<string>
   /** 带工具调用的流式对话：支持 tool_calls 回调 */

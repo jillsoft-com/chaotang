@@ -38,6 +38,7 @@ import { LintFixEngine } from './lint-fix-loop'
 import type { LintFixResult } from './lint-fix-loop'
 import type { SubAgentProfile } from './subagent-registry'
 import { DEFAULT_MAX_TOOL_ROUNDS } from './round-budget'
+import { pushToolResultMessage, attachRoundImages, visionPromptHint } from './vision-bridge'
 
 // ============ 类型 ============
 
@@ -270,10 +271,11 @@ export class AutonomousEngine {
     }
 
     // 构建初始消息
+    const visionCapable = provider.visionCapable === true
     const messages: ChatMessage[] = [
       {
         role: 'system',
-        content: this.buildSystemPrompt(systemPrompt, workingDirectory, agentsMdHint, memoryHint)
+        content: this.buildSystemPrompt(systemPrompt, workingDirectory, agentsMdHint, memoryHint) + visionPromptHint(visionCapable)
       },
       {
         role: 'user',
@@ -345,6 +347,7 @@ export class AutonomousEngine {
       })
 
       // 执行每个工具调用
+      const roundImages: string[] = []
       for (const tc of pendingToolCalls) {
         // 每次工具执行前检查中止信号
         if (abortSignal?.aborted) {
@@ -482,16 +485,13 @@ export class AutonomousEngine {
           finishTool(timeline, tc.id, tlStatus, tlOutput, (result as any).diffData)
         }
 
-        // 将工具结果加入消息历史
-        messages.push({
-          role: 'tool',
-          content: typeof result.result === 'string'
-            ? result.result
-            : JSON.stringify(result.result, null, 2),
-          tool_call_id: tc.id,
-          name: tc.function.name
-        })
+        // 将工具结果加入消息历史（图像结果单独挂载，不把 base64 灌进 content）
+        const imageUrl = pushToolResultMessage(messages, result, tc.id, tc.function.name, visionCapable)
+        if (imageUrl) roundImages.push(imageUrl)
       }
+
+      // 本轮截图统一作为一条带图 user 消息交给模型（须在全部 tool 应答之后）
+      attachRoundImages(messages, roundImages)
 
       // 验证提示注入
       if (this.config.verifyAfterEachRound && round < this.config.maxIterations - 1) {
@@ -627,6 +627,7 @@ export class AutonomousEngine {
           messages.push({ role: 'assistant', content: repairContent || '', tool_calls: repairToolCalls })
 
           // 执行修复工具调用（接入与主循环相同的执行保护）
+          const repairRoundImages: string[] = []
           for (const tc of repairToolCalls) {
             if (abortSignal?.aborted) break
             this.resolveToolPaths(tc, workingDirectory)
@@ -720,13 +721,11 @@ export class AutonomousEngine {
               } catch { /* 忽略 */ }
             }
 
-            messages.push({
-              role: 'tool',
-              content: typeof result.result === 'string' ? result.result : JSON.stringify(result.result, null, 2),
-              tool_call_id: tc.id,
-              name: tc.function.name
-            })
+            const repairImageUrl = pushToolResultMessage(messages, result, tc.id, tc.function.name, visionCapable)
+            if (repairImageUrl) repairRoundImages.push(repairImageUrl)
           }
+
+          attachRoundImages(messages, repairRoundImages)
 
           iterations++
 

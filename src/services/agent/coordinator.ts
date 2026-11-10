@@ -41,6 +41,7 @@ import type { NodeCost } from './execution-guardian'
 import { subAgentRegistry } from './subagent-registry'
 import type { SubAgentProfile } from './subagent-registry'
 import { startThink, endThink, startTool, finishTool, formatToolOutput } from './exec-timeline'
+import { pushToolResultMessage, attachRoundImages, visionPromptHint } from './vision-bridge'
 
 // ============ 类型定义 ============
 
@@ -1045,7 +1046,7 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
 ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
 
 请认真执行任务，必要时使用可用的工具获取信息。完成后给出你的分析结论。${agentsMdHint || ''}${memoryHint || ''}${workerSemanticHint}${taskDocHint}`
-        })()
+        })() + visionPromptHint(provider.visionCapable === true)
       },
       {
         role: 'user',
@@ -1114,6 +1115,7 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
       })
 
       // 执行工具调用
+      const roundImages: string[] = []
       for (const tc of pendingToolCalls) {
         // 相对路径解析：如果设置了工作目录，自动拼接相对路径
         if (workingDirectory && (tc.function.name === 'write_file' || tc.function.name === 'search_replace' || tc.function.name === 'create_directory' || tc.function.name === 'read_file' || tc.function.name === 'read_directory' || tc.function.name === 'read_document' || tc.function.name === 'search_code')) {
@@ -1289,16 +1291,13 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
           finishTool(timeline, tc.id, tlStatus, tlOutput, toolStatus.diffData)
         }
 
-        // 将工具结果加入消息历史
-        messages.push({
-          role: 'tool',
-          content: typeof result.result === 'string'
-            ? result.result
-            : JSON.stringify(result.result, null, 2),
-          tool_call_id: tc.id,
-          name: tc.function.name
-        })
+        // 将工具结果加入消息历史（图像结果单独挂载，不把 base64 灌进 content）
+        const imageUrl = pushToolResultMessage(messages, result, tc.id, tc.function.name, provider.visionCapable === true)
+        if (imageUrl) roundImages.push(imageUrl)
       }
+
+      // 本轮截图统一作为一条带图 user 消息交给模型（须在全部 tool 应答之后）
+      attachRoundImages(messages, roundImages)
 
       // 上下文压缩（R8：通过 ContextManager 按模型容量管理）
       if (round < maxToolRounds - 1) {

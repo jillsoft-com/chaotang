@@ -183,3 +183,15 @@ export type { WorktreeInfo, CreateWorktreeResult, RemoveWorktreeResult } from '.
 // ── 子 Agent 注册表（三期 Phase A） ──
 export { subAgentRegistry } from './subagent-registry'
 export type { SubAgentProfile } from './subagent-registry'
+
+// ── 视觉桥接（图像工具结果 → 多模态消息） ──
+export {
+  extractImagePayload,
+  stringifyToolResult,
+  pushToolResultMessage,
+  attachRoundImages,
+  pruneImageMessages,
+  visionPromptHint,
+  MAX_IMAGE_MESSAGES
+} from './vision-bridge'
+export type { ImagePayload } from './vision-bridge'

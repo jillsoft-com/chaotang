@@ -26,6 +26,8 @@ export interface LLMConfig {
   temperature?: number
   maxTokens?: number
   llmId?: string
+  /** 模型支持图片识别（多模态视觉）：浏览器截图等图像结果才会下发给模型 */
+  supportsVision?: boolean
 }
 
 /**
@@ -137,12 +139,27 @@ export interface Debate {
   deliveryConfirmedAt?: number
 }
 
+/**
+ * 多模态内容分片（OpenAI 兼容格式）。
+ * 仅在发送给模型前由 OpenAIProvider 从 ChatMessage 组装出来，
+ * 应用内部消息仍用 content: string，避免各处字符串操作全面改造。
+ */
+export type ChatContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string; detail?: 'auto' | 'low' | 'high' } }
+
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
   content: string
   tool_calls?: ToolCall[]       // assistant 返回的工具调用
   tool_call_id?: string         // tool role 对应的调用 ID
   name?: string                 // tool role 的函数名
+  /**
+   * 图片负载（data URL 数组）。
+   * base64 不进入 content，因此不参与字符统计 / 截断 / 摘要，
+   * 发送前由 provider 转成多模态 content（仅视觉模型下发）。
+   */
+  images?: string[]
 }
 
 // ============ 决策质量可视化（Sprint A - #1） ============

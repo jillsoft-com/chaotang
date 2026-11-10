@@ -26,6 +26,7 @@ export function createProvider(config: LLMConfig): LLMProvider {
   return new OpenAIProvider(
     config.apiKey || '',
     config.model,
-    baseURL
+    baseURL,
+    config.supportsVision === true
   )
 }

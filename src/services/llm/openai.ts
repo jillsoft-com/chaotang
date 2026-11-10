@@ -1,22 +1,43 @@
 import type { LLMProvider, LLMChatOptions } from './types'
-import type { ChatMessage, ToolCall } from '@/types'
+import type { ChatContentPart, ChatMessage, ToolCall } from '@/types'
 import { resolveLlmUrl } from './proxy'
 
 export class OpenAIProvider implements LLMProvider {
+  readonly visionCapable: boolean
   private apiKey: string
   private baseURL: string
   private model: string
 
-  constructor(apiKey: string, model: string, baseURL = 'https://api.openai.com/v1') {
+  constructor(apiKey: string, model: string, baseURL = 'https://api.openai.com/v1', visionCapable = false) {
     this.apiKey = apiKey
     this.model = model
     this.baseURL = baseURL
+    this.visionCapable = visionCapable
+  }
+
+  /**
+   * 将应用内消息转为 API 载荷：
+   * - 带 images 的消息组装为多模态 content 数组（OpenAI 兼容格式）
+   * - 未开启视觉时不下发 base64，仅保留文本
+   * - images 字段本身不属于 API 协议，转换后一律消失
+   */
+  private serializeMessages(messages: ChatMessage[]) {
+    return messages.map(m => {
+      const { images, ...rest } = m
+      if (!images || images.length === 0) return rest
+      if (!this.visionCapable) return rest
+      const parts: ChatContentPart[] = []
+      if (m.content) parts.push({ type: 'text', text: m.content })
+      for (const url of images) parts.push({ type: 'image_url', image_url: { url } })
+      if (parts.length === 0) parts.push({ type: 'text', text: '' })
+      return { ...rest, content: parts }
+    })
   }
 
   private buildRequestBody(messages: ChatMessage[], options?: LLMChatOptions) {
     const body: Record<string, any> = {
       model: this.model,
-      messages,
+      messages: this.serializeMessages(messages),
       stream: options?.stream || false
     }
     if (options?.tools && options.tools.length > 0) {

@@ -14,6 +14,8 @@ export interface LLMConfig {
   temperature?: number
   maxTokens?: number
   isDefault?: boolean
+  /** 模型支持图片识别（多模态视觉），如 gpt-4o / qwen-vl / glm-4v */
+  supportsVision?: boolean
 }
 
 export interface LLMTestResult {
