@@ -156,7 +156,10 @@ interface ElectronAPI {
 
   // 浏览器自动化
   browserAction: (params: {
-    action: 'navigate' | 'screenshot' | 'snapshot' | 'click' | 'type' | 'evaluate' | 'close'
+    action:
+      | 'navigate' | 'screenshot' | 'snapshot' | 'click' | 'type' | 'evaluate' | 'close'
+      | 'set-policy' | 'back' | 'forward' | 'reload' | 'state' | 'viewport'
+      | 'mouse-click' | 'mouse-wheel' | 'keyboard'
     params?: Record<string, any>
   }) => Promise<{
     success: boolean
@@ -169,6 +172,11 @@ interface ElectronAPI {
     truncated?: boolean
     result?: any
     message?: string
+    active?: boolean
+    moved?: boolean
+    httpStatus?: number
+    viewport?: { width: number; height: number }
+    policy?: { allowlistEnabled?: boolean; allowlist?: string[] }
   }>
 
   // 企业微信 Webhook

@@ -11,7 +11,27 @@
  */
 
 import type { ToolDefinition, ToolHandler } from '@/types'
-import { browserAction } from './browser-manager'
+import { runBrowserAction, beginAgentUse, endAgentUse, awaitManualRelease } from './browser-session'
+import { confirmNavigation } from './browser-policy'
+
+/**
+ * Agent 侧统一包装：
+ * 1) 用户接管期间先等待（自动暂停 Agent）；
+ * 2) 标记占用，让面板知道“现在是 Agent 在操作”并禁用人工按钮；
+ * 3) 导航前先过一层人工确认（默认关闭）。
+ */
+async function withAgentBrowserUse<T>(toolName: string, fn: () => Promise<T>, confirmUrl?: string): Promise<T> {
+  await awaitManualRelease()
+  if (confirmUrl && !(await confirmNavigation(confirmUrl, 'agent'))) {
+    throw new Error(`用户拒绝访问 ${confirmUrl}。请改用其他站点，或向用户说明为何需要该页面。`)
+  }
+  beginAgentUse(toolName)
+  try {
+    return await fn()
+  } finally {
+    endAgentUse()
+  }
+}
 
 // ============ 工具定义 ============
 
@@ -124,75 +144,90 @@ export const browserEvaluateTool: ToolDefinition = {
 // ============ 工具处理器 ============
 
 export const browserNavigateHandler: ToolHandler = async (args) => {
-  const result = await browserAction('navigate', { url: args.url })
-  if (!result.success) {
-    throw new Error(result.error || '导航失败')
-  }
-  return {
-    url: result.url,
-    title: result.title,
-    message: `已打开: ${result.title || result.url}`
-  }
+  return withAgentBrowserUse('browser_navigate', async () => {
+    const result = await runBrowserAction('navigate', { url: args.url })
+    if (!result.success) {
+      throw new Error(result.error || '导航失败')
+    }
+    return {
+      url: result.url,
+      title: result.title,
+      httpStatus: result.httpStatus,
+      message: `已打开: ${result.title || result.url}`
+    }
+  }, typeof args.url === 'string' ? args.url : undefined)
 }
 
 export const browserScreenshotHandler: ToolHandler = async (args) => {
-  const result = await browserAction('screenshot', {
-    fullPage: args.fullPage || false,
-    type: 'png'
+  return withAgentBrowserUse('browser_screenshot', async () => {
+    // jpeg 比 png 小一个量级，面板轮询与模型上传都依赖它
+    const result = await runBrowserAction('screenshot', {
+      fullPage: args.fullPage || false,
+      type: 'jpeg',
+      quality: 80
+    })
+    if (!result.success) {
+      throw new Error(result.error || '截图失败')
+    }
+    return {
+      type: 'image',
+      format: result.type || 'jpeg',
+      data: result.data,
+      message: '截图已生成（base64 格式）'
+    }
   })
-  if (!result.success) {
-    throw new Error(result.error || '截图失败')
-  }
-  return {
-    type: 'image',
-    format: result.type || 'png',
-    data: result.data,
-    message: '截图已生成（base64 格式）'
-  }
 }
 
 export const browserSnapshotHandler: ToolHandler = async (_args) => {
-  const result = await browserAction('snapshot', {})
-  if (!result.success) {
-    throw new Error(result.error || '获取快照失败')
-  }
-  return {
-    title: result.title,
-    url: result.url,
-    accessibilityTree: result.accessibilityTree,
-    truncated: result.truncated,
-    message: `页面快照: ${result.title || result.url}`
-  }
+  return withAgentBrowserUse('browser_snapshot', async () => {
+    const result = await runBrowserAction('snapshot', {})
+    if (!result.success) {
+      throw new Error(result.error || '获取快照失败')
+    }
+    return {
+      title: result.title,
+      url: result.url,
+      accessibilityTree: result.accessibilityTree,
+      truncated: result.truncated,
+      message: `页面快照: ${result.title || result.url}`
+    }
+  })
 }
 
 export const browserClickHandler: ToolHandler = async (args) => {
-  const result = await browserAction('click', { selector: args.selector })
-  if (!result.success) {
-    throw new Error(result.error || '点击失败')
-  }
-  return { message: result.message || `已点击: ${args.selector}` }
+  return withAgentBrowserUse('browser_click', async () => {
+    const result = await runBrowserAction('click', { selector: args.selector })
+    if (!result.success) {
+      throw new Error(result.error || '点击失败')
+    }
+    return { message: result.message || `已点击: ${args.selector}` }
+  })
 }
 
 export const browserTypeHandler: ToolHandler = async (args) => {
-  const result = await browserAction('type', {
-    selector: args.selector,
-    text: args.text
+  return withAgentBrowserUse('browser_type', async () => {
+    const result = await runBrowserAction('type', {
+      selector: args.selector,
+      text: args.text
+    })
+    if (!result.success) {
+      throw new Error(result.error || '填写失败')
+    }
+    return { message: result.message || `已填写: ${args.selector}` }
   })
-  if (!result.success) {
-    throw new Error(result.error || '填写失败')
-  }
-  return { message: result.message || `已填写: ${args.selector}` }
 }
 
 export const browserEvaluateHandler: ToolHandler = async (args) => {
-  const result = await browserAction('evaluate', { expression: args.expression })
-  if (!result.success) {
-    throw new Error(result.error || '执行失败')
-  }
-  return {
-    result: result.result,
-    message: 'JavaScript 执行成功'
-  }
+  return withAgentBrowserUse('browser_evaluate', async () => {
+    const result = await runBrowserAction('evaluate', { expression: args.expression })
+    if (!result.success) {
+      throw new Error(result.error || '执行失败')
+    }
+    return {
+      result: result.result,
+      message: 'JavaScript 执行成功'
+    }
+  })
 }
 
 // 汇总所有工具定义和处理器

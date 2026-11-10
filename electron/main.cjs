@@ -1362,6 +1362,35 @@ app.whenReady().then(() => {
   let browserInstance = null
   let browserPage = null
 
+  // 浏览器域名白名单策略（由渲染进程通过 set-policy 下发，主进程兜底拦截）
+  let browserPolicy = { allowlistEnabled: false, allowlist: [] }
+
+  // 域名是否放行：精确匹配或子域匹配（example.com 放行 a.example.com）
+  const hostMatchesPolicy = (targetUrl) => {
+    if (!browserPolicy.allowlistEnabled) return true
+    let host
+    try {
+      host = new URL(targetUrl).hostname.toLowerCase()
+    } catch {
+      return false
+    }
+    const patterns = Array.isArray(browserPolicy.allowlist) ? browserPolicy.allowlist : []
+    return patterns.some((raw) => {
+      const p = String(raw || '').trim().toLowerCase()
+        .replace(/^https?:\/\//, '')
+        .replace(/[\/].*$/, '')
+        .replace(/:\d+$/, '')
+      if (!p) return false
+      return host === p || host.endsWith('.' + p)
+    })
+  }
+
+  // 允许的人工按键名（避免面板把任意键盘事件透传给页面）
+  const ALLOWED_KEYS = new Set([
+    'Enter', 'Escape', 'Tab', 'Backspace', 'Delete', 'Space',
+    'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'
+  ])
+
   // IPC: 执行浏览器操作
   ipcMain.handle('browser-action', async (_event, { action, params = {} }) => {
     try {
@@ -1371,6 +1400,31 @@ app.whenReady().then(() => {
         chromium = require('playwright').chromium
       } catch {
         return { success: false, error: 'Playwright 未安装，请运行 npm install playwright' }
+      }
+
+      // 配置类操作不需要浏览器实例
+      if (action === 'set-policy') {
+        browserPolicy = {
+          allowlistEnabled: !!params.allowlistEnabled,
+          allowlist: Array.isArray(params.allowlist) ? params.allowlist : []
+        }
+        return { success: true, policy: browserPolicy }
+      }
+
+      // 查询状态同样不按需启动：面板挂载时要能判断“有没有页面”而不拉起 Chromium
+      if (action === 'state') {
+        if (!browserPage) {
+          return { success: true, active: false, url: '', title: '', viewport: null, policy: browserPolicy }
+        }
+        const pageUrl = browserPage.url()
+        return {
+          success: true,
+          active: pageUrl !== 'about:blank',
+          url: pageUrl,
+          title: await browserPage.title(),
+          viewport: browserPage.viewportSize(),
+          policy: browserPolicy
+        }
       }
 
       // 启动浏览器（按需）
@@ -1387,16 +1441,65 @@ app.whenReady().then(() => {
           if (!url || (!url.startsWith('http://') && !url.startsWith('https://'))) {
             return { success: false, error: '仅支持 http/https 协议' }
           }
-          await browserPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
+          if (!hostMatchesPolicy(url)) {
+            let host = url
+            try { host = new URL(url).hostname } catch { /* 保留原文 */ }
+            return { success: false, error: `DOMAIN_BLOCKED: ${host} 不在允许的域名白名单内（可在设置 → 浏览器安全 中调整）` }
+          }
+          const resp = await browserPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
           const title = await browserPage.title()
-          return { success: true, title, url: browserPage.url() }
+          return { success: true, title, url: browserPage.url(), httpStatus: resp ? resp.status() : undefined }
+        }
+        case 'back': {
+          const resp = await browserPage.goBack({ waitUntil: 'domcontentloaded', timeout: 30000 })
+          return {
+            success: true,
+            moved: !!resp,
+            url: browserPage.url(),
+            title: await browserPage.title(),
+            message: resp ? '已后退' : '没有可后退的历史记录'
+          }
+        }
+        case 'forward': {
+          const resp = await browserPage.goForward({ waitUntil: 'domcontentloaded', timeout: 30000 })
+          return {
+            success: true,
+            moved: !!resp,
+            url: browserPage.url(),
+            title: await browserPage.title(),
+            message: resp ? '已前进' : '没有可前进的历史记录'
+          }
+        }
+        case 'reload': {
+          if (browserPage.url() === 'about:blank') {
+            return { success: false, error: '当前为空白页，请先输入地址' }
+          }
+          await browserPage.reload({ waitUntil: 'domcontentloaded', timeout: 30000 })
+          return { success: true, url: browserPage.url(), title: await browserPage.title(), message: '已刷新' }
+        }
+        case 'viewport': {
+          // 面板宽度变化时同步视口，避免截图被拉伸模糊
+          const width = Math.round(Number(params.width) || 0)
+          const height = Math.round(Number(params.height) || 0)
+          if (width < 320 || width > 3840 || height < 240 || height > 2160) {
+            return { success: false, error: '视口尺寸超出允许范围' }
+          }
+          await browserPage.setViewportSize({ width, height })
+          return { success: true, viewport: browserPage.viewportSize() }
         }
         case 'screenshot': {
-          const buffer = await browserPage.screenshot({
-            fullPage: params.fullPage || false,
-            type: params.type || 'png'
-          })
-          return { success: true, data: buffer.toString('base64'), type: params.type || 'png' }
+          const isJpeg = params.type === 'jpeg'
+          const options = { type: isJpeg ? 'jpeg' : 'png', fullPage: !!params.fullPage }
+          if (isJpeg) options.quality = Math.max(30, Math.min(90, Number(params.quality) || 70))
+          const buffer = await browserPage.screenshot(options)
+          return {
+            success: true,
+            data: buffer.toString('base64'),
+            type: options.type,
+            url: browserPage.url(),
+            title: await browserPage.title(),
+            viewport: browserPage.viewportSize()
+          }
         }
         case 'snapshot': {
           const snapshot = await browserPage.accessibility.snapshot()
@@ -1445,6 +1548,32 @@ app.whenReady().then(() => {
           }
           const result = await browserPage.evaluate(params.expression)
           return { success: true, result: typeof result === 'string' ? result.slice(0, 10000) : JSON.stringify(result).slice(0, 10000) }
+        }
+        case 'mouse-click': {
+          // 面板画面内点击：视口坐标由渲染进程按截图尺寸换算
+          const x = Number(params.x)
+          const y = Number(params.y)
+          if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0) {
+            return { success: false, error: '缺少有效的点击坐标' }
+          }
+          await browserPage.mouse.click(x, y)
+          return { success: true, message: `已点击 (${Math.round(x)}, ${Math.round(y)})`, url: browserPage.url() }
+        }
+        case 'mouse-wheel': {
+          const deltaY = Math.round(Number(params.deltaY) || 0)
+          const deltaX = Math.round(Number(params.deltaX) || 0)
+          if (!deltaX && !deltaY) return { success: false, error: '缺少滚动量' }
+          await browserPage.mouse.wheel(deltaX, deltaY)
+          return { success: true, message: '已滚动' }
+        }
+        case 'keyboard': {
+          const key = String(params.key || '')
+          if (!key) return { success: false, error: '缺少按键名' }
+          if (!ALLOWED_KEYS.has(key)) {
+            return { success: false, error: `不支持的按键: ${key}` }
+          }
+          await browserPage.keyboard.press(key)
+          return { success: true, message: `已按下 ${key}` }
         }
         case 'close': {
           if (browserInstance) {

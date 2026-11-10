@@ -7,6 +7,8 @@ import ChatSession from '@/components/ChatSession.vue'
 import TaskTreePanel from '@/components/TaskTreePanel.vue'
 import FileTreePanel from '@/components/FileTreePanel.vue'
 import FileEditorPanel from '@/components/FileEditorPanel.vue'
+import BrowserPanel from '@/components/BrowserPanel.vue'
+import { browserView } from '@/services/browser/browser-session'
 import { llmService } from '@/services/llm-config'
 import { ElMessageBox } from 'element-plus'
 import { TOPIC_TEMPLATES, getTemplateCategories, applyTemplate as applyTopicTemplate } from '@/services/topic-templates'
@@ -176,14 +178,12 @@ function tabTip(tab: PanelTab): string {
 function emptyTitle(tab: PanelTab): string {
   if (tab.kind === 'taskTree') return '🌳 当前会话暂无任务树'
   if (tab.kind === 'file') return '📄 尚未打开文件'
-  if (tab.kind === 'browser') return '🌐 浏览器面板'
   return '🧩 空标签'
 }
 
 function emptyHint(tab: PanelTab): string {
   if (tab.kind === 'taskTree') return 'Agent 模式批准执行后，任务拆解会在此实时展示'
   if (tab.kind === 'file') return '在右侧目录树中点击文件即可在此查看与编辑'
-  if (tab.kind === 'browser') return '内置浏览器开发中，后续可在此直接预览页面与产物'
   return '选择这个标签要显示的内容类型'
 }
 
@@ -203,6 +203,14 @@ function ensureTaskTreeTab(): void {
   ]
 }
 
+/** 全局只有 1 个 headless 页面，浏览器标签多于 1 个时复用已有的那个 */
+function findOrFocusBrowserTab(): boolean {
+  const existing = panelTabs.value.find(t => t.kind === 'browser')
+  if (!existing) return false
+  activePanelTabId.value = existing.id
+  return true
+}
+
 /** 新建标签：任务树 / 文件预览 / 浏览器 / 其他（空白，建好后在内容区选类型） */
 function addPanelTab(kind: PanelTabKind) {
   showRightPanel.value = true
@@ -212,6 +220,7 @@ function addPanelTab(kind: PanelTabKind) {
     activePanelTabId.value = TASK_TREE_TAB_ID
     return
   }
+  if (kind === 'browser' && findOrFocusBrowserTab()) return
   const id = newTabId()
   const title = kind === 'browser' ? '浏览器' : kind === 'file' ? '未选择文件' : '新标签'
   panelTabs.value = [...panelTabs.value, { id, kind, title }]
@@ -239,10 +248,28 @@ function closePanelTab(id: string) {
 function setPanelTabKind(id: string, kind: PanelTabKind) {
   const tab = panelTabs.value.find(t => t.id === id)
   if (!tab || tab.pinned || tab.kind === kind) return
+  // 已有浏览器标签时直接切过去，避免出现两个共享同一页面的标签
+  if (kind === 'browser') {
+    const existing = panelTabs.value.find(t => t.kind === 'browser')
+    if (existing) {
+      closePanelTab(id)
+      activePanelTabId.value = existing.id
+      return
+    }
+  }
   tab.kind = kind
   tab.filePath = ''
   tab.title = kind === 'browser' ? '浏览器' : kind === 'file' ? '未选择文件' : '新标签'
 }
+
+// 浏览器标签标题跟随页面标题（截断避免挤爆 tab 栏）
+watch(() => browserView.title, (pageTitle) => {
+  for (const t of panelTabs.value) {
+    if (t.kind !== 'browser') continue
+    const text = (pageTitle || '').trim()
+    t.title = text ? (text.length > 14 ? `${text.slice(0, 14)}…` : text) : '浏览器'
+  }
+})
 
 /** 点击目录树文件：已打开则切到该标签，当前是空标签则就地载入，否则新开一个 */
 function openInEditor(path: string) {
@@ -1120,7 +1147,7 @@ onUnmounted(() => {
 
         <div class="right-panel-body">
           <!-- 内容区：当前活动标签（任务树 / 文件 / 浏览器 / 空标签） -->
-          <div class="rp-content" :class="{ 'rp-content-fill': activePanelTab.kind === 'file' && !!activePanelTab.filePath }">
+          <div class="rp-content" :class="{ 'rp-content-fill': (activePanelTab.kind === 'file' && !!activePanelTab.filePath) || activePanelTab.kind === 'browser' }">
             <!-- 任务树（Agent 模式） -->
             <TaskTreePanel
               v-if="activePanelTab.kind === 'taskTree' && activeTaskTree"
@@ -1138,7 +1165,9 @@ onUnmounted(() => {
               :root-dir="activeWorkDir"
               @close="closePanelTab(activePanelTab.id)"
             />
-            <!-- 空状态：未选文件 / 浏览器待接入 / 空标签，可就地切换类型 -->
+            <!-- 内置浏览器（截图流面板，与 Agent 共用同一个 headless 页面） -->
+            <BrowserPanel v-else-if="activePanelTab.kind === 'browser'" />
+            <!-- 空状态：未选文件 / 空标签，可就地切换类型 -->
             <div v-else class="panel-empty">
               <p>{{ emptyTitle(activePanelTab) }}</p>
               <p class="panel-empty-hint">{{ emptyHint(activePanelTab) }}</p>
@@ -1762,7 +1791,7 @@ onUnmounted(() => {
   padding: 12px;
 }
 
-/* 打开文件时撑满内容区高度，滚动交给编辑器自身 */
+/* 打开的文件、浏览器面板撑满内容区高度，滚动交给编辑器/面板自身 */
 .rp-content.rp-content-fill {
   display: flex;
   flex-direction: column;

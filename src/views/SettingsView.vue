@@ -22,6 +22,14 @@ import type { Debate } from '@/types'
 import { gepaEngine } from '@/services/learning'
 import type { GEPAExport } from '@/services/learning/gepa-export'
 import { DEFAULT_MAX_TOOL_ROUNDS } from '@/services/agent/round-budget'
+import {
+  browserPolicy,
+  saveBrowserPolicy,
+  cleanAllowlist,
+  syncPolicyToMain,
+  type BrowserPolicy
+} from '@/services/browser/browser-policy'
+import { isBrowserAvailable } from '@/services/browser/browser-manager'
 
 const router = useRouter()
 const debateStore = useDebateStore()
@@ -85,7 +93,8 @@ const llmForm = ref({
   apiKey: '',
   baseURL: '',
   temperature: 0.7,
-  maxTokens: 4096
+  maxTokens: 4096,
+  supportsVision: false
 })
 
 // 摘要模型
@@ -354,6 +363,8 @@ onMounted(() => {
   loadPluginList()
   // 加载沙箱配置
   loadSandboxConfig()
+  // 加载浏览器安全策略（模块级单例，仅同步到表单）
+  loadBrowserPolicyValues()
   // 初始化并加载消息集成配置
   initMessaging()
   loadMessagingConfigValues()
@@ -437,7 +448,7 @@ function saveMinisterLLMMap() {
 
 function openAddLLMDialog() {
   editingLLM.value = null
-  llmForm.value = { name: '', provider: 'openai', model: 'gpt-4o-mini', apiKey: '', baseURL: '', temperature: 0.7, maxTokens: 4096 }
+  llmForm.value = { name: '', provider: 'openai', model: 'gpt-4o-mini', apiKey: '', baseURL: '', temperature: 0.7, maxTokens: 4096, supportsVision: false }
   testResult.value = null
   fetchedModels.value = []
   showLLMDialog.value = true
@@ -452,7 +463,8 @@ function openEditLLMDialog(config: LLMConfig) {
     apiKey: config.apiKey || '',
     baseURL: config.baseURL || '',
     temperature: config.temperature || 0.7,
-    maxTokens: config.maxTokens || 4096
+    maxTokens: config.maxTokens || 4096,
+    supportsVision: config.supportsVision === true
   }
   testResult.value = null
   fetchedModels.value = []
@@ -505,7 +517,8 @@ async function saveLLMConfig() {
     apiKey: llmForm.value.apiKey || undefined,
     baseURL: llmForm.value.baseURL || undefined,
     temperature: llmForm.value.temperature,
-    maxTokens: llmForm.value.maxTokens
+    maxTokens: llmForm.value.maxTokens,
+    supportsVision: llmForm.value.supportsVision
   }
 
   try {
@@ -720,6 +733,51 @@ async function onSandboxChange() {
       maxTimeout: sandboxMaxTimeout.value
     })
     ElMessage.success('沙箱配置已保存')
+  }
+}
+
+// ============ 浏览器安全策略 ============
+
+/** 白名单在界面上按文本编辑（一行一个），保存时拆成数组 */
+const browserAllowlistText = ref('')
+const browserAvailable = ref(isBrowserAvailable())
+
+function loadBrowserPolicyValues() {
+  browserAllowlistText.value = cleanAllowlist(browserPolicy).join('\n')
+}
+
+function saveBrowserPolicyValues() {
+  browserPolicy.allowlist = browserAllowlistText.value
+    .split(/[,;\n]/)
+    .map(s => s.trim())
+    .filter(Boolean)
+  saveBrowserPolicy()
+  ElMessage.success('浏览器安全策略已保存并下发主进程')
+}
+
+/** 一键填充常用预设：本地开发地址与官方文档站 */
+function applyBrowserPreset(kind: 'local' | 'docs') {
+  const presets = kind === 'local'
+    ? ['localhost', '127.0.0.1']
+    : ['example.com', 'github.com', 'mdn.io', 'playwright.dev']
+  const merged = [...new Set([...cleanAllowlist(browserPolicy), ...presets])]
+  browserAllowlistText.value = merged.join('\n')
+  browserPolicy.allowlist = merged
+  saveBrowserPolicy()
+}
+
+async function checkBrowserMainSync() {
+  if (!window.electronAPI?.browserAction) {
+    ElMessage.warning('当前为 Web 模式，策略仅在本页生效')
+    return
+  }
+  await syncPolicyToMain()
+  const res = await window.electronAPI.browserAction({ action: 'state', params: {} })
+  const main: Partial<BrowserPolicy> = res.policy || {}
+  if (main.allowlistEnabled === browserPolicy.allowlistEnabled) {
+    ElMessage.success(`主进程已生效：${(main.allowlist || []).length} 个域名`)
+  } else {
+    ElMessage.warning('主进程未接受策略，需重启应用使新的 browser-action IPC 生效')
   }
 }
 
@@ -1337,6 +1395,7 @@ async function exportGEPAData() {
                   <h3 class="llm-name">{{ config.name }}</h3>
                   <el-tag v-if="config.isDefault" type="warning" size="small" effect="dark">默认</el-tag>
                   <el-tag size="small" effect="plain">{{ getProviderLabel(config.provider) }}</el-tag>
+                  <el-tag v-if="config.supportsVision" type="success" size="small" effect="plain">👁 图片识别</el-tag>
                 </div>
                 <div class="llm-actions">
                   <el-button v-if="!config.isDefault" :icon="Star" size="small" @click="setDefaultLLM(config.id)">设为默认</el-button>
@@ -1682,6 +1741,80 @@ handler: |
           </div>
         </el-tab-pane>
 
+        <!-- 浏览器安全 -->
+        <el-tab-pane label="浏览器安全" name="browser">
+          <div class="tab-header">
+            <div>
+              <h2 class="section-title">浏览器安全策略</h2>
+              <p class="section-desc">约束内置浏览器与 Agent 浏览器工具可访问的站点，默认全部关闭（不限制）</p>
+            </div>
+          </div>
+
+          <el-alert
+            v-if="!browserAvailable"
+            type="info"
+            :closable="false"
+            show-icon
+            title="当前为 Web 模式"
+            description="浏览器自动化仅在 Electron 桌面版可用；策略仍会保存在本地，启动桌面版后自动生效。"
+            style="margin-bottom: 12px"
+          />
+
+          <div class="settings-sections">
+            <el-card shadow="never" class="settings-card">
+              <h3 class="card-title">访问控制</h3>
+              <div class="settings-item">
+                <div class="settings-item-info">
+                  <span class="settings-item-label">启用域名白名单</span>
+                  <span class="settings-item-desc">仅允许访问列表内的域名（含子域）；列表为空时所有站点都会被拦截</span>
+                </div>
+                <el-switch v-model="browserPolicy.allowlistEnabled" @change="saveBrowserPolicyValues" />
+              </div>
+              <div class="settings-item">
+                <div class="settings-item-info">
+                  <span class="settings-item-label">导航前人工确认</span>
+                  <span class="settings-item-desc">无论 Agent 还是面板发起导航，先弹窗请示；本地命令仍保持全局免确认不受影响</span>
+                </div>
+                <el-switch v-model="browserPolicy.confirmNavigation" @change="saveBrowserPolicyValues" />
+              </div>
+
+              <div v-if="browserPolicy.allowlistEnabled" style="margin-top: 8px">
+                <div class="form-label-row">
+                  <span>允许的域名（一行一个）</span>
+                  <div style="display: flex; gap: 6px">
+                    <el-button size="small" text @click="applyBrowserPreset('local')">＋本地开发</el-button>
+                    <el-button size="small" text @click="applyBrowserPreset('docs')">＋文档站点</el-button>
+                  </div>
+                </div>
+                <el-input
+                  v-model="browserAllowlistText"
+                  type="textarea"
+                  :rows="6"
+                  placeholder="localhost&#10;github.com&#10;mdn.io"
+                />
+                <p class="form-hint">填写裸域名即可（可带 https:// 前缀，会自动去除）；example.com 同时放行 www.example.com 与 a.b.example.com</p>
+              </div>
+
+              <div style="display: flex; gap: 8px; margin-top: 12px">
+                <el-button type="primary" @click="saveBrowserPolicyValues">保存策略</el-button>
+                <el-button @click="checkBrowserMainSync">校验主进程生效</el-button>
+              </div>
+            </el-card>
+
+            <el-card shadow="never" class="settings-card">
+              <h3 class="card-title">策略说明</h3>
+              <ul class="sandbox-strategy-list">
+                <li><strong>双重校验：</strong>渲染层用于提示与确认，主进程 navigate 兜底拦截，任何一方被绕过都仍会拦截</li>
+                <li><strong>作用于 Agent：</strong>browser_navigate 同样受策略限制，被拒后模型会收到原因并改用其他方案</li>
+                <li><strong>子域匹配：</strong>白名单只按域名判定，不区分路径；如需精细控制请配合导航前人工确认</li>
+                <li><strong>仅 http/https：</strong>file:// 与其他协议在主进程直接拒绝</li>
+                <li><strong>人工接管：</strong>浏览器面板的「接管」会暂停 Agent 的浏览器操作，直到你退出接管</li>
+              </ul>
+              <p class="form-hint">首次使用浏览器需安装内核：<code>npx playwright install chromium</code>；主进程改动后需重启应用生效。</p>
+            </el-card>
+          </div>
+        </el-tab-pane>
+
         <!-- 消息集成 -->
         <el-tab-pane label="消息集成" name="messaging">
           <div class="tab-header">
@@ -1956,6 +2089,11 @@ handler: |
               <el-input-number v-model="llmForm.maxTokens" :min="1" style="width: 100%" />
             </div>
           </div>
+        </el-form-item>
+
+        <el-form-item>
+          <el-checkbox v-model="llmForm.supportsVision">支持图片识别（多模态视觉）</el-checkbox>
+          <div class="form-hint">勾选后，浏览器截图与用户粘贴的图片会以图像形式送入模型；未勾选时大臣只能看到文本形式的页面结构（browser_snapshot）。适用于 gpt-4o、qwen-vl、glm-4v 等视觉模型。</div>
         </el-form-item>
 
         <el-alert
@@ -2343,6 +2481,24 @@ handler: |
   margin-top: 6px;
   font-size: 12px;
   color: var(--ct-text-secondary);
+}
+
+/* 浏览器白名单：标题行右侧带预设快捷按钮 */
+.form-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 13px;
+  color: var(--ct-text-primary);
+}
+
+.form-hint code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--ct-bg-tertiary);
+  font-size: 12px;
 }
 
 .model-select-row {

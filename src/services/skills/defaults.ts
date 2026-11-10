@@ -197,7 +197,7 @@ const allSkills: Array<{ skill: Skill; handlers: Record<string, any> }> = [
     skill: {
       id: 'browser',
       name: '浏览器自动化',
-      description: '打开网页、截图、获取页面结构、点击元素、填写表单、执行 JavaScript',
+      description: '打开网页、截图、获取页面结构、点击元素、填写表单、执行 JavaScript（页面实时显示在右侧浏览器面板，用户可接管）',
       icon: '🌐',
       category: 'information',
       tools: browserToolDefinitions,
