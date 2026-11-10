@@ -79,19 +79,71 @@ function handleLoginClick() {
 
 // 右侧面板
 const showRightPanel = ref(false)
-const rightPanelWidth = ref(420)
+const rightPanelWidth = ref(600)
+/** 面板最小宽度：需同时容纳内容区与常驻目录树列 */
+const RIGHT_PANEL_MIN_WIDTH = 420
+/** 默认宽度占主区（含面板本身）的比例 */
+const RIGHT_PANEL_DEFAULT_RATIO = 0.45
+/** 用户手动拖过就不再跟随窗口尺寸重算 */
+let rightPanelManualWidth = false
 const mainContentRef = ref<HTMLElement | null>(null)
 let isResizingRight = false
 let resizeStartX = 0
 let resizeStartWidth = 0
 
-function toggleRightPanel() {
-  showRightPanel.value = !showRightPanel.value
+/** 按主区宽度的 45% 设默认宽（受上下限约束），手动调过则保持不动 */
+function applyDefaultRightPanelWidth() {
+  if (rightPanelManualWidth) return
+  const base = mainContentRef.value?.offsetWidth || 0
+  if (base <= 0) return
+  rightPanelWidth.value = Math.max(RIGHT_PANEL_MIN_WIDTH, Math.min(base * 0.7, base * RIGHT_PANEL_DEFAULT_RATIO))
 }
 
-// ============ 右侧任务面板 ============
+function toggleRightPanel() {
+  showRightPanel.value = !showRightPanel.value
+  if (showRightPanel.value) applyDefaultRightPanelWidth()
+  // 标签全部关掉后面板会收起，再次打开时把任务树标签带回来
+  if (showRightPanel.value && panelTabs.value.length === 0) {
+    ensureTaskTreeTab()
+    activePanelTabId.value = TASK_TREE_TAB_ID
+  }
+}
 
-const rightPanelTab = ref<'taskTree' | 'files'>('taskTree')
+// ============ 右侧任务面板（多标签） ============
+
+type PanelTabKind = 'taskTree' | 'file' | 'browser' | 'other'
+
+interface PanelTab {
+  id: string
+  kind: PanelTabKind
+  title: string
+  /** kind === 'file' 时当前打开的文件路径（空表示尚未选择） */
+  filePath?: string
+  /** 固定标签（任务树）：始终排在最左、不可就地改类型，但可以关闭 */
+  pinned?: boolean
+}
+
+/** 任务树为固定标签，始终排在最左 */
+const TASK_TREE_TAB_ID = 'task-tree'
+
+/** 空白标签上可选的内容类型 */
+const PANEL_KIND_OPTIONS: Array<{ kind: PanelTabKind; label: string }> = [
+  { kind: 'file', label: '📄 文件' },
+  { kind: 'browser', label: '🌐 浏览器' },
+  { kind: 'other', label: '🧩 其他' }
+]
+
+const panelTabs = ref<PanelTab[]>([
+  { id: TASK_TREE_TAB_ID, kind: 'taskTree', title: '任务树', pinned: true }
+])
+const activePanelTabId = ref(TASK_TREE_TAB_ID)
+
+/** 当前活动标签（无标签时回退到任务树占位，保证不为空） */
+const activePanelTab = computed<PanelTab>(() =>
+  panelTabs.value.find(t => t.id === activePanelTabId.value)
+  ?? panelTabs.value.find(t => t.pinned)
+  ?? { id: TASK_TREE_TAB_ID, kind: 'taskTree', title: '任务树', pinned: true }
+)
 
 /** 当前会话的任务树快照（Agent 模式） */
 const activeTaskTree = computed(() => debateStore.activeSession?.taskTreeSnapshot || null)
@@ -99,26 +151,144 @@ const activeTaskTree = computed(() => debateStore.activeSession?.taskTreeSnapsho
 /** 当前会话的工作目录（工程文件浏览根路径） */
 const activeWorkDir = computed(() => debateStore.activeSession?.workingDirectory || '')
 
-/** 工程面板中当前在左侧编辑器/预览器打开的文件路径（空则不显示编辑列） */
-const editingFilePath = ref('')
+/** 当前标签打开的文件路径（供目录树高亮与编辑器使用） */
+const editingFilePath = computed(() => {
+  const tab = activePanelTab.value
+  return tab.kind === 'file' ? tab.filePath || '' : ''
+})
 
-// 切换工作目录（换会话）时关闭编辑器，避免跨会话残留
-watch(activeWorkDir, () => { editingFilePath.value = '' })
+let tabSeq = 0
 
-/** 点击工程文件：在左侧打开编辑/预览面板，并适当加宽右侧面板以容纳并排两列 */
-function openInEditor(path: string) {
-  editingFilePath.value = path
-  const maxWidth = mainContentRef.value ? mainContentRef.value.offsetWidth * 0.7 : 600
-  const want = Math.min(720, maxWidth)
-  if (rightPanelWidth.value < want) rightPanelWidth.value = want
+function newTabId(): string {
+  return `tab-${Date.now().toString(36)}-${++tabSeq}`
 }
 
-/** 自动拉出右侧面板并切到任务树 tab（首次建树时由 ChatSession 触发） */
-function openTaskTreePanel() {
-  rightPanelTab.value = 'taskTree'
+function tabIcon(kind: PanelTabKind): string {
+  return kind === 'taskTree' ? '🌳' : kind === 'file' ? '📄' : kind === 'browser' ? '🌐' : '🧩'
+}
+
+function tabTip(tab: PanelTab): string {
+  if (tab.kind === 'file') return tab.filePath || '未选择文件'
+  if (tab.kind === 'taskTree') return '当前会话的任务树'
+  return tab.title
+}
+
+function emptyTitle(tab: PanelTab): string {
+  if (tab.kind === 'taskTree') return '🌳 当前会话暂无任务树'
+  if (tab.kind === 'file') return '📄 尚未打开文件'
+  if (tab.kind === 'browser') return '🌐 浏览器面板'
+  return '🧩 空标签'
+}
+
+function emptyHint(tab: PanelTab): string {
+  if (tab.kind === 'taskTree') return 'Agent 模式批准执行后，任务拆解会在此实时展示'
+  if (tab.kind === 'file') return '在右侧目录树中点击文件即可在此查看与编辑'
+  if (tab.kind === 'browser') return '内置浏览器开发中，后续可在此直接预览页面与产物'
+  return '选择这个标签要显示的内容类型'
+}
+
+/** 取路径末级文件名作为标签标题 */
+function fileBaseName(p: string): string {
+  const n = p.replace(/[\\/]+$/, '')
+  const i = Math.max(n.lastIndexOf('\\'), n.lastIndexOf('/'))
+  return i >= 0 ? n.slice(i + 1) : n
+}
+
+/** 确保任务树标签存在（已被关闭时重新插到最左） */
+function ensureTaskTreeTab(): void {
+  if (panelTabs.value.some(t => t.id === TASK_TREE_TAB_ID)) return
+  panelTabs.value = [
+    { id: TASK_TREE_TAB_ID, kind: 'taskTree', title: '任务树', pinned: true },
+    ...panelTabs.value
+  ]
+}
+
+/** 新建标签：任务树 / 文件预览 / 浏览器 / 其他（空白，建好后在内容区选类型） */
+function addPanelTab(kind: PanelTabKind) {
   showRightPanel.value = true
-  // 任务树宽度适中，默认面板太窄
-  if (rightPanelWidth.value < 360) rightPanelWidth.value = 360
+  ensureRightPanelWidth(treeColWidth.value + 460)
+  if (kind === 'taskTree') {
+    ensureTaskTreeTab()
+    activePanelTabId.value = TASK_TREE_TAB_ID
+    return
+  }
+  const id = newTabId()
+  const title = kind === 'browser' ? '浏览器' : kind === 'file' ? '未选择文件' : '新标签'
+  panelTabs.value = [...panelTabs.value, { id, kind, title }]
+  activePanelTabId.value = id
+}
+
+/** 关闭标签：所有标签（含任务树）都可关；关到空则顺带收起面板 */
+function closePanelTab(id: string) {
+  const idx = panelTabs.value.findIndex(t => t.id === id)
+  if (idx < 0) return
+  const rest = panelTabs.value.filter(t => t.id !== id)
+  panelTabs.value = rest
+  if (rest.length === 0) {
+    showRightPanel.value = false
+    activePanelTabId.value = TASK_TREE_TAB_ID
+    return
+  }
+  if (activePanelTabId.value === id) {
+    const fallback = rest[Math.min(idx, rest.length - 1)]
+    activePanelTabId.value = fallback ? fallback.id : TASK_TREE_TAB_ID
+  }
+}
+
+/** 在空标签上切换当前类型（文件 / 浏览器 / 其他） */
+function setPanelTabKind(id: string, kind: PanelTabKind) {
+  const tab = panelTabs.value.find(t => t.id === id)
+  if (!tab || tab.pinned || tab.kind === kind) return
+  tab.kind = kind
+  tab.filePath = ''
+  tab.title = kind === 'browser' ? '浏览器' : kind === 'file' ? '未选择文件' : '新标签'
+}
+
+/** 点击目录树文件：已打开则切到该标签，当前是空标签则就地载入，否则新开一个 */
+function openInEditor(path: string) {
+  showRightPanel.value = true
+  ensureRightPanelWidth(treeColWidth.value + 460)
+  const opened = panelTabs.value.find(t => t.kind === 'file' && t.filePath === path)
+  if (opened) {
+    activePanelTabId.value = opened.id
+    return
+  }
+  const tab = activePanelTab.value
+  if (!tab.pinned && (tab.kind === 'other' || (tab.kind === 'file' && !tab.filePath))) {
+    tab.kind = 'file'
+    tab.filePath = path
+    tab.title = fileBaseName(path)
+    return
+  }
+  const id = newTabId()
+  panelTabs.value = [...panelTabs.value, { id, kind: 'file', title: fileBaseName(path), filePath: path }]
+  activePanelTabId.value = id
+}
+
+// 切换工作目录（换会话）时清空各文件标签的路径，避免跨会话残留
+watch(activeWorkDir, () => {
+  for (const t of panelTabs.value) {
+    if (t.kind === 'file') {
+      t.filePath = ''
+      t.title = '未选择文件'
+    }
+  }
+})
+
+/** 按需加宽面板（不超过主区可用宽度上限），已有更宽则保持 */
+function ensureRightPanelWidth(want: number) {
+  const maxWidth = mainContentRef.value ? mainContentRef.value.offsetWidth * 0.7 : 800
+  const target = Math.min(want, maxWidth)
+  if (rightPanelWidth.value < target) rightPanelWidth.value = target
+}
+
+/** 自动拉出右侧面板并切回任务树（首次建树时由 ChatSession 触发） */
+function openTaskTreePanel() {
+  ensureTaskTreeTab()
+  activePanelTabId.value = TASK_TREE_TAB_ID
+  showRightPanel.value = true
+  applyDefaultRightPanelWidth()
+  ensureRightPanelWidth(RIGHT_PANEL_MIN_WIDTH)
 }
 
 /** ChatSession 组件引用：供任务树面板调用其 continueTaskTree 进行续跑 */
@@ -136,9 +306,10 @@ function startResizeRight(e: MouseEvent) {
 
 function onResizeRight(e: MouseEvent) {
   if (!isResizingRight) return
+  rightPanelManualWidth = true
   const delta = resizeStartX - e.clientX
   const maxWidth = mainContentRef.value ? mainContentRef.value.offsetWidth * 0.7 : 600
-  rightPanelWidth.value = Math.max(200, Math.min(maxWidth, resizeStartWidth + delta))
+  rightPanelWidth.value = Math.max(RIGHT_PANEL_MIN_WIDTH, Math.min(maxWidth, resizeStartWidth + delta))
 }
 
 function stopResizeRight() {
@@ -147,6 +318,54 @@ function stopResizeRight() {
   document.removeEventListener('mouseup', stopResizeRight)
   document.body.style.cursor = ''
   document.body.style.userSelect = ''
+}
+
+// ============ 常驻目录树列宽度（150–280px，默认 180px） ============
+
+const TREE_COL_MIN = 150
+const TREE_COL_MAX = 280
+const TREE_COL_DEFAULT = 180
+/** 内容区最少保留宽度，避免树列拖得过宽把任务树/编辑器挤没 */
+const RP_CONTENT_MIN = 200
+const TREE_COL_STORE_KEY = 'chaotang.rightPanel.treeWidth'
+
+function loadTreeColWidth(): number {
+  try {
+    const raw = localStorage.getItem(TREE_COL_STORE_KEY)
+    const n = raw ? Number(raw) : NaN
+    if (Number.isFinite(n)) return Math.max(TREE_COL_MIN, Math.min(TREE_COL_MAX, n))
+  } catch { /* 读取失败则用默认值 */ }
+  return TREE_COL_DEFAULT
+}
+
+const treeColWidth = ref(loadTreeColWidth())
+
+let isResizingTree = false
+
+function startResizeTree(e: MouseEvent) {
+  isResizingTree = true
+  resizeStartX = e.clientX
+  resizeStartWidth = treeColWidth.value
+  document.addEventListener('mousemove', onResizeTree)
+  document.addEventListener('mouseup', stopResizeTree)
+  document.body.style.cursor = 'col-resize'
+  document.body.style.userSelect = 'none'
+}
+
+function onResizeTree(e: MouseEvent) {
+  if (!isResizingTree) return
+  // 把手向左拖 → 树列变宽；上限同时受面板总宽约束，保证内容区不被挤没
+  const allowed = Math.max(TREE_COL_MIN, Math.min(TREE_COL_MAX, rightPanelWidth.value - RP_CONTENT_MIN))
+  treeColWidth.value = Math.max(TREE_COL_MIN, Math.min(allowed, resizeStartWidth + (resizeStartX - e.clientX)))
+}
+
+function stopResizeTree() {
+  isResizingTree = false
+  document.removeEventListener('mousemove', onResizeTree)
+  document.removeEventListener('mouseup', stopResizeTree)
+  document.body.style.cursor = ''
+  document.body.style.userSelect = ''
+  try { localStorage.setItem(TREE_COL_STORE_KEY, String(treeColWidth.value)) } catch { /* 写入失败忽略 */ }
 }
 
 // 项目分组列表（侧边栏）：按工作目录聚合已完成历史 + 进行中会话
@@ -559,10 +778,13 @@ function handleHomeKeydown(e: KeyboardEvent) {
 
 onMounted(() => {
   window.addEventListener('keydown', handleHomeKeydown)
+  // 未手动调宽时，跟随窗口尺寸保持默认 45%
+  window.addEventListener('resize', applyDefaultRightPanelWidth)
 })
 
 onUnmounted(() => {
   window.removeEventListener('keydown', handleHomeKeydown)
+  window.removeEventListener('resize', applyDefaultRightPanelWidth)
 })
 </script>
 
@@ -862,22 +1084,34 @@ onUnmounted(() => {
       <div v-if="showRightPanel" class="right-panel" :style="{ width: rightPanelWidth + 'px' }">
         <div class="right-panel-header">
           <div class="right-panel-tabs">
-            <button
-              v-if="activeTaskTree"
+            <div
+              v-for="tab in panelTabs"
+              :key="tab.id"
               class="right-panel-tab"
-              :class="{ active: rightPanelTab === 'taskTree' }"
-              @click="rightPanelTab = 'taskTree'"
+              :class="{ active: tab.id === activePanelTabId }"
+              :title="tabTip(tab)"
+              @click="activePanelTabId = tab.id"
             >
-              🌳 任务树
-            </button>
-            <button
-              v-if="activeWorkDir"
-              class="right-panel-tab"
-              :class="{ active: rightPanelTab === 'files' }"
-              @click="rightPanelTab = 'files'"
-            >
-              📁 工程
-            </button>
+              <span class="rp-tab-icon">{{ tabIcon(tab.kind) }}</span>
+              <span class="rp-tab-label">{{ tab.title }}</span>
+              <span
+                class="rp-tab-close"
+                :title="tab.pinned ? '关闭标签（可用＋号重新调出）' : '关闭标签'"
+                @click.stop="closePanelTab(tab.id)"
+              >✕</span>
+            </div>
+            <!-- 新建标签 -->
+            <el-dropdown trigger="click" size="small" @command="addPanelTab">
+              <button class="right-panel-tab rp-tab-add" title="新建标签">＋</button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item command="taskTree">🌳 任务树标签</el-dropdown-item>
+                  <el-dropdown-item command="browser">🌐 浏览器标签</el-dropdown-item>
+                  <el-dropdown-item command="file">📄 文件预览标签</el-dropdown-item>
+                  <el-dropdown-item command="other">🧩 空标签（建好后选类型）</el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
           </div>
           <el-button text size="small" @click="toggleRightPanel">
             <el-icon><Right v-if="showRightPanel" /><Back v-else /></el-icon>
@@ -885,10 +1119,11 @@ onUnmounted(() => {
         </div>
 
         <div class="right-panel-body">
-          <!-- 任务树（Agent 模式） -->
-          <template v-if="rightPanelTab === 'taskTree'">
+          <!-- 内容区：当前活动标签（任务树 / 文件 / 浏览器 / 空标签） -->
+          <div class="rp-content" :class="{ 'rp-content-fill': activePanelTab.kind === 'file' && !!activePanelTab.filePath }">
+            <!-- 任务树（Agent 模式） -->
             <TaskTreePanel
-              v-if="activeTaskTree"
+              v-if="activePanelTab.kind === 'taskTree' && activeTaskTree"
               :tree="activeTaskTree"
               :ministers="debateStore.sortedMinisters"
               :tick="debateStore.taskTreeTick"
@@ -896,30 +1131,41 @@ onUnmounted(() => {
               @continue="chatSessionRef?.continueTaskTree()"
               @retry-node="(id: string) => chatSessionRef?.continueTaskTree(id)"
             />
+            <!-- 文件编辑/预览 -->
+            <FileEditorPanel
+              v-else-if="activePanelTab.kind === 'file' && activePanelTab.filePath && activeWorkDir"
+              :file-path="activePanelTab.filePath"
+              :root-dir="activeWorkDir"
+              @close="closePanelTab(activePanelTab.id)"
+            />
+            <!-- 空状态：未选文件 / 浏览器待接入 / 空标签，可就地切换类型 -->
             <div v-else class="panel-empty">
-              <p>🌳 当前会话暂无任务树</p>
-              <p class="panel-empty-hint">Agent 模式批准执行后，任务拆解会在此实时展示</p>
-            </div>
-          </template>
-          <!-- 工程目录文件树 -->
-          <template v-if="rightPanelTab === 'files'">
-            <div v-if="activeWorkDir" class="files-split">
-              <div v-if="editingFilePath" class="files-editor-col">
-                <FileEditorPanel :file-path="editingFilePath" :root-dir="activeWorkDir" @close="editingFilePath = ''" />
-              </div>
-              <div class="files-tree-col" :class="{ 'with-editor': editingFilePath }">
-                <FileTreePanel
-                  :root-dir="activeWorkDir"
-                  :selected-path="editingFilePath"
-                  @select-file="openInEditor"
-                />
+              <p>{{ emptyTitle(activePanelTab) }}</p>
+              <p class="panel-empty-hint">{{ emptyHint(activePanelTab) }}</p>
+              <div v-if="!activePanelTab.pinned" class="panel-kind-btns">
+                <span class="panel-kind-tip">此标签显示为：</span>
+                <button
+                  v-for="opt in PANEL_KIND_OPTIONS"
+                  :key="opt.kind"
+                  class="panel-kind-btn"
+                  :class="{ 'is-current': activePanelTab.kind === opt.kind }"
+                  @click="setPanelTabKind(activePanelTab.id, opt.kind)"
+                >{{ opt.label }}</button>
               </div>
             </div>
-            <div v-else class="panel-empty">
-              <p>📁 当前会话未设置工作目录</p>
-              <p class="panel-empty-hint">在首页选择工作目录后可在此浏览工程文件</p>
-            </div>
-          </template>
+          </div>
+
+          <!-- 目录树列拖拽把手 -->
+          <div class="rp-tree-handle" title="拖动调整目录树宽度" @mousedown="startResizeTree"></div>
+
+          <!-- 常驻工程目录树列 -->
+          <div class="rp-tree" :style="{ width: treeColWidth + 'px' }">
+            <FileTreePanel
+              :root-dir="activeWorkDir"
+              :selected-path="editingFilePath"
+              @select-file="openInEditor"
+            />
+          </div>
         </div>
       </div>
     </main>
@@ -1502,44 +1748,75 @@ onUnmounted(() => {
 
 .right-panel-body {
   flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: stretch;
+  overflow: hidden;
+}
+
+/* 内容区：任务树 / 打开的文件 / 浏览器（与右侧常驻目录树列共享面板宽度） */
+.rp-content {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow-y: auto;
   padding: 12px;
 }
 
-/* 工程面板：左编辑/预览列 + 右文件树列 并排（撑满面板高度） */
-.files-split {
+/* 打开文件时撑满内容区高度，滚动交给编辑器自身 */
+.rp-content.rp-content-fill {
   display: flex;
-  align-items: stretch;
-  gap: 10px;
-  height: 100%;
+  flex-direction: column;
+  overflow: hidden;
 }
 
-.files-editor-col {
-  flex: 1 1 58%;
-  min-width: 0;
+.rp-content.rp-content-fill > * {
+  flex: 1 1 auto;
   min-height: 0;
 }
 
-.files-tree-col {
-  flex: 1 1 100%;
+/* 内容区与目录树列之间的拖拽把手 */
+.rp-tree-handle {
+  width: 3px;
+  flex-shrink: 0;
+  cursor: col-resize;
+  background: transparent;
+  transition: background 0.2s;
+}
+
+.rp-tree-handle:hover {
+  background: var(--ct-accent);
+}
+
+/* 常驻工程目录树列（面板最右侧） */
+.rp-tree {
+  flex-shrink: 0;
   min-width: 0;
-  min-height: 0;
+  overflow: hidden;
+  border-left: 1px solid var(--ct-border);
+  padding: 8px 6px;
 }
 
-.files-tree-col.with-editor {
-  flex: 0 0 40%;
-  max-width: 40%;
-}
-
-/* 右侧面板 - 标签页 */
+/* 右侧面板 - 标签栏（可横向滚动，末尾固定一个＋号） */
 .right-panel-tabs {
   display: flex;
+  align-items: center;
   gap: 2px;
   flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.right-panel-tabs::-webkit-scrollbar {
+  display: none;
 }
 
 .right-panel-tab {
-  padding: 4px 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
   border: none;
   background: transparent;
   color: var(--ct-text-secondary);
@@ -1548,6 +1825,44 @@ onUnmounted(() => {
   border-radius: 6px;
   transition: all 0.15s;
   white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* 标签标题限宽，长文件名截断 */
+.rp-tab-label {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rp-tab-icon {
+  font-size: 12px;
+  line-height: 1;
+}
+
+.rp-tab-close {
+  font-size: 11px;
+  line-height: 1;
+  opacity: 0.45;
+  padding: 0 2px;
+  border-radius: 3px;
+}
+
+.rp-tab-close:hover {
+  opacity: 1;
+  color: #ef4444;
+}
+
+/* ＋号：新建浏览器/文件/空标签 */
+.rp-tab-add {
+  padding: 2px 8px;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--ct-text-muted);
+}
+
+.rp-tab-add:hover {
+  color: var(--ct-accent);
 }
 
 .right-panel-tab:hover {
@@ -1576,6 +1891,45 @@ onUnmounted(() => {
 .panel-empty-hint {
   font-size: 12px !important;
   opacity: 0.7;
+}
+
+/* 空标签上的类型选择：文件 / 浏览器 / 其他 */
+.panel-kind-btns {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 14px;
+}
+
+.panel-kind-tip {
+  font-size: 12px;
+  color: var(--ct-text-muted);
+}
+
+.panel-kind-btn {
+  padding: 3px 10px;
+  border: 1px solid var(--ct-border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ct-text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.panel-kind-btn:hover {
+  border-color: var(--ct-accent);
+  color: var(--ct-accent);
+}
+
+.panel-kind-btn.is-current {
+  border-color: var(--ct-accent);
+  color: var(--ct-accent);
+  background: rgba(212, 175, 55, 0.1);
+  cursor: default;
 }
 
 .welcome-content {

@@ -836,6 +836,195 @@ function execHistorySegs(speech: Speech): ExecSegment[] {
   return live ? timeline.filter(s => s.id !== live.id) : timeline
 }
 
+/**
+ * 详情抽屉按真实发生顺序逐条列出：思考段标上轮次序号，工具段保持原样。
+ * 每轮思考各自成条，因此不会被下一轮的流式文本覆盖掉，事后可逐轮回看。
+ */
+function detailTimeline(speech: Speech): Array<{ seg: ExecSegment; roundNo?: number }> {
+  const rows: Array<{ seg: ExecSegment; roundNo?: number }> = []
+  let roundNo = 0
+  for (const seg of speech.execTimeline || []) {
+    if (seg.type === 'think') {
+      roundNo++
+      rows.push({ seg, roundNo })
+    } else {
+      rows.push({ seg })
+    }
+  }
+  return rows
+}
+
+/** 抽屉内的行标签：思考行按轮次编号，最新一轮仍在流式输出时沿用轮换措辞 */
+function detailRowLabel(seg: ExecSegment, speech: Speech, roundNo?: number): string {
+  if (seg.type !== 'think') return seg.displayName
+  if (!seg.done && speech.status === 'streaming') return execRowLabel(seg, speech)
+  return `第 ${roundNo} 轮思考`
+}
+
+/** 抽屉行类型：思考行、单个执行步、被合并的连续执行步组头 */
+type DetailRowKind = 'think' | 'tool' | 'group'
+
+interface DetailFlatRow {
+  key: string
+  kind: DetailRowKind
+  seg: ExecSegment | null
+  depth: number
+  label: string
+  icon: ExecRowState
+  stateText: string
+  preview: string
+  /** 执行步的文件变更（提取到行上，便于模板里按属性路径收窄，不必在模板里解包 seg） */
+  diffData?: { filePath: string; oldContent: string; newContent: string; isNew: boolean }
+  diffKey?: string
+  /** 组内含当前实时步：未被手动折叠过默认展开，该轮结束后自动收回 */
+  groupLive?: boolean
+  groupOpen?: boolean
+}
+
+/** 用户对合并组的展开/收起选择；未记录过的组走默认策略 */
+const detailFoldState = ref<Map<string, boolean>>(new Map())
+
+function isDetailGroupOpen(key: string, live: boolean): boolean {
+  const override = detailFoldState.value.get(key)
+  return override === undefined ? live : override
+}
+
+function toggleDetailGroup(key: string, live: boolean) {
+  const m = new Map(detailFoldState.value)
+  m.set(key, !isDetailGroupOpen(key, live))
+  detailFoldState.value = m
+}
+
+function onDetailRowClick(row: DetailFlatRow) {
+  if (row.kind === 'group') toggleDetailGroup(row.key, !!row.groupLive)
+  else toggleExecSeg(row.key)
+}
+
+/** ExecSegment 为判别联合，取工具分支字段前先收窄 */
+type ToolSeg = Extract<ExecSegment, { type: 'tool' }>
+
+function asToolSeg(seg: ExecSegment): ToolSeg {
+  return seg as ToolSeg
+}
+
+/** 行数据上的 seg 只对思考/执行行存在；按分支拆成两个窄接口，免得在模板里做类型收窄 */
+function rowThinkText(row: DetailFlatRow): string {
+  const seg = row.seg
+  return seg && seg.type === 'think' ? seg.text : ''
+}
+
+function rowTool(row: DetailFlatRow): ToolSeg {
+  return row.seg as ToolSeg
+}
+
+/** 组内摘要：按出现顺序去重工具名，最多列三个 */
+function groupToolSummary(segs: ToolSeg[]): string {
+  const names: string[] = []
+  for (const s of segs) {
+    if (!names.includes(s.displayName)) names.push(s.displayName)
+    if (names.length >= 3) break
+  }
+  return names.join('、') + (segs.length > names.length ? ' 等' : '')
+}
+
+function groupIconState(segs: ExecSegment[], speech: Speech): ExecRowState {
+  const states = segs.map(s => execRowState(s, speech))
+  if (states.includes('run')) return 'run'
+  if (states.includes('fail')) return 'fail'
+  return 'ok'
+}
+
+/** 执行过程抬头概览：直接给出“几轮思考、几次执行”的节奏 */
+function detailHeadSummary(speech: Speech): string {
+  const segs = speech.execTimeline || []
+  const thinks = segs.filter(s => s.type === 'think').length
+  return `${thinks} 轮思考 · ${segs.length - thinks} 次执行`
+}
+
+/**
+ * 抽屉行序列：思考逐条保留，连续的“执行命令 / 代码搜索”这类工具步合并成一行「执行 N 步」，
+ * 得到 思考 → 执行 → 思考 → 执行 的节奏。只有一步时不套壳，少一层点击。
+ */
+function detailRows(speech: Speech): DetailFlatRow[] {
+  const timeline = speech.execTimeline || []
+  const liveId = execLiveSeg(speech)?.id
+  const rows: DetailFlatRow[] = []
+  let roundNo = 0
+
+  for (let i = 0; i < timeline.length; i++) {
+    const seg = timeline[i]
+    if (seg.type === 'think') {
+      roundNo++
+      rows.push({
+        key: seg.id,
+        kind: 'think',
+        seg,
+        depth: 0,
+        label: detailRowLabel(seg, speech, roundNo),
+        icon: execRowState(seg, speech),
+        stateText: '',
+        preview: clipLine(seg.text)
+      })
+      continue
+    }
+
+    const runs: ToolSeg[] = [asToolSeg(seg)]
+    while (i + 1 < timeline.length && timeline[i + 1].type === 'tool') {
+      runs.push(asToolSeg(timeline[++i]))
+    }
+
+    if (runs.length === 1) {
+      rows.push({
+        key: seg.id,
+        kind: 'tool',
+        seg,
+        depth: 0,
+        label: seg.displayName,
+        icon: execRowState(seg, speech),
+        stateText: execRowStateText(seg, speech),
+        preview: execRowPreview(seg),
+        diffData: seg.diffData,
+        diffKey: seg.toolCallId || seg.id
+      })
+      continue
+    }
+
+    const key = `acts:${runs[0].id}`
+    const groupLive = runs.some(s => s.id === liveId)
+    const groupOpen = isDetailGroupOpen(key, groupLive)
+    rows.push({
+      key,
+      kind: 'group',
+      seg: null,
+      depth: 0,
+      label: `执行 ${runs.length} 步`,
+      icon: groupIconState(runs, speech),
+      stateText: '',
+      preview: groupToolSummary(runs),
+      groupLive,
+      groupOpen
+    })
+    if (!groupOpen) continue
+
+    for (const s of runs) {
+      rows.push({
+        key: s.id,
+        kind: 'tool',
+        seg: s,
+        depth: 1,
+        label: s.displayName,
+        icon: execRowState(s, speech),
+        stateText: execRowStateText(s, speech),
+        preview: execRowPreview(s),
+        diffData: s.diffData,
+        diffKey: s.toolCallId || s.id
+      })
+    }
+  }
+
+  return rows
+}
+
 /** 工具入参展示：execute_command 直接显示命令行，其余显示格式化 JSON */
 function formatToolInput(seg: ExecSegment): string {
   if (seg.type !== 'tool') return ''
@@ -3192,8 +3381,99 @@ function renderMarkdown(content: string): string {
         </header>
 
         <div class="exec-detail-body">
-          <!-- 工具调用完整列表 -->
-          <section v-if="activeDetailSpeech.toolStatuses && activeDetailSpeech.toolStatuses.length > 0" class="exec-detail-section">
+          <!-- 刚起头、还什么都没发生时给一句说明，不留整块空白 -->
+          <p
+            v-if="detailTimeline(activeDetailSpeech).length === 0 && (!activeDetailSpeech.toolStatuses || activeDetailSpeech.toolStatuses.length === 0)"
+            class="exec-detail-empty"
+          >
+            尚无执行步骤（正在等待本轮输出）
+          </p>
+
+          <!-- 执行过程：思考逐条保留，连续的命令/搜索类步骤合并成一行「执行 N 步」，
+               读起来就是 思考 → 执行 → 思考 → 执行 的节奏，不被一大串工具行淹没 -->
+          <section v-if="detailTimeline(activeDetailSpeech).length > 0" class="exec-detail-section">
+            <h4 class="exec-detail-section-title">🧭 执行过程（{{ detailHeadSummary(activeDetailSpeech) }}）</h4>
+            <div class="exec-detail-steps" v-auto-scroll-bottom>
+              <div
+                v-for="row in detailRows(activeDetailSpeech)"
+                :key="row.key"
+                class="exec-row"
+                :class="{ 'is-sub': row.depth > 0, 'is-group': row.kind === 'group' }"
+              >
+                <div class="exec-row-line" @click="onDetailRowClick(row)">
+                  <span class="exec-row-icon">
+                    <el-icon v-if="row.icon === 'ok'" class="exec-ico-ok"><CircleCheck /></el-icon>
+                    <el-icon v-else-if="row.icon === 'run'" class="exec-ico-run is-loading"><Loading /></el-icon>
+                    <el-icon v-else class="exec-ico-fail"><CircleClose /></el-icon>
+                  </span>
+                  <el-icon v-if="row.kind === 'group'" class="exec-row-chev" :class="{ 'is-folded': !row.groupOpen }"><ArrowDown /></el-icon>
+                  <span class="exec-row-label">{{ row.label }}</span>
+                  <span v-if="row.stateText" class="exec-row-state">{{ row.stateText }}</span>
+                  <span
+                    v-if="row.diffData"
+                    class="tool-diff-toggle"
+                    @click.stop="toggleDiffExpand(row.diffKey || row.key)"
+                  >
+                    <span v-if="row.diffData.isNew" class="diff-badge diff-new">+新文件</span>
+                    <span v-else class="diff-badge diff-modified">
+                      <span class="diff-added">+{{ getDiffStats(row.diffData.oldContent, row.diffData.newContent).added }}</span>
+                      <span class="diff-removed">-{{ getDiffStats(row.diffData.oldContent, row.diffData.newContent).removed }}</span>
+                    </span>
+                  </span>
+                  <template v-if="row.preview">
+                    <span class="exec-row-dot">·</span>
+                    <span class="exec-row-preview" :class="{ 'is-code': row.kind !== 'think' }" :title="row.preview">{{ row.preview }}</span>
+                  </template>
+                </div>
+
+                <!-- 组行自己不展开：它的“详情”就是下面列出的各个执行步 -->
+                <div v-if="row.kind !== 'group' && expandedExecSegs.has(row.key)" class="exec-row-detail">
+                  <pre v-if="row.kind === 'think'" class="exec-detail-think">{{ rowThinkText(row) || '（本轮无思考文本输出）' }}</pre>
+                  <template v-else>
+                    <div class="exec-tool-section">
+                      <div class="exec-tool-section-title">命令 / 参数</div>
+                      <pre class="exec-tool-input">{{ formatToolInput(rowTool(row)) }}</pre>
+                    </div>
+                    <div class="exec-tool-section">
+                      <div class="exec-tool-section-title">
+                        返回内容
+                        <span v-if="rowTool(row).status === 'executing'" class="exec-tool-running">（执行中…）</span>
+                        <span v-else-if="rowTool(row).status !== 'completed'" class="exec-tool-failed">（失败）</span>
+                      </div>
+                      <pre class="exec-tool-output">{{ rowTool(row).output || (rowTool(row).status === 'executing' ? '…' : '（无输出）') }}</pre>
+                    </div>
+                    <div v-if="row.diffData && expandedDiffs.has(row.diffKey || row.key)" class="tool-diff-panel" @click.stop>
+                      <div class="diff-file-path">{{ row.diffData.filePath }}</div>
+                      <div v-if="row.diffData.isNew" class="diff-new-file">
+                        <pre class="diff-content diff-all-added">{{ row.diffData.newContent }}</pre>
+                      </div>
+                      <div v-else class="diff-changes">
+                        <div
+                          v-for="(line, idx) in computeSimpleDiff(row.diffData.oldContent, row.diffData.newContent)"
+                          :key="idx"
+                          class="diff-line"
+                          :class="`diff-line-${line.type}`"
+                        >
+                          <span class="diff-line-marker">{{ line.type === 'added' ? '+' : line.type === 'removed' ? '-' : ' ' }}</span>
+                          <span v-if="line.lineNum" class="diff-line-num">{{ line.lineNum }}</span>
+                          <span class="diff-line-text">{{ line.line }}</span>
+                        </div>
+                      </div>
+                    </div>
+                    <div v-else-if="row.diffData" class="exec-tool-hint">
+                      点击上方行的 +/- 徽标展开文件变更
+                    </div>
+                  </template>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- 兼容旧归档数据：改动前落盘的会话没有 execTimeline，退化到按工具调用平铺 -->
+          <section
+            v-else-if="activeDetailSpeech.toolStatuses && activeDetailSpeech.toolStatuses.length > 0"
+            class="exec-detail-section"
+          >
             <h4 class="exec-detail-section-title">🔧 执行步骤（{{ activeDetailSpeech.toolStatuses.length }}）</h4>
             <div
               v-for="tc in activeDetailSpeech.toolStatuses"
@@ -3240,11 +3520,15 @@ function renderMarkdown(content: string): string {
             </div>
           </section>
 
-          <!-- 实时输出内容 -->
-          <section class="exec-detail-section">
-            <h4 class="exec-detail-section-title">📄 执行输出</h4>
+          <!-- 结论正文：发言收尾后才出现。speech.content 每轮都会被引擎重写一次，
+               执行中不展示，否则看起来像“上一轮内容被下一条思考覆盖掉了” -->
+          <section v-if="activeDetailSpeech.status !== 'streaming'" class="exec-detail-section">
+            <h4 class="exec-detail-section-title">📄 最终结论</h4>
+            <p v-if="activeDetailSpeech.status === 'error'" class="exec-detail-hint">
+              执行过程被该错误中断，上方「执行过程」保留了中断前已落定的各轮思考与工具调用。
+            </p>
             <pre
-              v-if="activeDetailSpeech.content && activeDetailSpeech.status === 'error'"
+              v-if="activeDetailSpeech.status === 'error'"
               class="exec-error-text"
             >{{ activeDetailSpeech.content }}</pre>
             <div
@@ -3471,7 +3755,7 @@ function renderMarkdown(content: string): string {
   overflow: hidden;
   position: relative;
   /* 头像列宽度（头像 48px + 间距 16px）：消息区与底部输入框共用的单一来源，
-     气泡左右各让出一列，输入框按同一口径限宽，两者边缘对齐 */
+     气泡只让出自己这一列头像，输入框按同一口径限宽，两者边缘对齐 */
   --avatar-col: 64px;
   /* 气泡与输入框的最小宽度：面板拉到再窄也不再缩于此值，超出部分横向滚动 */
   --bubble-min-w: 400px;
@@ -3726,11 +4010,11 @@ function renderMarkdown(content: string): string {
 }
 
 .messages-inner {
-  /* 消息流容器限宽 80% 居中，气泡在容器内铺满 */
-  max-width: 80%;
-  /* 下限按“气泡最小宽 + 左右两个头像列”倒推：容器到这个宽度后不再收窄，
-     气泡可用宽度恰好是 var(--bubble-min-w)（max-width 为 100% 减去两列头像） */
-  min-width: calc(var(--bubble-min-w) + var(--avatar-col) * 2);
+  /* 消息流撑满会话区（减去 .session-messages 左右内边距），气泡铺满整行 */
+  max-width: 100%;
+  /* 下限按“气泡最小宽 + 一列头像”倒推：容器到这个宽度后不再收窄，
+     气泡可用宽度恰好是 var(--bubble-min-w)（max-width 为 100% 减去一列头像） */
+  min-width: calc(var(--bubble-min-w) + var(--avatar-col));
   margin: 0 auto;
   display: flex;
   flex-direction: column;
@@ -3771,9 +4055,9 @@ function renderMarkdown(content: string): string {
 }
 
 .message-content {
-  /* 气泡向另一侧延伸到对方头像列之前为止：左右各让出一个头像列宽度，不压到对方头像 */
+  /* 气泡 = 整行宽度减去自己这一列头像（约 95%），头像加气泡刚好铺满 100% */
   flex: 1;
-  max-width: calc(100% - var(--avatar-col) * 2);
+  max-width: calc(100% - var(--avatar-col));
   background: var(--ct-bg-secondary);
   border: 1px solid var(--ct-border);
   border-radius: 12px;
@@ -4321,6 +4605,67 @@ function renderMarkdown(content: string): string {
   margin: 0;
 }
 
+/* 抽屉里的执行过程：自身带限高滚动，跟住最新一步而不把上方抬头与结论顶出可视区 */
+.exec-detail-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 55vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 4px;
+}
+
+/* 合并组展开后的子步骤：缩进 + 左侧连线，与组头形成从属关系 */
+.exec-row.is-sub {
+  margin-left: 20px;
+  padding-left: 8px;
+  border-left: 1px solid var(--ct-border);
+}
+
+/* 组头措辞与普通步骤区分，让“可点开的一串执行”一眼可认 */
+.exec-row.is-group > .exec-row-line .exec-row-label {
+  color: var(--ct-accent);
+}
+
+.exec-row-chev {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--ct-text-muted);
+  transition: transform 0.15s ease;
+}
+
+.exec-row-chev.is-folded { transform: rotate(-90deg); }
+
+/* 每轮思考全文：抽屉是看细节的地方，不像气泡那样只留一行摘要 */
+.exec-detail-think {
+  margin: 4px 0 0;
+  padding: 8px 10px;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--ct-text-primary);
+  background: var(--ct-bg-tertiary);
+  border-left: 2px solid var(--ct-accent);
+  border-radius: 4px;
+}
+
+.exec-detail-hint {
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: var(--ct-text-muted);
+  line-height: 1.5;
+}
+
+.exec-tool-hint {
+  margin-top: 6px;
+  font-size: 11.5px;
+  color: var(--ct-text-muted);
+}
+
 /* Tool Calls Section */
 .tool-calls-section {
   margin-bottom: 12px;
@@ -4462,16 +4807,16 @@ function renderMarkdown(content: string): string {
 }
 
 .chat-input {
-  /* 与气泡同宽：消息流限宽 80% 后再让出左右两个头像列；
+  /* 与气泡同宽：整行减去一列头像宽度；
      .session-messages 与 .session-footer 左右内边距同为 24px，宽度基准一致 */
-  max-width: calc(80% - var(--avatar-col) * 2);
+  max-width: calc(100% - var(--avatar-col));
   min-width: var(--bubble-min-w);
   margin: 0 auto;
 }
 
 /* 交付成果入口条：与输入框同宽同轴，有报告时常驻在输入框上方 */
 .delivery-entry {
-  max-width: calc(80% - var(--avatar-col) * 2);
+  max-width: calc(100% - var(--avatar-col));
   min-width: var(--bubble-min-w);
   margin: 0 auto 6px;
   display: flex;
