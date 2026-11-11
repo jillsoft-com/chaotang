@@ -1,7 +1,11 @@
 <template>
   <div class="bp-panel">
-    <!-- 宿主标签条：内嵌模式下每个标签都是一个独立的真实页面（独立分区、独立历史） -->
-    <div v-if="embedded" class="bp-tabs">
+    <!--
+      宿主标签条：每个标签都是一个独立的真实页面（独立分区、独立历史）。
+      只有一个页面时不显示（新建入口在工具条的 ＋），避免与外层面板 tab 看起来重复；
+      开了 2 个及以上才自动出现。
+    -->
+    <div v-if="embedded && hostState.tabs.length >= 2" class="bp-tabs">
       <button
         v-for="t in hostState.tabs"
         :key="t.id"
@@ -13,7 +17,6 @@
         <span class="bp-tab-title">{{ t.title || '新标签' }}</span>
         <span class="bp-tab-close" title="关闭标签页" @click.stop="closeHostTab(t.id)">✕</span>
       </button>
-      <button class="bp-tab bp-tab-new" title="新建标签页" @click="newHostTab">＋</button>
     </div>
 
     <!-- 控制条：后退 / 前进 / 刷新 / 地址栏 -->
@@ -35,6 +38,7 @@
         @keydown.enter.prevent="navigate(address)"
       />
       <button class="bp-btn bp-btn-go" :disabled="busy || browserView.agentBusy" title="前往" @click="navigate(address)">前往</button>
+      <button v-if="embedded" class="bp-btn" :disabled="busy" title="新建标签页" @click="newHostTab">＋</button>
       <button class="bp-btn" :disabled="busy" :title="embedded ? '关闭所有标签页（页面仍在内存里，直到实例关闭）' : '关闭浏览器实例（释放内存）'" @click="closeBrowser">✕</button>
     </div>
 
@@ -44,7 +48,7 @@
       <span v-if="browserView.agentBusy" class="bp-badge bp-badge-agent">
         ⚡ Agent 正在操作{{ browserView.agentLabel ? ` · ${browserView.agentLabel}` : '' }}
       </span>
-      <span v-else-if="browserView.manualHold" class="bp-badge bp-badge-hold">已接管 · Agent 已暂停</span>
+      <span v-else-if="browserView.manualHold" class="bp-badge bp-badge-hold" title="你在页面上动过手，Agent 的写操作已自动暂停；停止操作约 20 秒后会自动交还 Agent">已接管 · Agent 已暂停</span>
       <span v-else-if="embedded && !hostState.canCapture && hostState.active" class="bp-badge bp-badge-off" :title="hostState.captureHint">
         {{ visibilityLabel }}
       </span>
@@ -77,16 +81,12 @@
         aria-live="polite"
         :title="gestureSynthetic ? '窗口不可见，该动作已退化为 JS 合成事件（isTrusted=false）' : 'Agent 刚刚对页面做的操作'"
       >{{ gestureText }}</span>
-      <button
-        class="bp-btn bp-btn-hold"
-        :class="{ 'is-on': browserView.manualHold }"
-        :disabled="browserView.agentBusy"
-        :title="browserView.manualHold ? (embedded && hostState.holdSource && hostState.holdSource !== 'panel' ? '你在页面上动过手，已自动接管；点这里交还给 Agent' : '退出接管，允许 Agent 继续操作页面') : '接管页面：Agent 的浏览器操作将自动等待'"
-        @click="toggleHold"
-      >{{ browserView.manualHold ? '退出接管' : '接管' }}</button>
     </div>
 
-    <div v-if="notice" class="bp-notice" :class="noticeKind">{{ notice }}</div>
+    <div v-if="notice" class="bp-notice" :class="noticeKind">
+      <span class="bp-notice-text">{{ notice }}</span>
+      <button class="bp-notice-close" title="关闭提示" @click="dismissNotice">✕</button>
+    </div>
 
     <div v-if="!available" class="bp-hint">
       内嵌浏览器需要宿主通道支持：Web 模式下不可用，旧版安装包请重启应用。
@@ -181,11 +181,22 @@ const clickOffBadge = computed(() => {
 let stopObserve: (() => void) | null = null
 /** 动作提示的过期定时器 */
 let gestureTimer: ReturnType<typeof setTimeout> | null = null
+/** 提示条的自动消失定时器（info/warn 与 error 时长不同） */
+let noticeTimer: ReturnType<typeof setTimeout> | null = null
 
 function say(text: string, kind: 'info' | 'warn' | 'error' = 'info'): void {
   notice.value = text
   noticeKind.value = kind
+  // 每次重新提示都重新计时：旧的错误不该把新的成功也一起吹掉
+  if (noticeTimer) clearTimeout(noticeTimer)
+  noticeTimer = setTimeout(() => { notice.value = ''; noticeTimer = null }, kind === 'error' ? 15000 : 8000)
   if (kind === 'error') ElMessage.error(text)
+}
+
+/** 手动关掉提示条（右上角 ✕），同时取消未到点的自动消失计时 */
+function dismissNotice(): void {
+  notice.value = ''
+  if (noticeTimer) { clearTimeout(noticeTimer); noticeTimer = null }
 }
 
 /** 地址栏归一化：无协议时补 https，识别搜索词交给必应 */
@@ -364,21 +375,10 @@ function refreshGestureText(): void {
 }
 
 /**
- * 接管开关。
- * 锁由主进程持有（面板按钮只是入口之一，状态靠 browser-hold 事件镜像回来），
- * 所以这里只发 set-hold，不自己改 browserView。
+ * 接管锁不再提供面板按钮：主进程会在用户于页面上真实输入时自动上锁（holdSource=user-action），
+ * 并于 20 秒空闲后自动交还；面板只负责把锁态徒为“已接管”徽标。
+ * 面板销毁时（下方 onBeforeUnmount）仍需主动 setHold(false)，否则主进程会把 Agent 永远锁住。
  */
-async function toggleHold(): Promise<void> {
-  const on = !browserView.manualHold
-  const res = await setHold(on)
-  if (!res.success) {
-    say(res.error || '切换接管状态失败', 'error')
-    return
-  }
-  say(on
-    ? '已接管页面：Agent 对页面的写操作会被主进程拦住，取数仍可用'
-    : '已退出接管：Agent 可以继续操作页面', 'info')
-}
 
 onMounted(async () => {
   ensureHostListeners()
@@ -400,6 +400,10 @@ onBeforeUnmount(() => {
   if (gestureTimer) {
     clearTimeout(gestureTimer)
     gestureTimer = null
+  }
+  if (noticeTimer) {
+    clearTimeout(noticeTimer)
+    noticeTimer = null
   }
   stopObserve?.()
   stopObserve = null
@@ -509,11 +513,6 @@ watch(() => browserPolicy.allowlistEnabled, (on) => {
   color: #c62828;
 }
 
-.bp-tab-new {
-  flex-shrink: 0;
-  padding: 2px 8px;
-}
-
 .bp-toolbar {
   display: flex;
   align-items: center;
@@ -546,12 +545,6 @@ watch(() => browserPolicy.allowlistEnabled, (on) => {
 
 .bp-btn-go {
   font-weight: 600;
-}
-
-.bp-btn-hold.is-on {
-  border-color: var(--ct-accent);
-  color: #fff;
-  background: var(--ct-accent);
 }
 
 .bp-address {
@@ -627,12 +620,36 @@ watch(() => browserPolicy.allowlistEnabled, (on) => {
 }
 
 .bp-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
   padding: 4px 8px;
   font-size: 12px;
   line-height: 1.5;
   border-bottom: 1px solid var(--ct-border);
+}
+
+.bp-notice-text {
+  flex: 1;
+  min-width: 0;
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+.bp-notice-close {
+  flex: none;
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1.4;
+  padding: 0 2px;
+  opacity: 0.65;
+}
+
+.bp-notice-close:hover {
+  opacity: 1;
 }
 
 .bp-notice.info {
