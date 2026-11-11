@@ -4,7 +4,7 @@
  * 覆盖：
  * - 域名归一化与子域匹配
  * - 白名单开关语义（关闭=全放行，开启但空表=全拦截）
- * - 策略保存后的清洗与主进程下发调用
+ * - 策略保存后的清洗与主进程下发调用（只认宿主通道一条路）
  * - 导航前确认的放行/拒绝路径
  */
 
@@ -98,25 +98,42 @@ describe('saveBrowserPolicy', () => {
     vi.restoreAllMocks()
   })
 
-  it('保存时清洗白名单并下发主进程', async () => {
-    const spy = vi.fn()
-    ;(globalThis as any).window = window
+  it('策略通过宿主通道下发给主进程', async () => {
+    const hostSpy = vi.fn()
     Object.defineProperty(window, 'electronAPI', {
       configurable: true,
-      value: { browserAction: spy }
+      value: { browserHostAction: hostSpy }
     })
 
     browserPolicy.allowlistEnabled = true
     browserPolicy.allowlist = ['https://A.com/docs', 'a.com', 'localhost:3000']
+    browserPolicy.strictAllowlist = true
     saveBrowserPolicy()
 
     expect(browserPolicy.allowlist).toEqual(['a.com', 'localhost'])
     // set-policy 是异步下发（saveBrowserPolicy 内部不等待），等一个微任务队列
     await new Promise(resolve => setTimeout(resolve, 0))
-    expect(spy).toHaveBeenCalledWith({
+    expect(hostSpy).toHaveBeenCalledWith({
       action: 'set-policy',
-      params: { allowlistEnabled: true, allowlist: ['a.com', 'localhost'] }
+      params: { allowlistEnabled: true, allowlist: ['a.com', 'localhost'], strictAllowlist: true },
+      actor: 'user'
     })
+  })
+
+  it('宿主通道缺失时告警而不是静默失败', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    Object.defineProperty(window, 'electronAPI', {
+      configurable: true,
+      value: {}
+    })
+
+    browserPolicy.allowlistEnabled = true
+    browserPolicy.allowlist = ['a.com']
+    saveBrowserPolicy()
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // 拉不上闸就必须让用户知道，否则白名单看起来像已经生效了
+    expect(warn).toHaveBeenCalled()
   })
 })
 

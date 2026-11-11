@@ -52,6 +52,11 @@ export interface LoadedPlugin {
   toolDefinitions: ToolDefinition[]
   /** 解析后的 handler 函数映射（toolName → handler） */
   handlers: Record<string, ToolHandler>
+  /**
+   * SKILL.md 正文（frontmatter 之外的部分），作为该能力的使用契约发给模型。
+   * 与内置 Skill 的 guidance 同一机制，长度由 services/skills/guidance.ts 截断。
+   */
+  guidance?: string
   /** 加载状态 */
   status: 'loaded' | 'error'
   /** 错误信息 */

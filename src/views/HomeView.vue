@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { useDebateStore } from '@/stores/debate'
 import { Promotion, Setting, Fold, Expand, Plus, Close, House, Clock, Right, Back, FolderOpened, Edit, DocumentCopy, Connection, Delete, User, InfoFilled, Search } from '@element-plus/icons-vue'
@@ -9,6 +9,11 @@ import FileTreePanel from '@/components/FileTreePanel.vue'
 import FileEditorPanel from '@/components/FileEditorPanel.vue'
 import BrowserPanel from '@/components/BrowserPanel.vue'
 import { browserView } from '@/services/browser/browser-session'
+import {
+  hostState,
+  ensureHostListeners,
+  disposeHostListeners
+} from '@/services/browser/browser-host-session'
 import { llmService } from '@/services/llm-config'
 import { ElMessageBox } from 'element-plus'
 import { TOPIC_TEMPLATES, getTemplateCategories, applyTemplate as applyTopicTemplate } from '@/services/topic-templates'
@@ -269,6 +274,22 @@ watch(() => browserView.title, (pageTitle) => {
     const text = (pageTitle || '').trim()
     t.title = text ? (text.length > 14 ? `${text.slice(0, 14)}…` : text) : '浏览器'
   }
+})
+
+/**
+ * 内嵌模式下把浏览器面板调回前台。
+ * 宿主在 Agent 需要画面而页面未上屏时广播 browser-raise：此时面板可能已经收起、
+ * 浏览器标签可能已经被关掉，所以这里负责把标签本身弄回来；
+ * 把矩形报给主进程那一步由重新挂载的 BrowserPanel 完成。
+ */
+async function focusBrowserPanel(): Promise<void> {
+  showRightPanel.value = true
+  if (!findOrFocusBrowserTab()) addPanelTab('browser')
+  await nextTick()
+}
+
+watch(() => hostState.raiseSeq, () => {
+  void focusBrowserPanel()
 })
 
 /** 点击目录树文件：已打开则切到该标签，当前是空标签则就地载入，否则新开一个 */
@@ -807,11 +828,15 @@ onMounted(() => {
   window.addEventListener('keydown', handleHomeKeydown)
   // 未手动调宽时，跟随窗口尺寸保持默认 45%
   window.addEventListener('resize', applyDefaultRightPanelWidth)
+  // 宿主事件的监听挂在模块上而不是面板组件上：浏览器标签切走时 BrowserPanel 会被卸载，
+  // 但 Agent 那边的 browser-raise 还得有人接，所以由常驻的首页把订阅撑住
+  ensureHostListeners()
 })
 
 onUnmounted(() => {
   window.removeEventListener('keydown', handleHomeKeydown)
   window.removeEventListener('resize', applyDefaultRightPanelWidth)
+  disposeHostListeners()
 })
 </script>
 

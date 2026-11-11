@@ -46,6 +46,8 @@ export async function loadPlugin(filePath: string): Promise<LoadedPlugin> {
 
     // 2. 解析 YAML frontmatter
     const manifest = parseSkillMd(content)
+    // frontmatter 之外的正文就是「这个能力该怎么用」，随工具一起发给模型（SKILL.md 写法）
+    const guidance = extractFrontmatter(content).body.trim()
 
     // 3. 转换工具定义
     const toolDefinitions = manifest.tools.map(toToolDefinition)
@@ -71,6 +73,7 @@ export async function loadPlugin(filePath: string): Promise<LoadedPlugin> {
       dirPath,
       toolDefinitions,
       handlers,
+      guidance: guidance || undefined,
       status: 'loaded',
       loadedAt: Date.now()
     }

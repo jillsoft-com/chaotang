@@ -50,6 +50,8 @@ function registerPluginSkill(plugin: LoadedPlugin): void {
     icon: manifest.icon || '🔌',
     category: manifest.category || 'system',
     tools: toolDefinitions,
+    // SKILL.md 正文 = 行为契约，只有工具被选中发给模型时才会被拼进 system prompt
+    guidance: plugin.guidance,
     config: { timeout: 30000 },
     enabled: true
   }

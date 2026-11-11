@@ -15,7 +15,7 @@ import { CoordinatorAgent } from '@/services/agent'
 import { taskScheduler } from '@/services/agent'
 import { compressContext, getCompressThreshold, countMessageChars } from '@/services/agent/context-compressor'
 import { memoryStore } from '@/services/memory'
-import { skillRegistry, selectToolsForTopic, estimateToolTokens } from '@/services/skills'
+import { skillRegistry, selectToolsForTopic, estimateToolTokens, buildSkillGuidance } from '@/services/skills'
 import { toolExecutor } from '@/services/tools/executor'
 import { getProjectIndex, generateContextHint } from '@/services/agent/repository-context'
 import { mcpService } from '@/services/mcp'
@@ -1654,7 +1654,8 @@ async function runMinisterTurn(params: {
   const allToolDefs = combinedDefs.length > 0 ? combinedDefs : skillRegistry.getToolDefinitionsForMinister('chancellor')
 
   const messages: ChatMessage[] = [
-    { role: 'system', content: systemPrompt + dirHint + agentsMdHint + memoryHint + repoContextHint + visionPromptHint(provider.visionCapable === true) },
+    // 契约只在本轮真的发出了这组工具时才拼进来（如浏览器那套“先 state 再动作、没画面不要重试”）
+    { role: 'system', content: systemPrompt + dirHint + agentsMdHint + memoryHint + repoContextHint + buildSkillGuidance(allToolDefs) + visionPromptHint(provider.visionCapable === true) },
     { role: 'user', content: userMessage }
   ]
   attachUserImages(messages, provider.visionCapable === true)

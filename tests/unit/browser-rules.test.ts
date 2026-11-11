@@ -156,26 +156,67 @@ describe('limitText', () => {
   })
 })
 
-describe('resolveVisibility', () => {
-  it('未挂载时仍可读写 DOM 但不能截图', () => {
-    const v = rules.resolveVisibility({ mounted: false, windowVisible: true, minimized: false, width: 900, height: 600 })
+describe('resolveCapability', () => {
+  // 以下判定逐格对应真事件矩阵探针的实测结论：只信「页面里收到的事件」，
+  // 不信 CDP 命令的返回值。四位能力的失效边界各不相同，不能打包成一个关卡。
+
+  it('未挂载：键盘仍可送达，滚轮/点击/截图都不行', () => {
+    const v = rules.resolveCapability({ mounted: false, windowVisible: true, minimized: false, width: 900, height: 600 })
     expect(v.level).toBe('detached')
-    expect(v.canCapture).toBe(false)
-    expect(v.canDom).toBe(true)
+    expect(v).toMatchObject({ canKey: true, canWheel: false, canClick: false, canCapture: false, canDom: true })
   })
 
-  it('最小化优先于尺寸判定', () => {
-    expect(rules.resolveVisibility({ mounted: true, minimized: true, width: 900, height: 600 }).level).toBe('minimized')
+  it('已挂载且窗口可见：四位能力全通', () => {
+    const v = rules.resolveCapability({ mounted: true, windowVisible: true, minimized: false, width: 900, height: 600 })
+    expect(v).toMatchObject({ level: 'visible', canKey: true, canWheel: true, canClick: true, canCapture: true })
+    expect(v.clickHint).toBe('')
+    expect(v.captureHint).toBe('')
   })
 
-  it('窗口隐藏与零尺寸分别给出提示', () => {
-    expect(rules.resolveVisibility({ mounted: true, windowVisible: false }).level).toBe('hidden')
-    expect(rules.resolveVisibility({ mounted: true, windowVisible: true, width: 1, height: 600 }).level).toBe('zero-size')
+  it('最小化：键盘滚动照旧，点击与截图失效', () => {
+    const v = rules.resolveCapability({ mounted: true, minimized: true, windowVisible: true, width: 900, height: 600 })
+    expect(v.level).toBe('minimized')
+    expect(v).toMatchObject({ canKey: true, canWheel: true, canClick: false, canCapture: false })
+    expect(v.clickHint).toContain('最小化')
   })
 
-  it('已挂载且窗口可见才算可截图', () => {
-    const v = rules.resolveVisibility({ mounted: true, windowVisible: true, minimized: false, width: 900, height: 600 })
-    expect(v).toMatchObject({ level: 'visible', canCapture: true, canDom: true })
+  it('显示过又被藏起来：抑制点击与截图', () => {
+    const v = rules.resolveCapability({ mounted: true, windowVisible: false, width: 900, height: 600 })
+    expect(v.level).toBe('hidden')
+    expect(v).toMatchObject({ canWheel: true, canClick: false, canCapture: false })
+  })
+
+  it('从未显示的 ghost 宿主不算被藏起来：鼠标事件不该被误抑制', () => {
+    const v = rules.resolveCapability({ mounted: true, windowVisible: false, everShown: false, width: 900, height: 600 })
+    expect(v).toMatchObject({ level: 'visible', canClick: true, canCapture: true, canWheel: true })
+  })
+
+  it('零尺寸：有表面但没有命中目标，只有键盘例外', () => {
+    const v = rules.resolveCapability({ mounted: true, windowVisible: true, width: 1, height: 600 })
+    expect(v.level).toBe('zero-size')
+    expect(v).toMatchObject({ canKey: true, canWheel: false, canClick: false, canCapture: false })
+  })
+
+  it('离屏挂载：出帧不依赖可见性，但鼠标点击到不了页面', () => {
+    const v = rules.resolveCapability({ mounted: true, offscreen: true, windowVisible: false, width: 900, height: 600 })
+    expect(v).toMatchObject({ canCapture: true, canClick: false, canWheel: true, canKey: true })
+    expect(v.captureHint).toBe('')
+  })
+
+  it('离屏 + 最小化：画面仍出帧，点击仍失效', () => {
+    const v = rules.resolveCapability({ mounted: true, offscreen: true, minimized: true, width: 900, height: 600 })
+    expect(v.level).toBe('minimized')
+    expect(v).toMatchObject({ canCapture: true, canClick: false, canWheel: true })
+  })
+
+  it('reason 与 hint 分开给：退化路径要对各自的位说各自的话', () => {
+    const v = rules.resolveCapability({ mounted: true, windowVisible: true, width: 900, height: 600 })
+    expect(v.reason).toBe('')
+    expect(v.wheelHint).toBe('')
+  })
+
+  it('旧名字 resolveVisibility 是同一个函数', () => {
+    expect(rules.resolveVisibility).toBe(rules.resolveCapability)
   })
 })
 
@@ -199,5 +240,210 @@ describe('常量表', () => {
       expect(rules.KEY_CODE_TABLE[key].windowsVirtualKeyCode).toBeGreaterThan(0)
     }
     expect(rules.KEY_CODE_TABLE['KeyA']).toBeUndefined()
+  })
+})
+
+// ============ 安全（M6） ============
+
+describe('normalizeVersion / buildUserAgent', () => {
+  it('版本串整成四段，拿不准时退回真实 Chrome 120', () => {
+    expect(rules.normalizeVersion('120')).toBe('120.0.0.0')
+    expect(rules.normalizeVersion('118.0.5993.88')).toBe('118.0.5993.88')
+    expect(rules.normalizeVersion('1.2.3.4.5')).toBe('1.2.3.4')
+    expect(rules.normalizeVersion('abc')).toBe('120.0.6099.109')
+    expect(rules.normalizeVersion('')).toBe('120.0.6099.109')
+  })
+
+  it('拼出的 UA 不含 Electron 痕迹', () => {
+    const ua = rules.buildUserAgent('120.0.6099.109', 'win32')
+    expect(ua).toBe('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.109 Safari/537.36')
+    for (const s of [ua, rules.buildUserAgent('120', 'darwin'), rules.buildUserAgent('120', 'linux')]) {
+      expect(s).not.toMatch(/Electron|chaotang/i)
+    }
+    // 平台认不出来时退回 linux，不能留下 undefined
+    expect(rules.buildUserAgent('120', 'freebsd')).toContain('X11; Linux x86_64')
+  })
+})
+
+describe('buildClientHints', () => {
+  const hints = rules.buildClientHints({ chromeVersion: '120.0.6099.109', platform: 'win32', arch: 'x64' })
+
+  it('品牌列表没有 Electron，major 与 fullVersion 对齐', () => {
+    expect(JSON.stringify(hints.metadata)).not.toMatch(/Electron/i)
+    expect(hints.metadata.brands.map(b => b.brand)).toEqual([rules.NOT_BRAND, 'Chromium', 'Google Chrome'])
+    expect(hints.metadata.brands.every(b => /^[0-9]+$/.test(b.version))).toBe(true)
+    expect(hints.metadata.brands[1].version).toBe('120')
+    expect(hints.metadata.fullVersion).toBe('120.0.6099.109')
+    expect(hints.metadata.mobile).toBe(false)
+    expect(hints.metadata.platform).toBe('Windows')
+    expect(hints.metadata.architecture).toBe('x86')
+    expect(hints.metadata.model).toBe('')
+  })
+
+  it('arm64 只影响 architecture 字段', () => {
+    expect(rules.buildClientHints({ chromeVersion: '120', platform: 'darwin', arch: 'arm64' }).metadata.architecture).toBe('arm')
+  })
+
+  it('请求头形式与 Chrome 一致（ua-platform 带引号、mobile 为 ?0）', () => {
+    expect(hints.headers['sec-ch-ua']).toContain(`"${rules.NOT_BRAND}";v="8"`)
+    expect(hints.headers['sec-ch-ua-mobile']).toBe('?0')
+    expect(hints.headers['sec-ch-ua-platform']).toBe('"Windows"')
+    expect(hints.headers['user-agent']).toBe(hints.userAgent)
+  })
+})
+
+describe('applyClientHintHeaders', () => {
+  const hints = rules.buildClientHints({ chromeVersion: '120.0.6099.109', platform: 'win32' })
+
+  it('只改写已有的头，键名大小写不同也能命中', () => {
+    const r = rules.applyClientHintHeaders({
+      'Sec-CH-UA': '"Electron";v="33", "Chromium";v="120"',
+      'sec-ch-ua-platform': '"macOS"',
+      accept: '*/*'
+    }, hints)
+    expect(r.changed).toBe(true)
+    expect(r.headers['Sec-CH-UA']).toBe(hints.headers['sec-ch-ua'])
+    expect(r.headers['sec-ch-ua-platform']).toBe('"Windows"')
+    expect(r.headers.accept).toBe('*/*')
+    expect(JSON.stringify(r.headers)).not.toMatch(/Electron/i)
+  })
+
+  it('原本没带的 Client Hints 不无中生有', () => {
+    const r = rules.applyClientHintHeaders({ accept: '*/*' }, hints)
+    expect(r.changed).toBe(false)
+    expect(Object.keys(r.headers)).toEqual(['accept'])
+  })
+
+  it('空输入不抛异常', () => {
+    expect(rules.applyClientHintHeaders(null, hints)).toEqual({ headers: {}, changed: false })
+    expect(rules.applyClientHintHeaders({ a: 'b' }, null)).toEqual({ headers: { a: 'b' }, changed: false })
+  })
+})
+
+describe('navigationAllowed', () => {
+  it('非 http(s) 无条件拒绝，与白名单开关无关', () => {
+    for (const bad of ['mailto:a@b.com', 'file:///C:/x', 'javascript:alert(1)']) {
+      const r = rules.navigationAllowed(bad, { allowlistEnabled: false, allowlist: [] })
+      expect(r.ok).toBe(false)
+      expect(r.kind).toBe('protocol')
+    }
+  })
+
+  it('白名单关闭时 http(s) 放行', () => {
+    expect(rules.navigationAllowed('https://example.com', { allowlistEnabled: false, allowlist: [] }))
+      .toEqual({ ok: true, reason: '', kind: '' })
+  })
+
+  it('白名单开启时越界域名给出可展示的原因', () => {
+    const r = rules.navigationAllowed('https://evil.io/x', { allowlistEnabled: true, allowlist: ['example.com'] })
+    expect(r.ok).toBe(false)
+    expect(r.kind).toBe('allowlist')
+    expect(r.reason).toContain('evil.io')
+  })
+})
+
+describe('blockedRequestTypes / requestBlocked', () => {
+  const base = { allowlistEnabled: true, allowlist: ['example.com'] }
+  const strict = { ...base, strictAllowlist: true }
+
+  it('分级：关闭不拦、开启拦子框架、严格再拦长期通道', () => {
+    expect(rules.blockedRequestTypes({ allowlistEnabled: false })).toEqual([])
+    expect(rules.blockedRequestTypes(base)).toEqual(['subFrame'])
+    // 用的是 Electron 的类型名（实测 xhr / webSocket），不是 webRequest 规范里那套小写下划线名
+    expect(rules.blockedRequestTypes(strict)).toContain('xhr')
+    expect(rules.blockedRequestTypes(strict)).toContain('webSocket')
+    // 规范名作为兜底保留：哪天 Electron 改了映射仍然拦得住
+    expect(rules.blockedRequestTypes(strict)).toContain('xmlhttprequest')
+    expect(rules.blockedRequestTypes(strict)).toContain('websocket')
+  })
+
+  it('白名单外的 iframe 被拦，图片脚本不动', () => {
+    expect(rules.requestBlocked({ url: 'https://evil.io/embed', resourceType: 'subFrame' }, base, {})).toBe(true)
+    expect(rules.requestBlocked({ url: 'https://evil.io/x.png', resourceType: 'image' }, base, {})).toBe(false)
+    expect(rules.requestBlocked({ url: 'https://evil.io/a.js', resourceType: 'script' }, base, {})).toBe(false)
+  })
+
+  it('同源 XHR 不拦，否则页面瘫掉；严格模式也不破这条', () => {
+    const opts = { mainFrameUrl: 'https://example.com/page' }
+    expect(rules.requestBlocked({ url: 'https://example.com/api', resourceType: 'xhr' }, strict, opts)).toBe(false)
+    expect(rules.requestBlocked({ url: 'https://other.io/api', resourceType: 'xhr' }, strict, opts)).toBe(true)
+    expect(rules.requestBlocked({ url: 'https://other.io/api', resourceType: 'xhr' }, base, opts)).toBe(false)
+    expect(rules.requestBlocked({ url: 'wss://other.io/live', resourceType: 'webSocket' }, strict, opts)).toBe(true)
+    // 同源 WebSocket 也是正经生意：不能当成“跳出白名单”
+    expect(rules.requestBlocked({ url: 'wss://example.com/live', resourceType: 'webSocket' }, strict, opts)).toBe(false)
+    expect(rules.requestBlocked({ url: 'wss://other.io/live', resourceType: 'webSocket' }, base, opts)).toBe(false)
+  })
+
+  it('非 http 地址里只有会离机的才拦：子框架与 WebSocket', () => {
+    expect(rules.requestBlocked({ url: 'file:///C:/x', resourceType: 'subFrame' }, base, {})).toBe(true)
+    expect(rules.requestBlocked({ url: 'data:text/html,hi', resourceType: 'subFrame' }, base, {})).toBe(true)
+    expect(rules.requestBlocked({ url: 'ws://other.io/live', resourceType: 'webSocket' }, strict, { mainFrameUrl: 'https://example.com/' })).toBe(true)
+    // 严格模式下把 blob:/data: 一起拦掉，只会让正常页面的本地资源也打不开
+    expect(rules.requestBlocked({ url: 'blob:https://example.com/x', resourceType: 'other' }, strict, { mainFrameUrl: 'https://example.com/' })).toBe(false)
+  })
+
+  it('白名单关闭时一律放行（兼容旧行为）', () => {
+    expect(rules.requestBlocked({ url: 'https://evil.io/e', resourceType: 'subFrame' }, null, {})).toBe(false)
+    expect(rules.requestBlocked(null, strict, {})).toBe(false)
+  })
+})
+
+describe('holdDecision', () => {
+  it('接管期只放行取数类动作', () => {
+    for (const a of ['state', 'snapshot', 'query', 'evaluate', 'screenshot', 'frame-evaluate', 'tab-list']) {
+      expect(rules.holdDecision(a).allowed).toBe(true)
+    }
+  })
+
+  it('接管期拦住写操作并给出下一步', () => {
+    for (const a of ['click', 'type', 'navigate', 'scroll', 'keyboard', 'hover']) {
+      const d = rules.holdDecision(a)
+      expect(d.allowed).toBe(false)
+      expect(d.error).toContain('MANUAL_HOLD')
+      expect(d.hint).toContain('接管')
+    }
+    expect(rules.holdDecision('').allowed).toBe(false)
+    expect(rules.holdDecision(undefined).allowed).toBe(false)
+  })
+})
+
+describe('controlPlaneRefused / isUserDrivingAction', () => {
+  it('控制面动作对 Agent 拒接，取数与页面动作不受影响', () => {
+    for (const a of ['set-policy', 'set-hold', 'set-auto-raise', 'set-bounds', 'viewport', 'detach', 'attach']) {
+      const r = rules.controlPlaneRefused(a)
+      expect(r).not.toBeNull()
+      expect(r!.error).toContain('SECURITY_CONTROL')
+      expect(rules.CONTROL_PLANE_ACTIONS.has(a)).toBe(true)
+    }
+    for (const a of ['state', 'navigate', 'click', 'tab-open', 'close']) {
+      expect(rules.controlPlaneRefused(a)).toBeNull()
+    }
+    expect(rules.controlPlaneRefused(undefined)).toBeNull()
+  })
+
+  it("用户在开车的那几个动作会触发自动上锁", () => {
+    for (const a of ['click', 'type', 'keyboard', 'hover', 'scroll', 'navigate', 'reload', 'mouse-wheel']) {
+      expect(rules.isUserDrivingAction(a)).toBe(true)
+    }
+    // 取数与控制面不算“开车”：面板切标签页、报尺寸不应该把 Agent 锁住
+    for (const a of ['state', 'snapshot', 'query', 'tab-list', 'set-bounds', 'detach', 'set-hold']) {
+      expect(rules.isUserDrivingAction(a)).toBe(false)
+    }
+    expect(rules.isUserDrivingAction(undefined)).toBe(false)
+  })
+})
+
+describe('isUserInputEvent', () => {
+  it('只认新的按下事件', () => {
+    expect(rules.isUserInputEvent({ type: 'keyDown' })).toBe(true)
+    expect(rules.isUserInputEvent({ type: 'mouseDown' })).toBe(true)
+    expect(rules.isUserInputEvent({ type: 'keyUp' })).toBe(false)
+    expect(rules.isUserInputEvent({ type: 'char' })).toBe(false)
+    expect(rules.isUserInputEvent(null)).toBe(false)
+  })
+
+  it('按住不放与 CDP 输入窗口内都不算接管意图', () => {
+    expect(rules.isUserInputEvent({ type: 'keyDown', isAutoRepeat: true })).toBe(false)
+    expect(rules.isUserInputEvent({ type: 'keyDown' }, { withinCdpWindow: true })).toBe(false)
   })
 })

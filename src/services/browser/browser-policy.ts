@@ -21,6 +21,11 @@ export interface BrowserPolicy {
   allowlistEnabled: boolean
   /** 白名单域名（支持裸域与子域，如 example.com 放行 a.example.com） */
   allowlist: string[]
+  /**
+   * 严格白名单：除了子框架跳转，连 XHR/WebSocket/SSE/信标这些能长期外送数据的通道也一起管。
+   * 代价是很多正常站点会残缺（CDN 与接口域不在名单里时页面自己就瘫了），所以默认关。
+   */
+  strictAllowlist: boolean
   /** 每次导航前人工确认（仅 Electron 桌面版面板内生效） */
   confirmNavigation: boolean
 }
@@ -28,6 +33,7 @@ export interface BrowserPolicy {
 export const DEFAULT_BROWSER_POLICY: BrowserPolicy = {
   allowlistEnabled: false,
   allowlist: [],
+  strictAllowlist: false,
   confirmNavigation: false
 }
 
@@ -90,6 +96,7 @@ export function loadBrowserPolicy(): BrowserPolicy {
       Object.assign(browserPolicy, {
         allowlistEnabled: !!parsed.allowlistEnabled,
         allowlist: Array.isArray(parsed.allowlist) ? parsed.allowlist.map(normalizeHost).filter(Boolean) : [],
+        strictAllowlist: !!parsed.strictAllowlist,
         confirmNavigation: !!parsed.confirmNavigation
       })
     }
@@ -110,14 +117,27 @@ export function saveBrowserPolicy(): void {
   void syncPolicyToMain()
 }
 
-/** 下发策略到主进程（主进程 navigate 兜底拦截依赖它） */
+/**
+ * 下发策略到主进程（主进程 navigate 兜底拦截依赖它）。
+ *
+ * 必须走宿主通道：内嵌宿主读的是自己那份 policy，
+ * 下发失败就等于用户以为白名单生效了、而主进程手里还是默认的“关闭”。
+ */
 export async function syncPolicyToMain(): Promise<void> {
-  if (!window.electronAPI?.browserAction) return
+  const api = window.electronAPI
+  if (!api) return
+  const params = {
+    allowlistEnabled: browserPolicy.allowlistEnabled,
+    allowlist: cleanAllowlist(browserPolicy),
+    strictAllowlist: browserPolicy.strictAllowlist
+  }
   try {
-    await window.electronAPI.browserAction({
-      action: 'set-policy',
-      params: { allowlistEnabled: browserPolicy.allowlistEnabled, allowlist: cleanAllowlist(browserPolicy) }
-    })
+    // 宿主通道不在时直接告警而不是静默退回：那等于用户以为白名单生效了
+    if (!api.browserHostAction) {
+      console.warn('[Browser] 宿主通道不可用，白名单未能下发到内嵌浏览器，请重启应用')
+      return
+    }
+    await api.browserHostAction({ action: 'set-policy', params, actor: 'user' })
   } catch {
     // 主进程未支持该 action 时忽略：渲染层仍会做一层校验
   }
@@ -125,7 +145,7 @@ export async function syncPolicyToMain(): Promise<void> {
 
 /**
  * 应用启动时调用：载入策略并下发主进程。
- * 主进程的浏览器实例是按需创建的，策略必须先于首次 navigate 到位。
+ * 宿主的标签页是按需创建的，策略必须先于首次 navigate 到位。
  */
 export function initBrowserPolicy(): void {
   loadBrowserPolicy()

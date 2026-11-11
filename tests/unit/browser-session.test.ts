@@ -1,19 +1,17 @@
 /**
- * 浏览器面板共享状态测试
+ * 浏览器共享状态测试（单轨：内嵌宿主）
  *
  * 覆盖：
- * - 访问历史指针（前进/后退可用性）
- * - IPC 返回结果同步进共享状态
+ * - IPC 返回结果同步进共享状态（人机看到同一份 URL/标题）
  * - Agent 占用引用计数
  * - 人工接管期间的等待与超时报错
+ *
+ * 宿主推送的那一半另有 browser-host-session.test.ts，两边不要串。
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import {
   browserView,
-  recordUrl,
-  canGoBack,
-  canGoForward,
   applyPageInfo,
   runBrowserAction,
   beginAgentUse,
@@ -22,74 +20,27 @@ import {
   resetBrowserView
 } from '@/services/browser/browser-session'
 
-const mockBrowserAction = vi.fn()
+const mockHostAction = vi.fn()
 
 beforeEach(() => {
   // 复位单例状态，避免用例间相互影响
   browserView.url = ''
   browserView.title = ''
   browserView.active = false
-  browserView.image = ''
   browserView.viewport = { width: 1280, height: 720 }
   browserView.agentBusy = false
   browserView.agentLabel = ''
   browserView.manualHold = false
   browserView.lastError = ''
-  browserView.navHistory = []
-  browserView.navIndex = -1
-  mockBrowserAction.mockReset()
+  mockHostAction.mockReset()
   Object.defineProperty(window, 'electronAPI', {
     configurable: true,
-    value: { browserAction: mockBrowserAction }
+    value: { browserHostAction: mockHostAction }
   })
 })
 
 afterEach(() => {
   vi.restoreAllMocks()
-})
-
-describe('访问历史指针', () => {
-  it('首个地址建立历史且不启用后退', () => {
-    recordUrl('https://a.com')
-    expect(browserView.navHistory).toEqual(['https://a.com'])
-    expect(browserView.navIndex).toBe(0)
-    expect(canGoBack()).toBe(false)
-    expect(canGoForward()).toBe(false)
-  })
-
-  it('新导航截断尾部的前进记录', () => {
-    recordUrl('https://a.com')
-    recordUrl('https://b.com')
-    recordUrl('https://c.com')
-    recordUrl('https://b.com', true)
-    expect(browserView.navIndex).toBe(1)
-    expect(canGoForward()).toBe(true)
-    recordUrl('https://d.com')
-    expect(browserView.navHistory).toEqual(['https://a.com', 'https://b.com', 'https://d.com'])
-    expect(canGoForward()).toBe(false)
-  })
-
-  it('同一地址重复记录不增长历史', () => {
-    recordUrl('https://a.com')
-    recordUrl('https://a.com')
-    expect(browserView.navHistory).toHaveLength(1)
-  })
-
-  it('about:blank 不进入历史', () => {
-    recordUrl('about:blank')
-    expect(browserView.navHistory).toEqual([])
-    expect(browserView.navIndex).toBe(-1)
-  })
-
-  it('后退命中历史时移动指针而不是追加', () => {
-    recordUrl('https://a.com')
-    recordUrl('https://b.com')
-    recordUrl('https://a.com', true)
-    expect(browserView.navHistory).toHaveLength(2)
-    expect(browserView.navIndex).toBe(0)
-    expect(canGoBack()).toBe(false)
-    expect(canGoForward()).toBe(true)
-  })
 })
 
 describe('applyPageInfo', () => {
@@ -103,10 +54,10 @@ describe('applyPageInfo', () => {
   })
 
   it('失败时只记录错误，不动地址', () => {
-    recordUrl('https://a.com')
+    applyPageInfo({ success: true, url: 'https://a.com' })
     applyPageInfo({ success: false, error: 'DOMAIN_BLOCKED: evil.com' })
     expect(browserView.lastError).toContain('DOMAIN_BLOCKED')
-    expect(browserView.url).toBe('')
+    expect(browserView.url).toBe('https://a.com')
   })
 
   it('回到空白页时 active 置否', () => {
@@ -114,31 +65,44 @@ describe('applyPageInfo', () => {
     applyPageInfo({ success: true, active: false, url: 'about:blank' })
     expect(browserView.active).toBe(false)
   })
+
+  it('接管锁跟着主进程的返回值走', () => {
+    applyPageInfo({ success: true, manualHold: true })
+    expect(browserView.manualHold).toBe(true)
+    // 缺字段时不能把已有值抹掉：back 这类动作只回 url/title
+    applyPageInfo({ success: true, url: 'https://a.com' })
+    expect(browserView.manualHold).toBe(true)
+  })
 })
 
 describe('runBrowserAction', () => {
   it('透传动作并把结果同步到共享状态', async () => {
-    mockBrowserAction.mockResolvedValue({ success: true, url: 'https://a.com', title: 'A' })
+    mockHostAction.mockResolvedValue({ success: true, url: 'https://a.com', title: 'A' })
     const res = await runBrowserAction('navigate', { url: 'https://a.com' })
     expect(res.success).toBe(true)
-    expect(mockBrowserAction).toHaveBeenCalledWith({ action: 'navigate', params: { url: 'https://a.com' } })
+    expect(mockHostAction).toHaveBeenCalledWith({
+      action: 'navigate',
+      params: { url: 'https://a.com' },
+      actor: 'user'
+    })
     expect(browserView.title).toBe('A')
   })
 
-  it('历史类动作以 viaHistory 方式记录地址', async () => {
-    recordUrl('https://a.com')
-    recordUrl('https://b.com')
-    mockBrowserAction.mockResolvedValue({ success: true, moved: true, url: 'https://a.com', title: 'A' })
-    await runBrowserAction('back', {}, true)
-    expect(browserView.navIndex).toBe(0)
-    expect(browserView.navHistory).toHaveLength(2)
+  it('Agent 侧的身份原样送到主进程', async () => {
+    mockHostAction.mockResolvedValue({ success: true })
+    await runBrowserAction('click', { selector: '#btn' }, { actor: 'agent' })
+    expect(mockHostAction).toHaveBeenCalledWith({
+      action: 'click',
+      params: { selector: '#btn' },
+      actor: 'agent'
+    })
   })
 
   it('失败时把错误写进 lastError 并原样返回', async () => {
-    mockBrowserAction.mockResolvedValue({ success: false, error: 'Playwright 未安装' })
-    const res = await runBrowserAction('navigate', { url: 'https://a.com' })
+    mockHostAction.mockResolvedValue({ success: false, error: 'MANUAL_HOLD: 用户正在接管页面' })
+    const res = await runBrowserAction('click', { selector: '#btn' }, { actor: 'agent' })
     expect(res.success).toBe(false)
-    expect(browserView.lastError).toBe('Playwright 未安装')
+    expect(browserView.lastError).toContain('MANUAL_HOLD')
   })
 })
 
@@ -187,18 +151,16 @@ describe('人工接管', () => {
 })
 
 describe('resetBrowserView', () => {
-  it('关闭实例后清空全部状态', async () => {
-    recordUrl('https://a.com')
-    browserView.image = 'data:image/jpeg;base64,AA'
-    mockBrowserAction.mockResolvedValue({ success: true, message: '浏览器已关闭' })
+  it('清空页面表象与接管标记', () => {
+    applyPageInfo({ success: true, url: 'https://a.com', title: 'A', manualHold: true })
+    browserView.lastError = 'DOMAIN_BLOCKED'
 
-    await resetBrowserView()
+    resetBrowserView()
 
-    expect(mockBrowserAction).toHaveBeenCalledWith({ action: 'close', params: {} })
-    expect(browserView.navHistory).toEqual([])
-    expect(browserView.navIndex).toBe(-1)
-    expect(browserView.image).toBe('')
+    expect(browserView.url).toBe('')
+    expect(browserView.title).toBe('')
     expect(browserView.active).toBe(false)
+    expect(browserView.lastError).toBe('')
     expect(browserView.manualHold).toBe(false)
   })
 })

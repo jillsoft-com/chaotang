@@ -60,7 +60,6 @@
     "marked": "^12.0.2",
     "pdf-parse": "^1.1.1",
     "pinia": "^2.1.7",
-    "playwright": "1.60.0",
     "vue": "^3.4.21",
     "vue-router": "^4.3.0",
     "xlsx": "^0.18.5"

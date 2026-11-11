@@ -39,6 +39,7 @@ import type { LintFixResult } from './lint-fix-loop'
 import type { SubAgentProfile } from './subagent-registry'
 import { DEFAULT_MAX_TOOL_ROUNDS } from './round-budget'
 import { pushToolResultMessage, attachRoundImages, visionPromptHint } from './vision-bridge'
+import { buildSkillGuidance } from '@/services/skills/guidance'
 
 // ============ 类型 ============
 
@@ -275,7 +276,15 @@ export class AutonomousEngine {
     const messages: ChatMessage[] = [
       {
         role: 'system',
-        content: this.buildSystemPrompt(systemPrompt, workingDirectory, agentsMdHint, memoryHint) + visionPromptHint(visionCapable)
+        content: this.buildSystemPrompt(
+          systemPrompt,
+          workingDirectory,
+          agentsMdHint,
+          memoryHint,
+          // 契约跟着最终发出去的工具走：子 Agent 的黑白名单在上面已经过滤过了，
+          // 这里必须用 effectiveToolDefs，否则会给一个拿不到浏览器工具的角色念浏览器纪律
+          buildSkillGuidance(effectiveToolDefs)
+        ) + visionPromptHint(visionCapable)
       },
       {
         role: 'user',
@@ -1093,7 +1102,8 @@ export class AutonomousEngine {
     basePrompt: string,
     workingDirectory?: string,
     agentsMdHint?: string,
-    memoryHint?: string
+    memoryHint?: string,
+    skillGuidance?: string
   ): string {
     let prompt = basePrompt + AUTONOMOUS_PROMPT_SUFFIX
 
@@ -1105,6 +1115,9 @@ export class AutonomousEngine {
 
     if (agentsMdHint) prompt += agentsMdHint
     if (memoryHint) prompt += memoryHint
+    // 能力使用契约放在通用「失败就重试」规则之后：像浏览器那类“暂时没画面”的失败
+    // 不该被盲目重试，更具体的纪律要排在后面才能压住上面的通用说法
+    if (skillGuidance) prompt += skillGuidance
 
     // 三期 Phase A: 子 Agent 提示词追加
     if (this.config.subAgentProfile) {

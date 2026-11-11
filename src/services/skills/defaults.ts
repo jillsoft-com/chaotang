@@ -29,6 +29,7 @@ import {
 import {
   browserToolDefinitions, browserToolHandlers
 } from '@/services/browser/browser-tools'
+import { BROWSER_GUIDANCE } from '@/services/browser/browser-guidance'
 
 // ============ Skill 定义 ============
 
@@ -197,10 +198,12 @@ const allSkills: Array<{ skill: Skill; handlers: Record<string, any> }> = [
     skill: {
       id: 'browser',
       name: '浏览器自动化',
-      description: '打开网页、截图、获取页面结构、点击元素、填写表单、执行 JavaScript（页面实时显示在右侧浏览器面板，用户可接管）',
+      description: '操控真实浏览器：打开网页、多标签页管理、读取页面结构与元素数据、点击、填表、按键、滚动、截图、执行 JavaScript（页面实时显示在右侧浏览器面板，用户可接管）',
       icon: '🌐',
       category: 'information',
       tools: browserToolDefinitions,
+      // 行为契约跟着工具走：只要本轮发出了任意 browser_* 工具，这份契约就会被拼进 system prompt
+      guidance: BROWSER_GUIDANCE,
       config: { timeout: 30000 },
       enabled: true
     },
@@ -375,11 +378,13 @@ export function initializeSkills(): void {
   }
 
   // 3. 加载自定义插件
-  import('@/services/plugins/plugin-manager').then(({ pluginManager_loadAll }) => {
-    pluginManager_loadAll().catch(err => {
-      console.warn('[Skills] 插件加载失败:', err)
+  // 整条链都要 catch：dynamic import 本身也可能失败（循环依赖、chunk 加载错误），
+  // 写在 then 内层的 catch 只能盖住 loadAll 自己的异常，否则就是一个 Unhandled Rejection
+  import('@/services/plugins/plugin-manager')
+    .then(({ pluginManager_loadAll }) => pluginManager_loadAll())
+    .catch(err => {
+      console.error('[Skills] 插件加载失败，自定义工具本次不可用:', err)
     })
-  })
 
   console.log(`[Skills] 已注册 ${allSkills.length} 个 Skill（含浏览器自动化 + 角色专属工具 + 代码质量 + Git 工作流），完成角色绑定`)
 }

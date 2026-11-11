@@ -60,9 +60,11 @@ describe('动态工具选择器', () => {
     appStorage.setItem('enable_llm_advisor', 'false')
     initializeSkills()
 
-    // 御史只有 7 个 Skill，上限 12，应该全量返回
-    const tools = await selectToolsForTopic('censor', '请分析一下这个问题', 12)
+    // 御史绑定的工具数会随 Skill 增减而变，所以上限由实际数量推出来：
+    // 这条断言要验的是「上限够用就不要筛」，不是「御史只有七个工具」
     const allTools = skillRegistry.getSkillsForMinister('censor').flatMap(s => s.tools)
+    expect(allTools.length).toBeGreaterThan(0)
+    const tools = await selectToolsForTopic('censor', '请分析一下这个问题', allTools.length)
     expect(tools.length).toBe(allTools.length)
   })
 

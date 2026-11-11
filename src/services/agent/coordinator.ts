@@ -18,7 +18,7 @@ import { createProvider } from '@/services/llm'
 import { llmService } from '@/services/llm-config'
 import { compressContext, countMessageChars } from './context-compressor'
 import { memoryStore } from '@/services/memory'
-import { selectToolsForTopic, attributeError, checkReport } from '@/services/skills'
+import { selectToolsForTopic, attributeError, checkReport, buildSkillGuidance } from '@/services/skills'
 import { toolExecutor } from '@/services/tools/executor'
 import { findPresetById, getCurrentDynastyId } from '@/services/dynasty-presets'
 import { AutonomousEngine } from './autonomous-engine'
@@ -1001,6 +1001,9 @@ ${workerDesc}
       ? `\n\nℹ️ 工程内 docs/任务分解.md 记录了丞相拆解的完整任务清单、职责分工、验收标准与实时执行状态。开始前建议用 read_file 查阅，了解整体进度、你所依赖的前序任务是否完成，以及最新要求。`
       : ''
 
+    // 本轮真正发出去的工具对应哪些能力纪律，就只注入那几段（自主路径由引擎按 effectiveToolDefs 自己拼）
+    const skillGuidance = buildSkillGuidance(toolDefs)
+
     // Phase 5: 语义检索增强 — 为 Worker 注入相关代码上下文
     let workerSemanticHint = ''
     if (workingDirectory) {
@@ -1036,7 +1039,7 @@ ${workerDesc}
 协调者分配给你的任务：${workerTask.task}
 ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
 
-请认真执行任务。如果任务要求你创建文件，请使用 write_file 和 create_directory 工具生成实际的项目文件。完成后给出你的交付物总结。${agentsMdHint || ''}${memoryHint || ''}${workerSemanticHint}${taskDocHint}`
+请认真执行任务。如果任务要求你创建文件，请使用 write_file 和 create_directory 工具生成实际的项目文件。完成后给出你的交付物总结。${agentsMdHint || ''}${memoryHint || ''}${workerSemanticHint}${taskDocHint}${skillGuidance}`
           }
           return `${minister.systemPrompt}
 
@@ -1045,7 +1048,7 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
 丞相分配给你的任务：${workerTask.task}
 ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
 
-请认真执行任务，必要时使用可用的工具获取信息。完成后给出你的分析结论。${agentsMdHint || ''}${memoryHint || ''}${workerSemanticHint}${taskDocHint}`
+请认真执行任务，必要时使用可用的工具获取信息。完成后给出你的分析结论。${agentsMdHint || ''}${memoryHint || ''}${workerSemanticHint}${taskDocHint}${skillGuidance}`
         })() + visionPromptHint(provider.visionCapable === true)
       },
       {

@@ -54,9 +54,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 任意文件读写通道（对话框授权的一次性令牌机制）
   readArbitraryFile: (filePath, token) => ipcRenderer.invoke('read-arbitrary-file', filePath, token),
   writeArbitraryFile: (filePath, content, token) => ipcRenderer.invoke('write-arbitrary-file', filePath, content, token),
-  // 浏览器自动化通道
-  browserAction: (params) => ipcRenderer.invoke('browser-action', params),
-  // 内嵌浏览器宿主通道（与 Playwright 并存，由渲染进程 browser_engine 开关选用）
+  // 内嵌浏览器宿主通道：浏览器自动化只走这一条（旧的 browser-action 随 Playwright 一起删了）
   browserHostAction: (params) => ipcRenderer.invoke('browser-host-action', params),
   // 宿主主动推给面板的事件：返回卸载函数，沿用 onWebhookMessage 的写法
   onBrowserState: (callback) => {
@@ -73,6 +71,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
     const handler = (_event, data) => callback(data)
     ipcRenderer.on('browser-blocked', handler)
     return () => ipcRenderer.removeListener('browser-blocked', handler)
+  },
+  // 接管锁变化：锁由主进程持有，面板上的按钮状态是这个事件的镜像
+  onBrowserHold: (callback) => {
+    const handler = (_event, data) => callback(data)
+    ipcRenderer.on('browser-hold', handler)
+    return () => ipcRenderer.removeListener('browser-hold', handler)
   },
   onBrowserGesture: (callback) => {
     const handler = (_event, data) => callback(data)

@@ -1,46 +1,42 @@
 /**
- * 浏览器引擎开关与通道路由测试（内嵌浏览器 M2）
+ * 浏览器通道与动作能力表测试（内嵌浏览器 M7 单轨版）
  *
- * 覆盖两条容易出事的地方：
- * 1. 宿主专属动作不能静默退回 Playwright —— Playwright 没有 tab 概念，退回只会得到
- *    「未知的浏览器操作」，用户看不到真实原因；
- * 2. 存储尚未初始化时读引擎偏好会抛错，必须退回默认值而不是让面板崩掉。
+ * Playwright 通道删除后，这里守的是单轨时代最容易翻车的三件事：
+ * 1. 能力表要覆盖 BrowserActionName 全集 —— 表里漏一个，调用就会以「宿主不支持」失败；
+ * 2. 宿主通道缺失（Web 模式、旧安装包）必须明确报错，绝不静默返回成功；
+ * 3. actor 要原样送到主进程，接管锁与控制面拦截全靠它，缺省按 'user' 算。
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { appStorage } from '@/services/storage'
-import {
-  BROWSER_ENGINE_KEY,
-  EMBEDDED_ACTIONS,
-  canRouteEmbedded,
-  getBrowserEngine,
-  resetBrowserEngineCache,
-  setBrowserEngine
-} from '@/services/browser/browser-engine'
-import { browserAction, isBrowserAvailable } from '@/services/browser/browser-manager'
+import { HOST_ACTIONS, isHostAction, isHostChannelAvailable } from '@/services/browser/browser-engine'
+import { browserAction, isBrowserAvailable, type BrowserActionName } from '@/services/browser/browser-manager'
 
-/** 造一个假的 electronAPI，记录被调用的是哪条通道 */
-function mockApi(opts: { legacy?: boolean; host?: boolean }) {
-  const calls: Array<{ channel: string; action: string }> = []
-  const reply = (channel: string) => async ({ action }: { action: string }) => {
-    calls.push({ channel, action })
-    return { success: true, message: channel }
-  }
+/** BrowserActionName 里的每一个动作都必须真的被宿主提供 */
+const ALL_ACTIONS: BrowserActionName[] = [
+  'navigate', 'screenshot', 'snapshot', 'click', 'type', 'evaluate', 'close',
+  'set-policy', 'back', 'forward', 'reload', 'state', 'viewport',
+  'mouse-click', 'mouse-wheel', 'keyboard',
+  'tab-list', 'tab-open', 'tab-select', 'tab-close', 'stop',
+  'set-bounds', 'detach', 'attach', 'set-auto-raise', 'set-hold',
+  'query', 'hover', 'scroll', 'frame-evaluate'
+]
+
+let calls: Array<{ action: string; params: any; actor?: string }>
+
+/** 只暴露宿主通道，记录送出去的载荷；host=false 给的是「有 preload 但没有宿主通道」的旧安装包 */
+function mockHostApi(opts: { host?: boolean } = { host: true }) {
+  calls = []
   const api: Record<string, any> = {}
-  if (opts.legacy) api.browserAction = vi.fn(reply('legacy'))
-  if (opts.host) api.browserHostAction = vi.fn(reply('host'))
-  ;(window as any).electronAPI = Object.keys(api).length ? api : undefined
-  return calls
+  if (opts.host) {
+    api.browserHostAction = vi.fn(({ action, params, actor }: any) => {
+      calls.push({ action, params, actor })
+      return { success: true, action }
+    })
+  }
+  ;(window as any).electronAPI = api
 }
 
-/** 把持久层换成内存表，避免未初始化存储招致干扰 */
-let store: Map<string, string>
-
 beforeEach(() => {
-  store = new Map()
-  vi.spyOn(appStorage, 'getItem').mockImplementation((key: string) => store.get(key) ?? null)
-  vi.spyOn(appStorage, 'setItem').mockImplementation((key: string, value: string) => { store.set(key, value) })
-  resetBrowserEngineCache()
   ;(window as any).electronAPI = undefined
 })
 
@@ -48,83 +44,49 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
-describe('引擎偏好', () => {
-  it('存储不可用时退回 Playwright 默认值而不抛错', () => {
-    // 未 initializeAppStorage 时 getItem 会抛「本地存储尚未初始化」
-    vi.spyOn(appStorage, 'getItem').mockImplementation(() => {
-      throw new Error('本地存储尚未初始化')
-    })
-    expect(getBrowserEngine()).toBe('playwright')
-  })
-
-  it('非法存储值也退回默认值', () => {
-    store.set(BROWSER_ENGINE_KEY, 'webkit')
-    expect(getBrowserEngine()).toBe('playwright')
-  })
-
-  it('存储值可生效', () => {
-    store.set(BROWSER_ENGINE_KEY, 'embedded')
-    expect(getBrowserEngine()).toBe('embedded')
-  })
-
-  it('写入失败不影响本次生效', () => {
-    vi.spyOn(appStorage, 'setItem').mockImplementation(() => {
-      throw new Error('本地存储尚未初始化')
-    })
-    expect(setBrowserEngine('embedded')).toBe('embedded')
-    expect(getBrowserEngine()).toBe('embedded')
-  })
-
-  it('写入成功时下次读取一致', () => {
-    setBrowserEngine('embedded')
-    expect(store.get(BROWSER_ENGINE_KEY)).toBe('embedded')
-    resetBrowserEngineCache()
-    expect(getBrowserEngine()).toBe('embedded')
-  })
-})
-
 describe('动作能力表', () => {
-  it('宿主支持全部老通道动作，切引擎不会丢能力', () => {
-    for (const legacy of ['navigate', 'screenshot', 'snapshot', 'click', 'type', 'evaluate', 'close',
-      'set-policy', 'back', 'forward', 'reload', 'state', 'viewport', 'mouse-click', 'mouse-wheel', 'keyboard']) {
-      expect(canRouteEmbedded(legacy)).toBe(true)
-    }
-    expect([...EMBEDDED_ACTIONS].length).toBeGreaterThan(16)
+  it('接口声明的动作全部由宿主提供', () => {
+    for (const action of ALL_ACTIONS) expect(isHostAction(action)).toBe(true)
+    expect(HOST_ACTIONS.size).toBe(ALL_ACTIONS.length)
   })
 
-  it('未知动作不会被路由到宿主', () => {
-    expect(canRouteEmbedded('teleport')).toBe(false)
+  it('未知动作不会混进能力表', () => {
+    expect(isHostAction('teleport')).toBe(false)
+    expect(isHostAction('')).toBe(false)
+  })
+
+  it('通道可用性只认宿主通道', () => {
+    mockHostApi({ host: false })
+    expect(isHostChannelAvailable()).toBe(false)
+    mockHostApi()
+    expect(isHostChannelAvailable()).toBe(true)
   })
 })
 
-describe('通道路由', () => {
-  it('默认引擎下共用动作走 Playwright', async () => {
-    const calls = mockApi({ legacy: true, host: true })
-    setBrowserEngine('playwright')
+describe('单一路由', () => {
+  it('动作一律送到宿主，actor 原样透传', async () => {
+    mockHostApi()
+    await browserAction('tab-list', {}, { actor: 'agent' })
     await browserAction('navigate', { url: 'https://example.com' })
-    expect(calls[0]).toEqual({ channel: 'legacy', action: 'navigate' })
+    expect(calls[0]).toEqual({ action: 'tab-list', params: {}, actor: 'agent' })
+    // actor 缺省按用户算：面板按钮不能被自己的接管锁挡在门外
+    expect(calls[1]).toEqual({ action: 'navigate', params: { url: 'https://example.com' }, actor: 'user' })
   })
 
-  it('切到内嵌后共用动作走宿主', async () => {
-    const calls = mockApi({ legacy: true, host: true })
-    setBrowserEngine('embedded')
-    await browserAction('navigate', { url: 'https://example.com' })
-    expect(calls[0]).toEqual({ channel: 'host', action: 'navigate' })
+  it('能力表外的动作直接拒绝，不浪费一次 IPC', async () => {
+    mockHostApi()
+    const res = await browserAction('teleport' as BrowserActionName, {})
+    expect(res.success).toBe(false)
+    expect(res.error).toContain('宿主不支持的动作')
+    expect(calls.length).toBe(0)
   })
 
-  it('宿主专属动作即使引擎没切也走宿主', async () => {
-    const calls = mockApi({ legacy: true, host: true })
-    setBrowserEngine('playwright')
-    await browserAction('tab-list', {})
-    expect(calls[0]).toEqual({ channel: 'host', action: 'tab-list' })
-  })
-
-  it('宿主专属动作在宿主通道缺失时报错，不伪造成功', async () => {
-    mockApi({ legacy: true })
-    setBrowserEngine('playwright')
+  it('宿主通道缺失时报错，不伪造成功', async () => {
+    mockHostApi({ host: false })
     const res = await browserAction('tab-open', { url: 'https://example.com' })
     expect(res.success).toBe(false)
     expect(res.error).toContain('内嵌宿主通道不可用')
+    expect(isBrowserAvailable()).toBe(false)
   })
 
   it('Web 模式下给出可读提示', async () => {

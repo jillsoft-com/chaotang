@@ -1,9 +1,13 @@
 /**
- * 浏览器面板共享状态 — 人机共用同一个 headless 页面
+ * 浏览器共享状态 — 人机共用同一个页面
  *
  * 为什么放在渲染进程：
  * Agent 工具处理器与浏览器面板运行在同一个渲染进程里，共享一份模块级状态即可协调，
- * 不需要跨进程锁。主进程只负责持有 Playwright 单例 page。
+ * 不需要跨进程锁。页面本体归主进程的内嵌宿主。
+ *
+ * 与 browser-host-session.ts 的分工：
+ * 那份是宿主推送来的真相镜像（标签页、可见性、接管锁），本模块只留两份代码都需要看的
+ * 协调量：当前页面表象 + Agent 占用标记。历史栈不再自己记（真实页面会回答 canBack/canForward）。
  *
  * 协调规则（用户选定的「可点击 + Agent 占用时自动暂停」）：
  * - Agent 每次调用浏览器工具前置 agentBusy，面板据此禁用人工操作并提示；
@@ -12,7 +16,7 @@
  */
 
 import { reactive } from 'vue'
-import { browserAction, type BrowserActionResult } from './browser-manager'
+import { browserAction, type BrowserActionResult, type BrowserActor } from './browser-manager'
 
 const BLANK = 'about:blank'
 
@@ -31,49 +35,22 @@ export const browserView = reactive({
   title: '',
   /** 是否已导航到真实页面 */
   active: false,
-  /** 最近一帧画面（data URL） */
-  image: '',
-  /** headless 视口尺寸，用于把面板点击换算为页面坐标 */
+  /** 页面视口尺寸（宿主按面板矩形定，面板只需要知道当前尺寸，不拿它换算点击坐标） */
   viewport: { width: 1280, height: 720 } as ViewportSize,
   /** Agent 正在使用浏览器 */
   agentBusy: false,
-  /** 占用浏览器的 Agent 工具名 */
+  /** Agent 占用浏览器的工具名 */
   agentLabel: '',
-  /** 用户已接管，Agent 需等待 */
+  /** 用户已接管，Agent 需等待。
+   * 这份状态以主进程为准（面板按钮与“用户真的碰了页面”都汇到那里），
+   * 本字段只是它的镜像，供 Agent 侧的 awaitManualRelease 同步读取。 */
   manualHold: false,
   /** 最近一次失败原因 */
-  lastError: '',
-  /** 面板自维护的访问历史（Playwright 不暴露历史栈长度，据此启用前进/后退按钮） */
-  navHistory: [] as string[],
-  navIndex: -1
+  lastError: ''
 })
 
-/** 后退/前进可用性 */
-export function canGoBack(): boolean {
-  return browserView.navIndex > 0
-}
-
-export function canGoForward(): boolean {
-  return browserView.navIndex >= 0 && browserView.navIndex < browserView.navHistory.length - 1
-}
-
-/** 记录页面地址变化：命中历史则移动指针（后退/前进），否则截断尾部并追加 */
-export function recordUrl(url: string, viaHistory = false): void {
-  if (!url || url === BLANK) return
-  if (viaHistory) {
-    const i = browserView.navHistory.lastIndexOf(url)
-    if (i >= 0) browserView.navIndex = i
-    return
-  }
-  if (browserView.navHistory[browserView.navIndex] === url) return
-  const trimmed = browserView.navHistory.slice(0, browserView.navIndex + 1)
-  trimmed.push(url)
-  browserView.navHistory = trimmed
-  browserView.navIndex = trimmed.length - 1
-}
-
 /** 用 IPC 返回的页面信息刷新共享状态 */
-export function applyPageInfo(res: BrowserActionResult, viaHistory = false): void {
+export function applyPageInfo(res: BrowserActionResult): void {
   if (!res.success) {
     if (res.error) browserView.lastError = res.error
     return
@@ -82,28 +59,32 @@ export function applyPageInfo(res: BrowserActionResult, viaHistory = false): voi
   if (typeof res.url === 'string' && res.url) {
     browserView.url = res.url
     browserView.active = res.url !== BLANK
-    recordUrl(res.url, viaHistory)
   }
   if (typeof res.title === 'string') browserView.title = res.title
   const vp = res.viewport
   if (vp && typeof vp.width === 'number' && typeof vp.height === 'number') {
     browserView.viewport = { width: vp.width, height: vp.height }
   }
+  // 接管锁以主进程为准：面板按钮、用户实际操作页面、退出接管，最后都落到主进程那份状态上
+  if (typeof res.manualHold === 'boolean') browserView.manualHold = res.manualHold
   browserView.lastError = ''
 }
 
 /**
  * 统一执行浏览器操作，并把结果同步进共享状态。
  * 面板按钮与 Agent 工具都走这里，保证人机看到的是同一份 URL/标题。
+ *
+ * opts.actor：'agent' 的写操作会在接管期间被主进程拦住，
+ * 面板自己发的动作缺省 'user'，否则用户会被自己的接管锁在门外。
  */
 export async function runBrowserAction(
   action: Parameters<typeof browserAction>[0],
   params: Record<string, any> = {},
-  viaHistory = false
+  opts: { actor?: BrowserActor } = {}
 ): Promise<BrowserActionResult> {
-  const res = await browserAction(action, params)
+  const res = await browserAction(action, params, opts)
   if (res.success) {
-    applyPageInfo(res, viaHistory)
+    applyPageInfo(res)
   } else if (res.error) {
     browserView.lastError = res.error
   }
@@ -158,16 +139,11 @@ export function releaseManualHold(): void {
   browserView.manualHold = false
 }
 
-/** 关闭浏览器实例并复位状态 */
-export async function resetBrowserView(): Promise<BrowserActionResult> {
-  const res = await browserAction('close', {})
+/** 关掉整个浏览器时复位共享状态（标签页本身由 browser-host-session 的 closeAllTabs 负责） */
+export function resetBrowserView(): void {
   browserView.url = ''
   browserView.title = ''
   browserView.active = false
-  browserView.image = ''
   browserView.lastError = ''
-  browserView.navHistory = []
-  browserView.navIndex = -1
   browserView.manualHold = false
-  return res
 }

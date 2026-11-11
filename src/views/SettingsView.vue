@@ -759,7 +759,7 @@ function saveBrowserPolicyValues() {
 function applyBrowserPreset(kind: 'local' | 'docs') {
   const presets = kind === 'local'
     ? ['localhost', '127.0.0.1']
-    : ['example.com', 'github.com', 'mdn.io', 'playwright.dev']
+    : ['example.com', 'github.com', 'mdn.io', 'developer.mozilla.org']
   const merged = [...new Set([...cleanAllowlist(browserPolicy), ...presets])]
   browserAllowlistText.value = merged.join('\n')
   browserPolicy.allowlist = merged
@@ -767,17 +767,22 @@ function applyBrowserPreset(kind: 'local' | 'docs') {
 }
 
 async function checkBrowserMainSync() {
-  if (!window.electronAPI?.browserAction) {
-    ElMessage.warning('当前为 Web 模式，策略仅在本页生效')
+  const api = window.electronAPI
+  if (!api?.browserHostAction) {
+    ElMessage.warning('当前为 Web 模式（或旧安装包不带宿主通道），策略仅在本页生效')
     return
   }
   await syncPolicyToMain()
-  const res = await window.electronAPI.browserAction({ action: 'state', params: {} })
+  // 直接问在干活的那个：主进程收到策略后 state 会把它原样回传，
+  // 不一致就说明下发没落地（例如旧安装包不携带 set-policy）
+  const res = await api.browserHostAction({ action: 'state', params: {}, actor: 'user' })
   const main: Partial<BrowserPolicy> = res.policy || {}
-  if (main.allowlistEnabled === browserPolicy.allowlistEnabled) {
-    ElMessage.success(`主进程已生效：${(main.allowlist || []).length} 个域名`)
+  if (main.allowlistEnabled === browserPolicy.allowlistEnabled &&
+      !!main.strictAllowlist === !!browserPolicy.strictAllowlist) {
+    ElMessage.success(`主进程已生效：${(main.allowlist || []).length} 个域名` +
+      (main.strictAllowlist ? '（严格模式）' : ''))
   } else {
-    ElMessage.warning('主进程未接受策略，需重启应用使新的 browser-action IPC 生效')
+    ElMessage.warning('主进程未接受策略，需重启应用使新的浏览器 IPC 生效')
   }
 }
 
@@ -1779,6 +1784,16 @@ handler: |
               </div>
 
               <div v-if="browserPolicy.allowlistEnabled" style="margin-top: 8px">
+                <div class="settings-item">
+                  <div class="settings-item-info">
+                    <span class="settings-item-label">严格白名单（含页面自己的请求）</span>
+                    <span class="settings-item-desc">除了 iframe 跳转，连 XHR/WebSocket/SSE 往白名单外发数据也一并拦住；代价是不少正常站点会因为 CDN/接口域不在名单里而残。同源请求始终放行</span>
+                  </div>
+                  <el-switch v-model="browserPolicy.strictAllowlist" @change="saveBrowserPolicyValues" />
+                </div>
+              </div>
+
+              <div v-if="browserPolicy.allowlistEnabled" style="margin-top: 8px">
                 <div class="form-label-row">
                   <span>允许的域名（一行一个）</span>
                   <div style="display: flex; gap: 6px">
@@ -1807,10 +1822,13 @@ handler: |
                 <li><strong>双重校验：</strong>渲染层用于提示与确认，主进程 navigate 兜底拦截，任何一方被绕过都仍会拦截</li>
                 <li><strong>作用于 Agent：</strong>browser_navigate 同样受策略限制，被拒后模型会收到原因并改用其他方案</li>
                 <li><strong>子域匹配：</strong>白名单只按域名判定，不区分路径；如需精细控制请配合导航前人工确认</li>
-                <li><strong>仅 http/https：</strong>file:// 与其他协议在主进程直接拒绝</li>
-                <li><strong>人工接管：</strong>浏览器面板的「接管」会暂停 Agent 的浏览器操作，直到你退出接管</li>
+                <li><strong>仅 http/https：</strong>file:// 与其他协议在主进程直接拒绝，页面里的 location='mailto:…' 也不例外</li>
+                <li><strong>内嵌宿主的额外闸：</strong>页面申请摄像头/定位/通知一律拒绝，下载直接取消（严格白名单开启后才拦 XHR/WebSocket）</li>
+                <li><strong>人工接管：</strong>面板的「接管」把锁交给主进程，Agent 的写操作被拦住、取数仍可用；你在页面上动过手也会自动上锁，误触约 20 秒后自动放开</li>
+                <li><strong>策略只能由用户改：</strong>Agent 调 set-policy / set-hold 会被拒，免得模型自己拆闸</li>
+                <li><strong>身份伪装：</strong>内嵌页面用真实 Chrome 的 UA 与 Client Hints，navigator.userAgentData 里不会露出 Electron</li>
               </ul>
-              <p class="form-hint">首次使用浏览器需安装内核：<code>npx playwright install chromium</code>；主进程改动后需重启应用生效。</p>
+              <p class="form-hint">浏览器就是应用自带的内嵌页面，不需要安装内核；主进程改动后需重启应用生效。</p>
             </el-card>
           </div>
         </el-tab-pane>

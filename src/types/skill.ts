@@ -38,6 +38,16 @@ export interface Skill {
   icon?: string              // 图标 emoji
   category: SkillCategory    // 分类
   tools: ToolDefinition[]    // 该 Skill 包含的 Function Call 工具列表
+  /**
+   * 能力使用契约（行为纪律）。
+   *
+   * 只有本轮确实把这组工具发给了模型，services/skills/guidance.ts 才会把这段文字
+   * 拼进 system prompt，因此它比工具 description 更省、也更容易写清楚「先后顺序、
+   * 什么该用什么不该用、失败了说明什么」。
+   * 正文来源：内置 Skill 用 src/services/<模块>/ 下的独立 md；插件用 SKILL.md 的正文。
+   * 不要放进 src/prompts/，那个目录的文件名会被当成角色 id。
+   */
+  guidance?: string
   config?: SkillConfig       // 可选配置
   enabled: boolean           // 是否启用
 }
