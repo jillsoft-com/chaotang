@@ -18,7 +18,7 @@ import { llmService } from '@/services/llm-config'
 import { ElMessageBox } from 'element-plus'
 import { TOPIC_TEMPLATES, getTemplateCategories, applyTemplate as applyTopicTemplate } from '@/services/topic-templates'
 import type { TopicTemplate } from '@/services/topic-templates'
-import type { Attachment } from '@/types'
+import type { Attachment, FileDiffRequest, FileDiffRequestInput } from '@/types'
 import type { ProjectGroup } from '@/stores/debate'
 
 const router = useRouter()
@@ -126,6 +126,8 @@ interface PanelTab {
   title: string
   /** kind === 'file' 时当前打开的文件路径（空表示尚未选择） */
   filePath?: string
+  /** 本轮改动快照：带上时文件面板默认展示这份 diff（不依赖 git） */
+  diff?: FileDiffRequest
   /** 固定标签（任务树）：始终排在最左、不可就地改类型，但可以关闭 */
   pinned?: boolean
 }
@@ -162,6 +164,12 @@ const activeWorkDir = computed(() => debateStore.activeSession?.workingDirectory
 const editingFilePath = computed(() => {
   const tab = activePanelTab.value
   return tab.kind === 'file' ? tab.filePath || '' : ''
+})
+
+/** 当前标签附带的本轮改动快照：文件面板据此默认展示这份 diff */
+const activePanelDiff = computed<FileDiffRequest | undefined>(() => {
+  const tab = activePanelTab.value
+  return tab.kind === 'file' ? tab.diff : undefined
 })
 
 let tabSeq = 0
@@ -264,6 +272,7 @@ function setPanelTabKind(id: string, kind: PanelTabKind) {
   }
   tab.kind = kind
   tab.filePath = ''
+  tab.diff = undefined
   tab.title = kind === 'browser' ? '浏览器' : kind === 'file' ? '未选择文件' : '新标签'
 }
 
@@ -305,6 +314,7 @@ function openInEditor(path: string) {
   if (!tab.pinned && (tab.kind === 'other' || (tab.kind === 'file' && !tab.filePath))) {
     tab.kind = 'file'
     tab.filePath = path
+    tab.diff = undefined
     tab.title = fileBaseName(path)
     return
   }
@@ -313,11 +323,46 @@ function openInEditor(path: string) {
   activePanelTabId.value = id
 }
 
+/**
+ * 会话改动清单里点文件名：打开（或复用）该文件的标签，并带上本轮正文快照。
+ *
+ * 复用已有标签而不是新开：同一文件反复点开只刷新快照，不会把标签栏堆满。
+ * seq 递增让“同一路径再点一次”也能被面板感知到。
+ */
+let diffSeq = 0
+
+function openFileDiff(req: FileDiffRequestInput) {
+  if (!req?.path) return
+  const payload: FileDiffRequest = { ...req, seq: ++diffSeq }
+  showRightPanel.value = true
+  ensureRightPanelWidth(treeColWidth.value + 460)
+  const opened = panelTabs.value.find(t => t.kind === 'file' && t.filePath === payload.path)
+  if (opened) {
+    opened.diff = payload
+    activePanelTabId.value = opened.id
+    return
+  }
+  const tab = activePanelTab.value
+  if (!tab.pinned && (tab.kind === 'other' || (tab.kind === 'file' && !tab.filePath))) {
+    tab.kind = 'file'
+    tab.filePath = payload.path
+    tab.diff = payload
+    tab.title = fileBaseName(payload.path)
+    return
+  }
+  const id = newTabId()
+  panelTabs.value = [...panelTabs.value, {
+    id, kind: 'file', title: fileBaseName(payload.path), filePath: payload.path, diff: payload
+  }]
+  activePanelTabId.value = id
+}
+
 // 切换工作目录（换会话）时清空各文件标签的路径，避免跨会话残留
 watch(activeWorkDir, () => {
   for (const t of panelTabs.value) {
     if (t.kind === 'file') {
       t.filePath = ''
+      t.diff = undefined
       t.title = '未选择文件'
     }
   }
@@ -999,7 +1044,7 @@ onUnmounted(() => {
       <!-- Content Area -->
       <div class="content-area">
       <template v-if="debateStore.activeSession">
-        <ChatSession ref="chatSessionRef" :sessionId="debateStore.activeSessionId!" :key="debateStore.activeSessionId!" @open-task-tree-panel="openTaskTreePanel" />
+        <ChatSession ref="chatSessionRef" :sessionId="debateStore.activeSessionId!" :key="debateStore.activeSessionId!" @open-task-tree-panel="openTaskTreePanel" @open-file-diff="openFileDiff" />
       </template>
 
       <!-- Welcome Page -->
@@ -1188,6 +1233,7 @@ onUnmounted(() => {
               v-else-if="activePanelTab.kind === 'file' && activePanelTab.filePath && activeWorkDir"
               :file-path="activePanelTab.filePath"
               :root-dir="activeWorkDir"
+              :round-diff="activePanelDiff"
               @close="closePanelTab(activePanelTab.id)"
             />
             <!-- 内置浏览器（截图流面板，与 Agent 共用同一个 headless 页面） -->

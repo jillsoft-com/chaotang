@@ -210,10 +210,11 @@ export class AutonomousEngine {
     const summaryId = appStorage.getItem('summary_model_id')
     if (summaryId) {
       const cfg = llmService.getById(summaryId)
-      if (cfg) return createProvider({ provider: cfg.provider, model: cfg.model, apiKey: cfg.apiKey, baseURL: cfg.baseURL })
+      // 摘要走非思考模式：多一道 reasoning 只会拖慢压缩、多吃 token
+      if (cfg) return createProvider({ ...cfg, thinkingMode: 'off' })
     }
     const defaultCfg = llmService.getAll().find((c: any) => c.isDefault) || llmService.getAll()[0]
-    if (defaultCfg) return createProvider({ provider: defaultCfg.provider, model: defaultCfg.model, apiKey: defaultCfg.apiKey, baseURL: defaultCfg.baseURL })
+    if (defaultCfg) return createProvider({ ...defaultCfg, thinkingMode: 'off' })
     return null
   }
 
@@ -308,8 +309,12 @@ export class AutonomousEngine {
 
       this.emit({ type: 'executing', data: { round: round + 1, maxRounds: this.config.maxIterations } })
 
-      // 时间线：本轮开始，新建思考段（流式更新 text）
+      // 时间线：本轮开始，新建思考段（推理通道 reasoning + 正文通道 content 合入 text）
       const thinkSeg = timeline ? startThink(timeline) : null
+      let roundReasoning = ''
+      let roundText = ''
+      const composeThink = () =>
+        roundReasoning && roundText ? `${roundReasoning}\n\n${roundText}` : roundReasoning || roundText
 
       const pendingToolCalls: ToolCall[] = []
 
@@ -318,14 +323,20 @@ export class AutonomousEngine {
         messages,
         (text) => {
           // 流式更新
+          roundText = text
           finalContent = text
-          if (thinkSeg) thinkSeg.text = text
+          if (thinkSeg) thinkSeg.text = composeThink()
           onContent(text)
         },
         (tcs) => {
           pendingToolCalls.push(...tcs)
         },
-        { tools: effectiveToolDefs.length > 0 ? effectiveToolDefs : undefined }
+        { tools: effectiveToolDefs.length > 0 ? effectiveToolDefs : undefined },
+        (reasoning) => {
+          // 推理模型的思考内容：合入时间线思考段，便于回溯“为什么执行这些命令”
+          roundReasoning = reasoning
+          if (thinkSeg) thinkSeg.text = composeThink()
+        }
       )
 
       if (content) {

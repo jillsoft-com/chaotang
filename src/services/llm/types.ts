@@ -11,11 +11,12 @@ export interface LLMProvider {
   readonly visionCapable?: boolean
   chat(messages: ChatMessage[], options?: LLMChatOptions): Promise<string | ReadableStream>
   chatStream(messages: ChatMessage[], onChunk: (text: string) => void, options?: LLMChatOptions): Promise<string>
-  /** 带工具调用的流式对话：支持 tool_calls 回调 */
+  /** 带工具调用的流式对话：支持 tool_calls 回调；onReasoning 回传推理模型累计的思考内容（reasoning_content/reasoning 通道） */
   chatStreamWithTools(
     messages: ChatMessage[],
     onChunk: (text: string) => void,
     onToolCalls: (toolCalls: import('@/types').ToolCall[]) => void,
-    options?: LLMChatOptions
+    options?: LLMChatOptions,
+    onReasoning?: (text: string) => void
   ): Promise<string>
 }

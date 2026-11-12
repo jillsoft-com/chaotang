@@ -59,8 +59,9 @@ function getHandoverProvider(): { provider: LLMProvider; modelId: string } | nul
   if (summaryId) {
     const cfg = llmService.getById(summaryId)
     if (cfg && (cfg.apiKey || cfg.provider === 'ollama')) {
+      // 压缩类任务走非思考模式：多一道 reasoning 只会拖慢交接、多吃 token
       return {
-        provider: createProvider({ provider: cfg.provider, model: cfg.model, apiKey: cfg.apiKey, baseURL: cfg.baseURL }),
+        provider: createProvider({ ...cfg, thinkingMode: 'off' }),
         modelId: `${cfg.provider}/${cfg.model}`
       }
     }
@@ -68,7 +69,7 @@ function getHandoverProvider(): { provider: LLMProvider; modelId: string } | nul
   const defaultCfg = llmService.getAll().find(c => c.isDefault) || llmService.getAll()[0]
   if (defaultCfg && (defaultCfg.apiKey || defaultCfg.provider === 'ollama')) {
     return {
-      provider: createProvider({ provider: defaultCfg.provider, model: defaultCfg.model, apiKey: defaultCfg.apiKey, baseURL: defaultCfg.baseURL }),
+      provider: createProvider({ ...defaultCfg, thinkingMode: 'off' }),
       modelId: `${defaultCfg.provider}/${defaultCfg.model}`
     }
   }

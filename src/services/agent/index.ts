@@ -20,19 +20,10 @@ export type {
 
 export { PostDebateExecutor, postDebateExecutor } from './post-debate'
 export type {
-  ImperialDecree,
   ActionItem,
   PostDebateResult,
   PostDebateAction
 } from './post-debate'
-
-export {
-  parseActionItemsFromReport,
-  parseActionItemsFromDecree,
-  executeActionItems,
-  formatExecutionReport
-} from './imperial-executor'
-export type { ExecutionReport } from './imperial-executor'
 
 export { buildProjectIndex, searchProjectIndex, generateContextHint, getProjectIndex, invalidateIndexOnWrite, semanticSearch, clearSemanticIndexCache, symbolSearch } from './repository-context'
 export type { SymbolInfo, ReferenceInfo, SymbolKind } from './symbol-index'
@@ -134,7 +125,7 @@ export type {
 } from './acceptance-gate'
 
 // ── 交付报告（P1-B） ──
-export { buildDeliveryReport, extractFileChanges, extractUnresolvedQuestions, formatDeliverySummary, countLineDiff } from './delivery-report'
+export { buildDeliveryReport, extractFileChanges, extractUnresolvedQuestions, formatDeliverySummary, countLineDiff, trimDeliveryReportForStorage, MAX_SNAPSHOT_CHARS } from './delivery-report'
 export type { DeliveryReport, FileChange } from './delivery-report'
 
 // ── 测试循环引擎（Phase 2） ──

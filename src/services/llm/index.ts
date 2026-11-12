@@ -27,6 +27,8 @@ export function createProvider(config: LLMConfig): LLMProvider {
     config.apiKey || '',
     config.model,
     baseURL,
-    config.supportsVision === true
+    config.supportsVision === true,
+    // 思考开关：推理模型不带走 reasoning 通道，执行过程会只剩工具行
+    config.thinkingMode || 'auto'
   )
 }

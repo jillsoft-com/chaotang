@@ -26,7 +26,7 @@ import type { AutonomousEvent } from './autonomous-engine'
 import { taskScheduler } from './task-scheduler'
 import type { ExecutionContext, LeafExecContext, LeafResult } from './task-scheduler'
 import type { TaskTreeSnapshot, TaskNode } from './task-tree'
-import { createTree, createNode, addNode, transitionStatus } from './task-tree'
+import { createTree, createNode, addNode, transitionStatus, captureRetryContext } from './task-tree'
 // 注：写文件能力不再受只读标志约束（只读设计已移除），故不再引入 filterToolDefinitionsForReadOnlyNode / WRITE_TOOLS
 import { runAcceptance, collectChangedFiles } from './acceptance-gate'
 import type { CommandExecutor, AcceptancePlan } from './acceptance-gate'
@@ -175,10 +175,11 @@ export class CoordinatorAgent {
     const summaryId = appStorage.getItem('summary_model_id')
     if (summaryId) {
       const cfg = llmService.getById(summaryId)
-      if (cfg) return createProvider({ provider: cfg.provider, model: cfg.model, apiKey: cfg.apiKey, baseURL: cfg.baseURL })
+      // 摘要走非思考模式：多一道 reasoning 只会拖慢压缩、多吃 token
+      if (cfg) return createProvider({ ...cfg, thinkingMode: 'off' })
     }
     const defaultCfg = llmService.getAll().find(c => c.isDefault) || llmService.getAll()[0]
-    if (defaultCfg) return createProvider({ provider: defaultCfg.provider, model: defaultCfg.model, apiKey: defaultCfg.apiKey, baseURL: defaultCfg.baseURL })
+    if (defaultCfg) return createProvider({ ...defaultCfg, thinkingMode: 'off' })
     return null
   }
 
@@ -268,6 +269,9 @@ export class CoordinatorAgent {
         if (tree.state === 'interrupted') {
           for (const node of Object.values(tree.nodes)) {
             if (node.status === 'interrupted') {
+              // 重新排队前先留存上一轮现场，否则重试时模型完全不知道上次为何中断
+              node.attempt++
+              captureRetryContext(node)
               transitionStatus(tree, node.id, 'ready', '用户确认继续')
             }
           }
@@ -343,6 +347,8 @@ export class CoordinatorAgent {
               if (node.fileBaselines) {
                 for (const [path] of Object.entries(node.fileBaselines)) {
                   if (lostNodes.some(l => l.includes(path)) && node.status === 'completed') {
+                    node.attempt++
+                    captureRetryContext(node)
                     const result = transitionStatus(tree, node.id, 'ready', '写入未落盘，需重新执行')
                     if (!result.ok) {
                       console.error(`[Agent] 恢复迁移失败: ${result.error}`)
@@ -820,11 +826,11 @@ ${workerDesc}
 - 判断规则：如果任务需要创建实际文件并验证结果正确性，设为 true；如果只需输出文字方案，设为 false
 
 要求：
-1. 每个任务分配给最合适的成员
+1. 每个任务分配给最合适的成员。**不要求每位成员都领到任务**：与本次议题无关的成员（例如纯接口、配置或构建改动无需 UI 设计参与）直接不要出现在 tasks 里，也不要为了凑齐流水线而安排空任务；可在 plan 里用一句话说明哪些成员本次不参与及原因
 2. 任务描述要具体、可执行，明确说明需要创建哪些文件
-3. 按流水线顺序分配：UI设计 → 前端开发 → 后端开发 → 测试
+3. 任务排列顺序仍遵循协作流水线 UI设计 → 前端开发 → 后端开发 → 测试，但**只排本次确实涉及的环节**
 4. 如果需要创建文件，在 task 描述中明确文件路径和内容要求
-5. 通常分配 4-5 个子任务${dirHint}${agentsMdHint}${memoryHint}${semanticHint}${subAgentHint}`
+5. 子任务数量按议题复杂度定，通常 2-5 个；能用一个任务说清的不要拆成两个${dirHint}${agentsMdHint}${memoryHint}${semanticHint}${subAgentHint}`
           }
           return `你是丞相，朝堂之上的协调者。你的职责是分析圣上提出的议题，将其拆解为具体的子任务，分配给合适的大臣去执行。
 
@@ -851,10 +857,10 @@ ${workerDesc}
 - 判断规则：如果任务需要执行实际操作（创建文件、运行命令、修改代码等），设为 true；如果只需分析和建议，设为 false
 
 要求：
-1. 每个任务分配给最合适的大臣
+1. 每个任务分配给最合适的大臣。**不要求每位大臣都领到任务**：与议题无关的大臣直接不参与，也不要为了凑数安排空任务；可在 plan 里一句话说明哪些大臣本次不召
 2. 任务描述要具体、可执行
-3. 合理分配，不要遗漏重要方面
-4. 通常分配 2-4 个子任务${dirHint}${agentsMdHint}${memoryHint}${semanticHint}${subAgentHint}`
+3. 合理分配，不要遗漏重要方面，也不要让多个大臣重复干同一件事
+4. 子任务数量按议题复杂度定，通常 2-4 个${dirHint}${agentsMdHint}${memoryHint}${semanticHint}${subAgentHint}`
         })()
       },
       {
@@ -1079,21 +1085,31 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
 
       const pendingToolCalls: ToolCall[] = []
 
-      // 时间线：本轮开始，新建思考段（流式更新 text）
+      // 时间线：本轮开始，新建思考段（推理通道 reasoning + 正文通道 content 合入 text）
       const thinkSeg = timeline ? startThink(timeline) : null
+      let roundReasoning = ''
+      let roundText = ''
+      const composeThink = () =>
+        roundReasoning && roundText ? `${roundReasoning}\n\n${roundText}` : roundReasoning || roundText
 
       const content = await provider.chatStreamWithTools(
         messages,
         // onChunk：流式更新 UI
         (text) => {
+          roundText = text
           reactiveSpeech.content = text
-          if (thinkSeg) thinkSeg.text = text
+          if (thinkSeg) thinkSeg.text = composeThink()
         },
         // onToolCalls：收集工具调用请求
         (tcs) => {
           pendingToolCalls.push(...tcs)
         },
-        { tools: toolDefs.length > 0 ? toolDefs : undefined }
+        { tools: toolDefs.length > 0 ? toolDefs : undefined },
+        // onReasoning：推理模型的思考内容合入时间线思考段，便于回溯决策过程
+        (reasoning) => {
+          roundReasoning = reasoning
+          if (thinkSeg) thinkSeg.text = composeThink()
+        }
       )
 
       // 时间线：本轮 LLM 输出结束；无工具调用轮（最终回复）的思考段会被移除，避免与正文重复
@@ -1605,14 +1621,20 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
       if (!RESUMABLE_FROM.includes(node.status)) {
         return { ok: false, requeued: 0, reason: `该任务当前状态（${node.status}）无需重试` }
       }
-      const r = transitionStatus(tree, nodeId, 'ready', '用户手动重试')
+      // 回退前先留存上一轮现场：failureReason 会在迁入 ready 时被清空，不另存则重试时没人知道上次为何失败
+      node.attempt++
+      captureRetryContext(node)
+      const r = transitionStatus(tree, nodeId, 'ready', `重试 (第 ${node.attempt} 次)`)
       if (!r.ok) return { ok: false, requeued: 0, reason: r.error }
       requeued = 1
     } else {
       for (const node of Object.values(tree.nodes)) {
         if (node.id === tree.rootId) continue
         if (RESUMABLE_FROM.includes(node.status)) {
-          const r = transitionStatus(tree, node.id, 'ready', '用户继续执行')
+          // 续跑也是重新执行，同样先把上一轮的缘由与成果交下去
+          node.attempt++
+          captureRetryContext(node)
+          const r = transitionStatus(tree, node.id, 'ready', `用户继续执行 (第 ${node.attempt} 次)`)
           if (r.ok) requeued++
         }
       }
@@ -1727,7 +1749,9 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
         if (!node.fileBaselines) continue
         for (const [path] of Object.entries(node.fileBaselines)) {
           if (lostNodes.some(l => l.includes(path)) && node.status === 'completed') {
-            const r = transitionStatus(tree, node.id, 'ready', '写入未落盘，需重新执行')
+            node.attempt++
+            captureRetryContext(node)
+            const r = transitionStatus(tree, node.id, 'ready', `写入未落盘，需重新执行 (第 ${node.attempt} 次)`)
             if (!r.ok) return { ok: false, reason: `状态迁移失败：${r.error}` }
           }
         }
@@ -1935,6 +1959,14 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
       ? `${node.description}\n\n${leafContext.previousResultsSummary}`
       : node.description
 
+    // 重试轮次：把上一轮的失败缘由与已留下的成果注入上下文。
+    // 新的 messages 数组不含上一轮思考与工具记录，failureReason 又已在回退时清空，
+    // 不注入就等于让模型蒙着眼回到工位自己摸索，容易重复劳动或再踩同一个坑。
+    const retryNote = node.retryContext
+      ? `=== 上次尝试留下的现场 ===\n${node.retryContext}\n本次为第 ${node.attempt + 1} 次执行。请先核查已有产物（文件内容、git 状态、docs/任务分解.md 里的进度），只补齐缺失部分，不要重复已完成的步骤；若上次失败缘由指出的问题仍在，请换一种做法而不是原样重跑。`
+      : ''
+    const retryHint = retryNote ? `\n\n${retryNote}` : ''
+
     // P1-A: 注入仓库索引上下文
     let contextHint = ''
     if (workingDirectory) {
@@ -1969,7 +2001,7 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
         const engine = new AutonomousEngine({ maxIterations: Math.max(node.budget.maxIterations, this.config.autonomousMaxIterations), verifyAfterEachRound: true, workingDirectory, agentsMdHint, memoryHint, modelId: worker.llm?.model, subAgentProfile })
         engine.onEvent((evt: AutonomousEvent) => { this.emit({ type: 'worker-autonomous', ministerId: worker.id, data: evt }) })
         const execResult = await engine.execute({
-          provider: workerLLM, systemPrompt: worker.systemPrompt, goal: topic, taskContext: taskContextWithHistory + contextHint, toolDefs,
+          provider: workerLLM, systemPrompt: worker.systemPrompt, goal: topic, taskContext: taskContextWithHistory + retryHint + contextHint, toolDefs,
           onContent: (text) => { reactiveWorker.content = text }, onBeforeToolExecute, abortSignal, onToolCall,
           timeline: reactiveWorker.execTimeline
         })
@@ -1981,7 +2013,7 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
         result = { content: execResult.content, toolCalls: execResult.toolCalls }
         goalReached = execResult.goalReached
       } else {
-        const wt: WorkerTask = { ministerId: worker.id, task: node.description }
+        const wt: WorkerTask = { ministerId: worker.id, task: node.description, context: retryNote || undefined }
         result = await this.executeWorkerTask(workerLLM, worker, wt, topic, toolDefs, reactiveWorker, workingDirectory, onBeforeToolExecute, agentsMdHint, memoryHint, onToolCall)
         // 非自主路径：检查关键写操作是否失败（同一工具同参数只看最后一次结果）
         const criticalTools = new Set(['write_file', 'create_directory', 'execute_command', 'run_tests', 'git_operation', 'git_auto_commit', 'git_create_branch'])
@@ -2092,30 +2124,80 @@ ${workerTask.context ? `补充说明：${workerTask.context}` : ''}${dirHint}
 总体目标：${topic}`
     }, { role: 'user', content: `请分析任务"${node.title}"的粒度，决定直接执行还是拆解。` }]
 
+    // 拆解决策的 JSON 只是内部协议，不能当发言内容上屏：流式阶段挂占位提示，
+    // 收尾时统一替成可读的粒度评估结论（与丞相首轮拆解走同一套处理方式）
     try {
-      const content = await provider.chatStream(messages, (t) => { reactive.content = t })
-      reactive.status = 'completed'
+      const content = await provider.chatStream(messages, () => { reactive.content = '🧩 正在评估任务粒度…' })
       const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/) || content.match(/\{[\s\S]*\}/)
       const jsonStr = jsonMatch ? (jsonMatch[1] || jsonMatch[0]) : content
-      const parsed = JSON.parse(jsonStr)
+      let parsed: any = null
+      try {
+        parsed = JSON.parse(jsonStr)
+      } catch {
+        parsed = null // 模型未按约定返回 JSON：当作不拆解，但界面上不能留下裸 JSON
+      }
+
       // needDecompose:false 或无有效子任务 → childIds 保持为空 → 调度器将本节点标为叶子直接执行
       if (parsed && parsed.needDecompose === true && Array.isArray(parsed.subtasks)) {
         const maxChildren = tree.limits?.maxChildren ?? 5
-        for (const st of parsed.subtasks.slice(0, maxChildren)) {
+        const usable = parsed.subtasks.filter((st: any) => typeof st?.description === 'string' && st.description.trim())
+        const planned = usable.slice(0, maxChildren)
+        let addedCount = 0
+        for (const st of planned) {
           const title = typeof st.title === 'string' && st.title.trim() ? st.title.trim() : '子任务'
-          const description = typeof st.description === 'string' ? st.description.trim() : ''
-          if (!description) continue
+          const description = st.description.trim()
           const acceptance = Array.isArray(st.acceptance)
             ? st.acceptance.filter((a: any) => typeof a === 'string' && a.trim()).map((a: string) => a.trim())
             : []
           const child = createNode({ title, description, parentId: node.id, createdBy: worker.id, assigneeId: worker.id, autonomous: st.autonomous === true, readOnly: false, decomposition: 'leaf', mode: 'action', acceptance })
           const r = addNode(tree, child)
           if (!r.ok) break
+          addedCount++
         }
+        if (addedCount > 0) {
+          reactive.content = this.formatWorkerDecomposition(planned.slice(0, addedCount), parsed.subtasks.length - addedCount)
+        } else {
+          reactive.content = '🧩 子任务未能纳入任务树（超出数量或结构限制），本节点按单一任务直接执行。'
+        }
+      } else if (parsed) {
+        reactive.content = '🧩 评估结论：单一任务，无需再拆解，直接执行。'
+      } else {
+        reactive.content = '🧩 拆解回复未能解析为约定格式，本节点按单一任务直接执行。'
       }
-    } catch { /* 拆解失败，保持为叶子 */ }
+      reactive.status = 'completed'
+    } catch {
+      // 粒度评估调用失败不阻断执行：保持为叶子，气泡留一句可读说明而不是停在占位文案
+      reactive.content = '🧩 任务粒度评估未完成，本节点按单一任务直接执行。'
+      reactive.status = 'completed'
+    }
 
     return tree
+  }
+
+  /**
+   * Worker 二次拆解的上屏文案：只展示人类可读的子任务清单，不输出内部协议 JSON
+   */
+  private formatWorkerDecomposition(subtasks: any[], droppedCount: number): string {
+    const lines: string[] = ['**🧩 本任务再拆解为以下子任务**', '']
+    subtasks.forEach((st, i) => {
+      const title = typeof st.title === 'string' && st.title.trim() ? st.title.trim() : '子任务'
+      const description = typeof st.description === 'string' ? st.description.trim() : ''
+      const badge = st.autonomous === true ? '🔄' : '📝'
+      lines.push(`${i + 1}. ${badge} **${title}**`)
+      if (description) lines.push(`   ${description.length > 200 ? description.slice(0, 200) + '…' : description}`)
+      const acceptance = Array.isArray(st.acceptance)
+        ? st.acceptance.filter((a: any) => typeof a === 'string' && a.trim()).map((a: string) => a.trim())
+        : []
+      if (acceptance.length > 0) {
+        const shown = acceptance.slice(0, 3).join('；')
+        lines.push(`   > 验收：${shown}${acceptance.length > 3 ? ` 等 ${acceptance.length} 项` : ''}`)
+      }
+      lines.push('')
+    })
+    if (droppedCount > 0) {
+      lines.push(`_受单父节点子任务数上限限制，本轮先纳入 ${subtasks.length} 项，其余 ${droppedCount} 项待后续按需拆解。_`)
+    }
+    return lines.join('\n')
   }
 
   /**
@@ -2241,12 +2323,18 @@ ${topic}
     ]
 
     try {
-      const content = await provider.chatStream(messages, (t) => { reactive.content = t })
-      reactive.status = 'completed'
+      // 与 Worker 二次拆解同一处理：重规划的 JSON 是内部协议，上屏的只能是可读清单
+      const content = await provider.chatStream(messages, () => { reactive.content = '🧭 丞相正在围绕长期目标重新规划子任务…' })
       const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/) || content.match(/\{[\s\S]*\}/)
       const jsonStr = jsonMatch ? (jsonMatch[1] || jsonMatch[0]) : content
-      const parsed = JSON.parse(jsonStr)
-      if (parsed.subtasks && Array.isArray(parsed.subtasks) && parsed.subtasks.length > 0) {
+      let parsed: any = null
+      try {
+        parsed = JSON.parse(jsonStr)
+      } catch {
+        parsed = null
+      }
+      if (parsed && Array.isArray(parsed.subtasks) && parsed.subtasks.length > 0) {
+        const added: any[] = []
         for (const st of parsed.subtasks) {
           const child = createNode({
             title: st.title || '目标补充任务',
@@ -2259,12 +2347,45 @@ ${topic}
             decomposition: 'leaf',
             mode: 'action'
           })
-          addNode(tree, child)
+          const r = addNode(tree, child)
+          if (!r.ok) break
+          added.push(st)
         }
+        reactive.content = added.length > 0
+          ? this.formatReplanDecomposition(added, parsed.subtasks.length - added.length)
+          : '🧭 新子任务未能纳入任务树（超出数量或结构限制），本轮不追加执行。'
+      } else if (parsed) {
+        reactive.content = '🧭 丞相本轮未规划出新的子任务，长期目标待后续执行后再评估。'
+      } else {
+        reactive.content = '🧭 重规划回复未能解析为约定格式，本轮不追加新子任务。'
       }
-    } catch { /* 重新规划失败，不影响主流程 */ }
+      reactive.status = 'completed'
+    } catch {
+      // 重新规划失败不阻断主流程，但不能把占位文案留在会话区
+      reactive.content = '🧭 重规划调用未完成，本轮不追加新子任务。'
+      reactive.status = 'completed'
+    }
 
     return tree
+  }
+
+  /**
+   * 长期目标重规划子任务的上屏文案：同样不把内部协议 JSON 铺到会话区
+   */
+  private formatReplanDecomposition(subtasks: any[], droppedCount: number): string {
+    const lines: string[] = ['**🧭 围绕长期目标追加的子任务**', '']
+    subtasks.forEach((st, i) => {
+      const title = typeof st.title === 'string' && st.title.trim() ? st.title.trim() : '目标补充任务'
+      const description = typeof st.description === 'string' ? st.description.trim() : ''
+      const badge = st.autonomous !== false ? '🔄' : '📝'
+      lines.push(`${i + 1}. ${badge} **${title}**`)
+      if (description) lines.push(`   ${description.length > 200 ? description.slice(0, 200) + '…' : description}`)
+      lines.push('')
+    })
+    if (droppedCount > 0) {
+      lines.push(`_受节点总数上限限制，本轮先纳入 ${subtasks.length} 项，其余 ${droppedCount} 项待下一轮再规划。_`)
+    }
+    return lines.join('\n')
   }
 
   /**

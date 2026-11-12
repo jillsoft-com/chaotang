@@ -11,7 +11,7 @@
           <button class="fe-btn" :class="{ active: mode === 'split' }" @click="mode = 'split'">分栏</button>
         </template>
         <button v-else class="fe-btn" :class="{ active: mode === 'edit' }" @click="mode = 'edit'">编辑</button>
-        <button v-if="canDiff" class="fe-btn" :class="{ active: mode === 'diff' }" title="查看该文件的 git diff" @click="toggleDiff">Diff</button>
+        <button v-if="canDiff" class="fe-btn" :class="{ active: mode === 'diff' }" title="查看该文件的改动差异" @click="toggleDiff">Diff</button>
         <button class="fe-btn fe-save" :disabled="!dirty || saving || !loaded" @click="save">
           {{ saving ? '保存中…' : '保存' }}
         </button>
@@ -29,6 +29,7 @@
           <div class="fe-diff-bar">
             <label class="fe-diff-baseline">基准
               <select v-model="diffMode" @change="loadDiff">
+                <option v-if="hasRoundSnapshot" value="round">本轮改动（执行快照）</option>
                 <option value="uncommitted">未提交（工作树+暂存区 vs HEAD）</option>
                 <option value="staged">仅暂存区（git diff --cached）</option>
                 <option value="unstaged">仅工作区（git diff）</option>
@@ -37,6 +38,7 @@
             </label>
             <span class="fe-diff-stat">{{ diffStatText }}</span>
           </div>
+          <div v-if="diffNote" class="fe-diff-note">{{ diffNote }}</div>
           <div v-if="diffLoading" class="fe-status">加载 diff…</div>
           <div v-else-if="diffError" class="fe-status fe-error">⚠ {{ diffError }}</div>
           <pre v-else-if="diffHasContent" class="fe-diff-pre"><span
@@ -77,8 +79,10 @@
 import { ref, computed, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { renderSafeMarkdown } from '@/utils/sanitize-markdown'
+import { toUnifiedDiff } from '@/utils/line-diff'
+import type { FileDiffRequest } from '@/types'
 
-const props = defineProps<{ filePath: string; rootDir?: string }>()
+const props = defineProps<{ filePath: string; rootDir?: string; roundDiff?: FileDiffRequest | null }>()
 const emit = defineEmits<{ (e: 'close'): void }>()
 
 const editText = ref('')
@@ -95,15 +99,30 @@ const diffLoading = ref(false)
 const diffError = ref('')
 const diffStatus = ref('')
 const diffHasContent = ref(false)
-const diffMode = ref<'uncommitted' | 'staged' | 'unstaged' | 'last'>('uncommitted')
+const diffNote = ref('')
+type GitDiffMode = 'uncommitted' | 'staged' | 'unstaged' | 'last'
+const diffMode = ref<GitDiffMode | 'round'>('uncommitted')
 
-const canDiff = computed(() => !!props.rootDir && !!window.electronAPI?.gitFileDiff)
+/** 本轮快照能否直接算 diff：正文被裁剪掉时只能回退 git 基准 */
+const hasRoundSnapshot = computed(() => {
+  const r = props.roundDiff
+  if (!r || r.trimmed) return false
+  return typeof r.newContent === 'string' || typeof r.oldContent === 'string'
+})
+
+const canDiff = computed(() => hasRoundSnapshot.value || (!!props.rootDir && !!window.electronAPI?.gitFileDiff))
 
 const diffLines = computed(() => diffText.value.split('\n'))
 
 const diffStatText = computed(() => {
   if (diffError.value) return ''
   if (diffLoading.value) return '读取中…'
+  if (diffStatus.value === 'round') {
+    const r = props.roundDiff
+    if (!r) return ''
+    const verb = r.status === 'created' ? '本轮新建' : r.status === 'deleted' ? '本轮删除' : '本轮修改'
+    return `${verb} +${r.linesAdded || 0} -${r.linesRemoved || 0}`
+  }
   switch (diffStatus.value) {
     case 'modified': return '有改动'
     case 'untracked': return '未跟踪新文件（全部为新增）'
@@ -150,6 +169,7 @@ async function load(): Promise<void> {
   diffError.value = ''
   diffStatus.value = ''
   diffHasContent.value = false
+  diffNote.value = ''
   if (!window.electronAPI?.readFile) {
     error.value = '需在 Electron 环境运行'
     loaded.value = false
@@ -197,8 +217,43 @@ async function save(): Promise<void> {
   }
 }
 
-/** 拉取当前文件相对所选基准的 unified diff */
+/** 本轮快照直接出 unified 文本：不依赖 git，也不碰磁盘现状 */
+function applyRoundDiff(): void {
+  const r = props.roundDiff
+  diffLoading.value = false
+  diffError.value = ''
+  diffStatus.value = 'round'
+  diffText.value = r ? toUnifiedDiff(r.oldContent ?? '', r.newContent ?? '', fileName.value) : ''
+  diffHasContent.value = diffText.value !== ''
+  diffNote.value = r?.drift
+    ? 'ℹ 本轮快照生成后该文件又被外部修改，下面展示的是当时的差异；要看磁盘现状请切未提交基准'
+    : ''
+}
+
+/** 拉取 diff：round 基准用本地快照算，其余基准走 git */
 async function loadDiff(): Promise<void> {
+  if (diffMode.value === 'round') {
+    if (hasRoundSnapshot.value) {
+      applyRoundDiff()
+      return
+    }
+    // 正文被裁剪的历史归档：只能退 git，并说明退的原因
+    if (!props.rootDir || !window.electronAPI?.gitFileDiff) {
+      diffLoading.value = false
+      diffError.value = '本轮快照正文已超出落盘上限被裁剪，且当前环境不可用 git 基准，无法展示差异'
+      diffText.value = ''
+      diffHasContent.value = false
+      return
+    }
+    diffNote.value = '本轮快照正文已超出落盘上限被裁剪，改按 git 未提交基准展示'
+    diffMode.value = 'uncommitted'
+  }
+  // 上面的分支已排掉或改写了 round，此处必为 git 基准
+  await loadGitDiff(diffMode.value)
+}
+
+/** 拉取当前文件相对所选 git 基准的 unified diff */
+async function loadGitDiff(gitMode: GitDiffMode): Promise<void> {
   if (!props.rootDir || !window.electronAPI?.gitFileDiff) return
   diffLoading.value = true
   diffError.value = ''
@@ -206,7 +261,7 @@ async function loadDiff(): Promise<void> {
     const res = await window.electronAPI.gitFileDiff({
       filePath: props.filePath,
       cwd: props.rootDir,
-      mode: diffMode.value
+      mode: gitMode
     })
     diffStatus.value = res.status || ''
     if (!res.success) {
@@ -230,6 +285,9 @@ function toggleDiff(): void {
     mode.value = isMarkdown.value || isSvg.value ? 'preview' : 'edit'
   } else {
     mode.value = 'diff'
+    // 有本轮快照时默认看“本轮改了什么”，没有则保留上次的 git 基准选择
+    if (hasRoundSnapshot.value) diffMode.value = 'round'
+    else if (diffMode.value === 'round') diffMode.value = 'uncommitted'
     loadDiff()
   }
 }
@@ -246,6 +304,14 @@ function diffLineClass(line: string): string {
 
 // 切换文件时重新载入
 watch(() => props.filePath, () => { load() }, { immediate: true })
+
+// 从会话改动清单点开：带着本轮快照就直接进 diff 视图（seq 递增，同文件重复点也能刷新）
+watch(() => props.roundDiff?.seq, () => {
+  if (!props.roundDiff) return
+  mode.value = 'diff'
+  diffMode.value = hasRoundSnapshot.value ? 'round' : 'uncommitted'
+  loadDiff()
+})
 </script>
 
 <style scoped>
@@ -535,6 +601,16 @@ watch(() => props.filePath, () => { load() }, { immediate: true })
 .fe-diff-stat {
   margin-left: auto;
   color: var(--ct-text-muted);
+}
+
+/* 快照漂移 / 正文被裁剪时的如实说明 */
+.fe-diff-note {
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--ct-border);
+  background: rgba(230, 162, 60, 0.1);
+  color: var(--ct-text-secondary);
+  font-size: 11.5px;
+  line-height: 1.5;
 }
 
 .fe-diff-pre {

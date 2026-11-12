@@ -8,7 +8,7 @@ import { promptService } from '@/services/prompt-config'
 import { useTheme } from '@/composables/useTheme'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowLeft, Plus, Edit, Delete, Star, RefreshRight, Sunny, Moon, Refresh } from '@element-plus/icons-vue'
-import type { LLMConfig, LLMTestResult, LLMProviderType } from '@/types/llm'
+import type { LLMConfig, LLMTestResult, LLMProviderType, ThinkingMode } from '@/types/llm'
 import { skillRegistry } from '@/services/skills'
 import { isCustomTheme, getPresetsByCategory, THEME_CATEGORIES } from '@/services/dynasty-presets'
 import type { Skill } from '@/types'
@@ -94,7 +94,8 @@ const llmForm = ref({
   baseURL: '',
   temperature: 0.7,
   maxTokens: 4096,
-  supportsVision: false
+  supportsVision: false,
+  thinkingMode: 'auto' as ThinkingMode
 })
 
 // 摘要模型
@@ -448,7 +449,7 @@ function saveMinisterLLMMap() {
 
 function openAddLLMDialog() {
   editingLLM.value = null
-  llmForm.value = { name: '', provider: 'openai', model: 'gpt-4o-mini', apiKey: '', baseURL: '', temperature: 0.7, maxTokens: 4096, supportsVision: false }
+  llmForm.value = { name: '', provider: 'openai', model: 'gpt-4o-mini', apiKey: '', baseURL: '', temperature: 0.7, maxTokens: 4096, supportsVision: false, thinkingMode: 'auto' }
   testResult.value = null
   fetchedModels.value = []
   showLLMDialog.value = true
@@ -464,7 +465,8 @@ function openEditLLMDialog(config: LLMConfig) {
     baseURL: config.baseURL || '',
     temperature: config.temperature || 0.7,
     maxTokens: config.maxTokens || 4096,
-    supportsVision: config.supportsVision === true
+    supportsVision: config.supportsVision === true,
+    thinkingMode: config.thinkingMode || 'auto'
   }
   testResult.value = null
   fetchedModels.value = []
@@ -518,7 +520,8 @@ async function saveLLMConfig() {
     baseURL: llmForm.value.baseURL || undefined,
     temperature: llmForm.value.temperature,
     maxTokens: llmForm.value.maxTokens,
-    supportsVision: llmForm.value.supportsVision
+    supportsVision: llmForm.value.supportsVision,
+    thinkingMode: llmForm.value.thinkingMode
   }
 
   try {
@@ -1401,6 +1404,8 @@ async function exportGEPAData() {
                   <el-tag v-if="config.isDefault" type="warning" size="small" effect="dark">默认</el-tag>
                   <el-tag size="small" effect="plain">{{ getProviderLabel(config.provider) }}</el-tag>
                   <el-tag v-if="config.supportsVision" type="success" size="small" effect="plain">👁 图片识别</el-tag>
+                  <el-tag v-if="config.thinkingMode === 'on'" type="success" size="small" effect="plain">🧠 思考强制开启</el-tag>
+                  <el-tag v-else-if="config.thinkingMode === 'off'" type="info" size="small" effect="plain">🧠 思考已关闭</el-tag>
                 </div>
                 <div class="llm-actions">
                   <el-button v-if="!config.isDefault" :icon="Star" size="small" @click="setDefaultLLM(config.id)">设为默认</el-button>
@@ -2112,6 +2117,20 @@ handler: |
         <el-form-item>
           <el-checkbox v-model="llmForm.supportsVision">支持图片识别（多模态视觉）</el-checkbox>
           <div class="form-hint">勾选后，浏览器截图与用户粘贴的图片会以图像形式送入模型；未勾选时大臣只能看到文本形式的页面结构（browser_snapshot）。适用于 gpt-4o、qwen-vl、glm-4v 等视觉模型。</div>
+        </el-form-item>
+
+        <el-form-item label="思考模式（推理模型）">
+          <el-select v-model="llmForm.thinkingMode" style="width: 100%">
+            <el-option label="自动（按模型名/网关识别）" value="auto" />
+            <el-option label="强制开启" value="on" />
+            <el-option label="关闭" value="off" />
+          </el-select>
+          <div class="form-hint">
+            决定请求里是否携带思考开关（enable_thinking / thinking.type / reasoning_effort）。
+            执行过程看不见「已思考」、只有一串工具行时，多半是服务端没走思考模式：
+            模型名被代理改写过（如统一叫 my-gateway）选「强制开启」；
+            若网关不认这个字段，系统会自动去掉该参数重试一次，不会因参数导致会话失败。
+          </div>
         </el-form-item>
 
         <el-alert

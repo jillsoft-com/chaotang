@@ -8,10 +8,9 @@ import { postDebateExecutor } from '@/services/agent/post-debate'
 import { llmService } from '@/services/llm-config'
 import { backgroundScheduler } from '@/services/scheduler'
 import { gepaEngine } from '@/services/learning'
-import { parseActionItemsFromReport, parseActionItemsFromDecree, executeActionItems } from '@/services/agent/imperial-executor'
-import type { ExecutionReport } from '@/services/agent/imperial-executor'
 import type { TaskTreeSnapshot, TaskNode } from '@/services/agent/task-tree'
 import { transitionStatus } from '@/services/agent/task-tree'
+import { trimDeliveryReportForStorage } from '@/services/agent/delivery-report'
 import {
   DYNASTY_PRESETS,
   getCurrentDynastyId,
@@ -92,7 +91,7 @@ export const useDebateStore = defineStore('debate', () => {
   }
 
   function saveDebates() {
-    appStorage.setItem('debates_history', JSON.stringify(debates.value))
+    appStorage.setItem('debates_history', JSON.stringify(debates.value.map(trimForStorage)))
   }
 
   // 初始化时加载
@@ -106,7 +105,7 @@ export const useDebateStore = defineStore('debate', () => {
 
   function saveSessions() {
     appStorage.setItem(SESSIONS_KEY, JSON.stringify({
-      sessions: sessions.value,
+      sessions: sessions.value.map(trimForStorage),
       activeSessionId: activeSessionId.value
     }))
   }
@@ -430,12 +429,12 @@ export const useDebateStore = defineStore('debate', () => {
     }
   }
 
-  function completeDebate(imperialDecree?: string, force?: boolean) {
+  function completeDebate(force?: boolean) {
     if (!activeSession.value) return
 
     const session = activeSession.value
 
-    // 防护检查：确认所有预期的大臣都已发言完毕（force=true 时跳过，用于退朝/拍板）
+    // 防护检查：确认所有预期的大臣都已发言完毕（force=true 时跳过，用于@提及追问等只有部分角色进言的收尾）
     if (!force) {
       const mentioned = session.mentionedMinisters
       const expectedMinisters = mentioned && mentioned.length > 0
@@ -456,7 +455,8 @@ export const useDebateStore = defineStore('debate', () => {
 
     session.status = 'completed'
     session.completedAt = Date.now()
-    session.imperialDecree = imperialDecree
+    // session.imperialDecree 不再写入（拍板颁布圣旨已取消），
+    // 保持原值不动，旧存档里的圣旨依旧能在历史页看到
 
     // 深拷贝 speeches
     const snapshot = {
@@ -474,36 +474,13 @@ export const useDebateStore = defineStore('debate', () => {
     saveDebates()
 
     // Sprint A - #1：朝议模式自动触发决策报告生成（不阻塞主流程）
-    // 决策报告暂时停用（当前价值不大）：不再自动生成，省去每次拍板/退朝的额外 LLM 调用。
+    // 决策报告暂时停用（当前价值不大）：不再自动生成，省去每次收尾归档的额外 LLM 调用。
     // 如需恢复：取消下方注释即可（同时把 ChatSession 的 enableDecisionReport 置为 true）。
     // if (session.mode === 'court') {
     //   generateDecisionReportAsync(session.id).catch(err => {
     //     console.warn('[completeDebate] 决策报告生成失败:', err)
     //   })
     // }
-  }
-
-  /**
-   * Sprint D - #3：执行圣旨/决策报告中的行动项
-   */
-  async function executeImperialDecree(debateId: string): Promise<ExecutionReport | null> {
-    const debate = debates.value.find(d => d.id === debateId)
-    if (!debate) return null
-
-    // 优先从决策报告解析行动项，否则从圣旨文本解析
-    let actionItems
-    if (debate.decisionReport?.nextSteps && debate.decisionReport.nextSteps.length > 0) {
-      actionItems = parseActionItemsFromReport(debate.decisionReport)
-    } else if (debate.imperialDecree) {
-      actionItems = parseActionItemsFromDecree(debate.imperialDecree)
-    } else {
-      return null
-    }
-
-    if (actionItems.length === 0) return null
-
-    const report = await executeActionItems(actionItems, debate.workingDirectory)
-    return report
   }
 
   /**
@@ -540,7 +517,7 @@ export const useDebateStore = defineStore('debate', () => {
 
   /**
    * 异步生成决策报告（四象限）
-   * 拍板后由丞相的 LLM 汇总产出，结果写入 debates 并持久化
+   * 由丞相的 LLM 汇总产出，结果写入 debates 并持久化
    */
   async function generateDecisionReportAsync(debateId: string): Promise<DecisionReport | null> {
     const debate = debates.value.find(d => d.id === debateId)
@@ -941,6 +918,17 @@ export const useDebateStore = defineStore('debate', () => {
     }
   }
 
+  /**
+   * 交付报告只在写入存储时裁剪正文，内存对象保持完整。
+   *
+   * 每轮执行的 oldContent/newContent 全量留在归档里，几十轮就能把存储撑爆；
+   * 裁剪后超过上限的文件只剩路径 + 增删行数（diff 视图会回退到 git 基准）。
+   */
+  function trimForStorage<T extends { deliveryReport?: any }>(item: T): T {
+    if (!item?.deliveryReport) return item
+    return { ...item, deliveryReport: trimDeliveryReportForStorage(item.deliveryReport) }
+  }
+
   /** 标记交付已确认：报告保留可重看，只记录确认时间 */
   function markDeliveryConfirmed(debateId: string) {
     const at = Date.now()
@@ -1077,7 +1065,6 @@ export const useDebateStore = defineStore('debate', () => {
     setProjectAlias,
     scheduleFollowUp,
     scheduleLongDebate,
-    executeImperialDecree,
     saveTaskTreeSnapshot,
     saveDeliveryReport,
     markDeliveryConfirmed,

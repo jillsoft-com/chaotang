@@ -115,8 +115,14 @@ export async function compressContext(
   // [system] [user(首条)] ... [旧消息 - 待压缩] ... [最近 KEEP_RECENT 条]
   const systemMsg = result[0]  // system
   const firstUserMsg = result[1]  // 首条 user
-  const recentMessages = result.slice(-KEEP_RECENT)
-  const oldMessages = result.slice(2, -KEEP_RECENT)
+  // 切割点必须落在「assistant(tool_calls) 与其 tool 结果」这一对之外：
+  // 若保留段以 tool 结果开头，说明它对应的 assistant 被划进了摘要段，
+  // 保留段里就会冒出孤立的工具结果（发给模型即 call_id 对不上的 400）。
+  // 因此把开头的 tool 结果并入摘要段，直到保留段不再以 tool 开头。
+  let splitIndex = result.length - KEEP_RECENT
+  while (splitIndex > 2 && result[splitIndex]?.role === 'tool') splitIndex++
+  const recentMessages = result.slice(splitIndex)
+  const oldMessages = result.slice(2, splitIndex)
 
   // 检查不可压缩的固定部分（system + 首条 user + 最近轮次）是否已超阈值
   const fixedChars = countMessageChars([systemMsg, firstUserMsg, ...recentMessages])

@@ -85,6 +85,12 @@ export interface TaskNode {
   waitingReason?: string
   /** 终态失败原因（failed / interrupted / partial）— 此前终态 reason 被丢弃，节点显示失败却查不到缘由 */
   failureReason?: string
+  /**
+   * 重试现场留存（排队重试时抓取）
+   * failureReason 会在迁回 ready 时被清空、resultSummary 会被本轮结果覆盖，
+   * 所以必须在回退之前另存，否则重试时模型完全不知道自己上次为何失败、做到哪一步。
+   */
+  retryContext?: string
   wakeCondition?: WakeCondition
   verification: Verification
   resultSummary?: string
@@ -596,6 +602,110 @@ export function transitionStatus(
 
   tree.updatedAt = Date.now()
   return { ok: true }
+}
+
+/**
+ * 重试排队时留存上一轮的现场（失败缘由 + 已留下的成果摘要）
+ *
+ * 重试是“节点级重跑”：新的 executeLeafNode 会重建 messages 数组，上一轮的思考与
+ * 工具调用记录一条都不带；而 transitionStatus 迁入 ready 时会清空 failureReason（面板
+ * 不应挂陈旧失败缘由），resultSummary 又会被本轮结果覆盖。不在回退前另存，
+ * 重试就等于让模型蒙着眼回到工位自己摸索。
+ *
+ * 必须在 attempt++ 之后、transitionStatus(..., 'ready') 之前调用。
+ */
+export function captureRetryContext(node: TaskNode): void {
+  const parts: string[] = []
+  if (node.failureReason) {
+    parts.push(`上次失败缘由：${node.failureReason}`)
+  } else if (node.status === 'interrupted') {
+    // 启动时的 markInterruptedTrees 只直写状态不写缘由，这里补上成因
+    parts.push('上次执行被中断（应用重启或用户取消），未产生终态结果')
+  }
+  if (node.resultSummary) {
+    const summary = node.resultSummary.length > 600
+      ? node.resultSummary.slice(0, 600) + '...(已截断)'
+      : node.resultSummary
+    parts.push(`上次留下的成果摘要：\n${summary}`)
+  }
+  if (parts.length === 0) {
+    node.retryContext = undefined
+    return
+  }
+  node.retryContext = `已尝试 ${node.attempt} 次。\n${parts.join('\n')}`
+}
+
+/**
+ * 会话追问回合成功后的状态回写：把指定执行者名下「已中断/失败」的叶子节点落定为已完成
+ *
+ * 背景：会话区追问/@提及的回合（runMinisterTurn 与各降级路径）真的执行完工具并成功，
+ * 但不经过任务树调度器——节点会停在上次运行中断留下的 interrupted/failed，
+ * 面板显示「已中断/重试」而会话气泡显示「执行完成」，两侧不一致。
+ * 状态机里 interrupted/failed → completed 不是合法迁移（重跑必须经 ready 重新执行），
+ * 因此这里仅用于「会话侧已确认工作完成」的语义对齐，模仿 transitionStatus 的终态副作用直写。
+ * 父节点与根节点按子节点结果自底向上重推，口径与调度器 updateParentStatus 一致。
+ *
+ * @returns 被回写/重推的节点数（0 表示没有任何变化）
+ */
+export function reconcileNodesAfterChat(tree: TaskTreeSnapshot, assigneeId: string): number {
+  if (!assigneeId) return 0
+  let changed = 0
+  const affectedParentIds = new Set<string>()
+
+  for (const node of Object.values(tree.nodes)) {
+    if (node.id === tree.rootId) continue
+    if (node.childIds.length > 0) continue // 父节点交给下面的自底向上推导
+    if (node.assigneeId !== assigneeId) continue
+    if (node.status !== 'interrupted' && node.status !== 'failed') continue
+
+    node.status = 'completed'
+    node.revision++
+    node.finishedAt = Date.now()
+    if (!node.startedAt) node.startedAt = node.finishedAt
+    node.waitingReason = undefined
+    node.failureReason = undefined
+    node.resultSummary = `${node.resultSummary ? node.resultSummary + '\n\n' : ''}（状态由会话追问回合回写为已完成）`
+    changed++
+    if (node.parentId) affectedParentIds.add(node.parentId)
+  }
+
+  if (changed === 0) return 0
+
+  // 受影响的父链自底向上重推：所有子节点均达终态时父节点才落定
+  const terminal = new Set<TaskStatus>(['completed', 'failed', 'skipped', 'cancelled', 'partial', 'blocked'])
+  const queue = [...affectedParentIds]
+  const seen = new Set<string>()
+  while (queue.length > 0) {
+    const parentId = queue.shift()!
+    if (seen.has(parentId)) continue
+    seen.add(parentId)
+    const parent = tree.nodes[parentId]
+    if (!parent || parent.childIds.length === 0) continue
+    if (!parent.childIds.every(id => { const c = tree.nodes[id]; return !!c && terminal.has(c.status) })) continue
+
+    const hasRequiredFailure = parent.childIds.some(id => {
+      const child = tree.nodes[id]
+      return !!child && child.requiredForParent && (child.status === 'failed' || child.status === 'blocked')
+    })
+    const hasAnyFailure = parent.childIds.some(id => {
+      const child = tree.nodes[id]
+      return !!child && (child.status === 'failed' || child.status === 'blocked' || child.status === 'cancelled')
+    })
+    const newStatus: TaskStatus = hasRequiredFailure ? 'failed' : hasAnyFailure ? 'partial' : 'completed'
+    if (parent.status !== newStatus) {
+      parent.status = newStatus
+      parent.revision++
+      parent.finishedAt = Date.now()
+      parent.waitingReason = undefined
+      if (newStatus === 'completed') parent.failureReason = undefined
+      changed++
+      if (parent.parentId) queue.push(parent.parentId)
+    }
+  }
+
+  tree.state = deriveTreeState(tree)
+  tree.updatedAt = Date.now()
+  return changed
 }
 
 // ============ 查询与遍历 ============

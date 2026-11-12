@@ -9,8 +9,16 @@
 
 import type { ToolCallResult } from '@/types'
 import type { AcceptancePlan, CheckRecord, GateState } from './acceptance-gate'
+import { diffStats } from '@/utils/line-diff'
 
 // ============ 类型 ============
+
+/**
+ * 落盘时单个文件正文快照的字符上限。
+ * 交付报告要长期留在历史归档里，正文全存会随轮次把存储撑爆；
+ * 超过上限的文件只保留路径与增删行数，diff 视图据此回退到 git 基准。
+ */
+export const MAX_SNAPSHOT_CHARS = 32 * 1024
 
 /** 单个文件变更 */
 export interface FileChange {
@@ -28,6 +36,10 @@ export interface FileChange {
   linesRemoved: number
   /** 是否禁用撤销（新建文件或缺失原始内容时为 true） */
   revertDisabled?: boolean
+  /** 快照生成后文件又被外部改动（当前磁盘内容 ≠ 本轮快照） */
+  contentDrift?: boolean
+  /** 正文因超过落盘上限被裁掉（内存里仍完整，重开历史会话后为 true） */
+  contentTrimmed?: boolean
 }
 
 /** 交付报告 */
@@ -118,37 +130,11 @@ export function extractFileChanges(toolCalls: ToolCallResult[]): FileChange[] {
 /**
  * 统计行级 diff 行数
  *
- * 使用简单的 LCS 算法计算新增和删除行数。
+ * 委派给统一的 LCS 行对齐工具，与 diff 视图显示的行数保持同一套口径
+ * （旧实现用集合交集近似，重复行与顺序变化都会算错）。
  */
 export function countLineDiff(oldContent: string, newContent: string): { added: number; removed: number } {
-  const oldLines = oldContent.split('\n')
-  const newLines = newContent.split('\n')
-
-  // 简单统计：公共行用 Set 交集近似
-  // 对于精确 diff 需要 LCS，这里用简化算法
-  const oldSet = new Map<string, number>()
-  for (const line of oldLines) {
-    oldSet.set(line, (oldSet.get(line) || 0) + 1)
-  }
-
-  let common = 0
-  const newSet = new Map<string, number>()
-  for (const line of newLines) {
-    const count = newSet.get(line) || 0
-    newSet.set(line, count + 1)
-    const oldCount = oldSet.get(line) || 0
-    if (oldCount > 0) {
-      // 只有当新文件中该行的累计出现次数 <= 旧文件中的出现次数时才算公共行
-      if (count < oldCount) {
-        common++
-      }
-    }
-  }
-
-  return {
-    added: newLines.length - common,
-    removed: oldLines.length - common
-  }
+  return diffStats(oldContent || '', newContent || '')
 }
 
 /**
@@ -250,4 +236,30 @@ export function formatDeliverySummary(report: DeliveryReport): string {
   }
 
   return lines.join('\n')
+}
+
+/**
+ * 生成用于落盘的报告副本：只裁掉超限正文，不改动传入对象。
+ *
+ * 内存里的报告保留完整正文（撤销、内联 diff 都要用），写进存储的副本把超过
+ * MAX_SNAPSHOT_CHARS 的正文丢弃并标记 contentTrimmed；被丢弃原始内容的修改项
+ * 同时标记 revertDisabled，避免重启后从归档恢复时把空内容写回文件。
+ */
+export function trimDeliveryReportForStorage(report: DeliveryReport, limit: number = MAX_SNAPSHOT_CHARS): DeliveryReport {
+  return {
+    ...report,
+    changedFiles: report.changedFiles.map(f => {
+      const oldTooBig = typeof f.oldContent === 'string' && f.oldContent.length > limit
+      const newTooBig = typeof f.newContent === 'string' && f.newContent.length > limit
+      if (!oldTooBig && !newTooBig) return f
+      const trimmed: FileChange = { ...f, contentTrimmed: true }
+      if (oldTooBig) {
+        delete trimmed.oldContent
+        // 没有原始内容就无法回滚，必须显式禁用撤销（原本已禁用的保持不变）
+        if (f.status === 'modified') trimmed.revertDisabled = true
+      }
+      if (newTooBig) delete trimmed.newContent
+      return trimmed
+    })
+  }
 }

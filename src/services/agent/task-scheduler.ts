@@ -19,6 +19,7 @@ import type {
 import {
   getReadyNodes,
   transitionStatus,
+  captureRetryContext,
   validateStructure,
   aggregateTreeUsage,
   deriveTreeState,
@@ -383,6 +384,8 @@ export class TaskScheduler {
 
     // 递增尝试次数
     node.attempt++
+    // 先留存上一轮现场再回退：transitionStatus 到 ready 会清空 failureReason，不另存则重试时无人知道上次为何失败
+    captureRetryContext(node)
     transitionStatus(tree, node.id, 'ready', `重试 (第 ${node.attempt} 次)`)
     guardian.resetNodeRecords(nodeId)
     context.saveSnapshot(tree)

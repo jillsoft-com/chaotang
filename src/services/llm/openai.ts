@@ -1,28 +1,60 @@
 import type { LLMProvider, LLMChatOptions } from './types'
 import type { ChatContentPart, ChatMessage, ToolCall } from '@/types'
 import { resolveLlmUrl } from './proxy'
+import { buildThinkingParams, hasThinkingParams, looksLikeThinkingRejected, resolveThinkingFamily } from './thinking'
+import type { ThinkingMode } from './thinking'
 
 export class OpenAIProvider implements LLMProvider {
   readonly visionCapable: boolean
   private apiKey: string
   private baseURL: string
   private model: string
+  /** 思考模式：默认 auto，按模型名/网关域名特征决定是否下发思考开关 */
+  private thinkingMode: ThinkingMode
+  /** 同一 provider 的思考开关判定只播报一次，免得每轮都刷屏 */
+  private thinkingAnnounced = false
+  /** 最近一次请求实际的形态判定结果，供流结束日志一起打出，便于「看不见已思考」时一眼定位 */
+  private thinkingFamily = 'none'
 
-  constructor(apiKey: string, model: string, baseURL = 'https://api.openai.com/v1', visionCapable = false) {
+  constructor(apiKey: string, model: string, baseURL = 'https://api.openai.com/v1', visionCapable = false, thinkingMode: ThinkingMode = 'auto') {
     this.apiKey = apiKey
     this.model = model
     this.baseURL = baseURL
     this.visionCapable = visionCapable
+    this.thinkingMode = thinkingMode
+  }
+
+  /**
+   * 丢弃孤立工具结果：role='tool' 的消息必须有一条在它之前、tool_calls 里含相同 id 的
+   * assistant 消息与之配对。若配对缺失（常见于上下文压缩或中断恢复把那条 assistant 丢了），
+   * OpenAI/Responses 网关会直接 400："No tool call found for function call output with call_id ..."。
+   * 这里只删“没有主人”的工具结果，绝不删有主人的，因此不会反向产生“assistant 有 tool_calls 却无回复”。
+   */
+  private dropOrphanToolCalls(messages: ChatMessage[]): ChatMessage[] {
+    const knownCallIds = new Set<string>()
+    const out: ChatMessage[] = []
+    for (const m of messages) {
+      if (m.role === 'assistant' && Array.isArray(m.tool_calls)) {
+        for (const tc of m.tool_calls) if (tc?.id) knownCallIds.add(tc.id)
+      }
+      if (m.role === 'tool') {
+        const id = (m as { tool_call_id?: string }).tool_call_id
+        if (!id || !knownCallIds.has(id)) continue
+      }
+      out.push(m)
+    }
+    return out
   }
 
   /**
    * 将应用内消息转为 API 载荷：
+   * - 先剔除孤立的工具结果，保证 tool_calls 与 tool 应答严格配对
    * - 带 images 的消息组装为多模态 content 数组（OpenAI 兼容格式）
    * - 未开启视觉时不下发 base64，仅保留文本
    * - images 字段本身不属于 API 协议，转换后一律消失
    */
   private serializeMessages(messages: ChatMessage[]) {
-    return messages.map(m => {
+    return this.dropOrphanToolCalls(messages).map(m => {
       const { images, ...rest } = m
       if (!images || images.length === 0) return rest
       if (!this.visionCapable) return rest
@@ -34,7 +66,7 @@ export class OpenAIProvider implements LLMProvider {
     })
   }
 
-  private buildRequestBody(messages: ChatMessage[], options?: LLMChatOptions) {
+  private buildRequestBody(messages: ChatMessage[], options?: LLMChatOptions, withThinking = false) {
     const body: Record<string, any> = {
       model: this.model,
       messages: this.serializeMessages(messages),
@@ -44,18 +76,59 @@ export class OpenAIProvider implements LLMProvider {
       body.tools = options.tools
       body.tool_choice = options.toolChoice || 'auto'
     }
+    // 推理模型的思考开关：不带则服务端多半走非思考模式，reasoning_content 一条不下发，
+    // 执行过程就只剩工具行（详见 thinking.ts）
+    if (withThinking && this.thinkingMode !== 'off') {
+      Object.assign(body, buildThinkingParams(this.model, this.baseURL, this.thinkingMode, options?.stream === true))
+    }
     return body
   }
 
-  async chat(messages: ChatMessage[], options?: LLMChatOptions) {
-    const response = await fetch(resolveLlmUrl(`${this.baseURL}/chat/completions`), {
+  private async fetchCompletions(body: Record<string, any>): Promise<Response> {
+    return fetch(resolveLlmUrl(`${this.baseURL}/chat/completions`), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${this.apiKey}`
       },
-      body: JSON.stringify(this.buildRequestBody(messages, options))
+      body: JSON.stringify(body)
     })
+  }
+
+  /**
+   * chat/completions 统一出口：命中思考特征时带上开关；
+   * 若网关不认这个字段（报错措辞提到 thinking/reasoning，或直接回了 400），
+   * 就把参数去掉原样重试一次——宁可不显示思考，也不能让整个会话直接失败。
+   */
+  private async postChatCompletions(messages: ChatMessage[], options?: LLMChatOptions): Promise<Response> {
+    const thinkingBody = this.buildRequestBody(messages, options, true)
+    const sent = hasThinkingParams(thinkingBody)
+    this.thinkingFamily = sent ? resolveThinkingFamily(this.model, this.baseURL, this.thinkingMode) : 'none'
+    if (!this.thinkingAnnounced) {
+      this.thinkingAnnounced = true
+      // 这条是「看不见已思考」的第一现场证据：未下发 ⇒ 服务端根本不会回 reasoning_content
+      console.log(
+        `[LLM] 思考开关 model=${this.model} mode=${this.thinkingMode} family=${this.thinkingFamily} → ` +
+        (sent ? `已下发 ${JSON.stringify({ ...thinkingBody, messages: undefined, model: undefined, stream: undefined })}`
+          : '未下发（服务端不会回 reasoning_content，可在设置里把该模型改为「强制开启」）')
+      )
+    }
+    if (!sent) return this.fetchCompletions(thinkingBody)
+
+    const first = await this.fetchCompletions(thinkingBody)
+    if (first.ok) return first
+
+    const errorText = await first.text().catch(() => '')
+    if (!looksLikeThinkingRejected(first.status, errorText)) {
+      // 与思考参数无关的失败：text 已被消费，重造一个同状态响应交回上层报错
+      return new Response(errorText, { status: first.status, statusText: first.statusText })
+    }
+    console.warn(`[OpenAI] 思考开关被网关拒绝，已去掉该参数重试: ${errorText.slice(0, 200)}`)
+    return this.fetchCompletions(this.buildRequestBody(messages, options))
+  }
+
+  async chat(messages: ChatMessage[], options?: LLMChatOptions) {
+    const response = await this.postChatCompletions(messages, options)
 
     if (!response.ok) {
       throw new Error(`OpenAI API error: ${response.statusText}`)
@@ -71,14 +144,7 @@ export class OpenAIProvider implements LLMProvider {
 
   async chatStream(messages: ChatMessage[], onChunk: (text: string) => void, options?: LLMChatOptions) {
     console.log('[chatStream] 开始, messages 数量:', messages.length)
-    const response = await fetch(resolveLlmUrl(`${this.baseURL}/chat/completions`), {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${this.apiKey}`
-      },
-      body: JSON.stringify(this.buildRequestBody(messages, { ...options, stream: true }))
-    })
+    const response = await this.postChatCompletions(messages, { ...options, stream: true })
 
     if (!response.ok) {
       const errorText = await response.text().catch(() => '')
@@ -147,21 +213,16 @@ export class OpenAIProvider implements LLMProvider {
   /**
    * 带工具调用的流式对话
    * 当 LLM 返回 tool_calls 时，通过 onToolCalls 回调通知调用者
+   * 推理模型的思考内容走 reasoning_content/reasoning 通道，通过 onReasoning 回传累计值
    */
   async chatStreamWithTools(
     messages: ChatMessage[],
     onChunk: (text: string) => void,
     onToolCalls: (toolCalls: ToolCall[]) => void,
-    options?: LLMChatOptions
+    options?: LLMChatOptions,
+    onReasoning?: (text: string) => void
   ): Promise<string> {
-    const response = await fetch(resolveLlmUrl(`${this.baseURL}/chat/completions`), {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${this.apiKey}`
-      },
-      body: JSON.stringify(this.buildRequestBody(messages, { ...options, stream: true }))
-    })
+    const response = await this.postChatCompletions(messages, { ...options, stream: true })
 
     if (!response.ok) {
       const errorText = await response.text().catch(() => '')
@@ -175,6 +236,7 @@ export class OpenAIProvider implements LLMProvider {
     let fullContent = ''      // 最终返回内容
     let dsmlStarted = false   // DSML 标记已检测到，后续 content 不再累加到 cleanContent
     let buffer = ''
+    let rawReasoning = ''     // 推理模型思考内容累计（reasoning_content / reasoning 通道）
     const toolCallChunks = new Map<number, { id: string; name: string; arguments: string }>()
     let finishReason = ''
 
@@ -238,6 +300,14 @@ export class OpenAIProvider implements LLMProvider {
             // dsmlStarted = true 后，不再往 cleanContent 添加任何内容
           }
 
+          // 推理通道：推理模型发工具调用时 content 往往为空，思考走 reasoning_content/reasoning
+          const deltaObj = choice.delta as { reasoning_content?: unknown; reasoning?: unknown } | undefined
+          const reasoningDelta = deltaObj?.reasoning_content ?? deltaObj?.reasoning
+          if (typeof reasoningDelta === 'string' && reasoningDelta.length > 0) {
+            rawReasoning += reasoningDelta
+            if (onReasoning) onReasoning(rawReasoning)
+          }
+
           // 工具调用（DeepSeek V4 通过此通道返回正确的 JSON 格式）
           const tcChunks = choice.delta?.tool_calls
           if (tcChunks && Array.isArray(tcChunks)) {
@@ -287,6 +357,10 @@ export class OpenAIProvider implements LLMProvider {
       finishReason,
       rawContentLen: rawContent.length,
       cleanContentLen: cleanContent.length,
+      reasoningLen: rawReasoning.length,
+      // reasoningLen=0 时先看这里：none 表示开关压根没发（多为代理改写了模型名），
+      // 非 none 则是网关收了参数但没回 reasoning 通道
+      thinkingFamily: this.thinkingFamily,
       rawContentPreview: rawContent.slice(0, 200)
     }))
 

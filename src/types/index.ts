@@ -18,6 +18,12 @@ export interface Minister {
   skills?: Skill[]           // 角色绑定的技能列表
 }
 
+/**
+ * 思考模式（推理模型）：定义在 types 层，以免 types 反向依赖 services。
+ * auto=按模型名/网关域名特征识别；on=强制下发思考开关；off=强制关闭。
+ */
+export type ThinkingMode = 'auto' | 'on' | 'off'
+
 export interface LLMConfig {
   provider: LLMProviderType
   model: string
@@ -28,6 +34,12 @@ export interface LLMConfig {
   llmId?: string
   /** 模型支持图片识别（多模态视觉）：浏览器截图等图像结果才会下发给模型 */
   supportsVision?: boolean
+  /**
+   * 思考模式（推理模型）：决定请求体里是否携带思考开关。
+   * auto=按模型名/网关域名特征识别；on=强制下发；off=强制关闭。
+   * 不下发时服务端常走非思考模式，reasoning_content 一条不发，执行过程就只剩工具行。
+   */
+  thinkingMode?: ThinkingMode
 }
 
 /**
@@ -185,7 +197,7 @@ export interface DecisionReport {
   risks: DecisionEntry[]
   /** 待验证假设：尚未确认、需要后续验证的前提、数据或结论 */
   assumptions: DecisionEntry[]
-  /** 一句话决策结论（圣旨浓缩版） */
+  /** 一句话决策结论 */
   verdict?: string
   /** 下一步行动建议（按优先级排序） */
   nextSteps?: string[]
@@ -194,3 +206,34 @@ export interface DecisionReport {
   /** 生成使用的 LLM 标识（provider:model） */
   generatedBy?: string
 }
+
+// ============ 本轮改动的 diff 查看 ============
+
+/**
+ * 从会话改动清单点开右侧 diff 面板时的载荷。
+ *
+ * 与会话层解耦：ChatSession 只负责把本轮快照交出去，
+ * 具体用快照算 diff 还是回退 git 基准，由右侧文件面板决定。
+ */
+export interface FileDiffRequest {
+  /** 绝对路径（工具执行时已按工作目录解析） */
+  path: string
+  /** 本轮写入前的正文快照（新建文件时缺省） */
+  oldContent?: string
+  /** 本轮写入后的正文快照 */
+  newContent?: string
+  status: 'created' | 'modified' | 'deleted'
+  linesAdded: number
+  linesRemoved: number
+  /** 快照生成后文件又被外部改动，展示时要如实标注 */
+  drift?: boolean
+  /** 正文超过落盘上限已被裁剪，只能回退 git 基准 */
+  trimmed?: boolean
+  /** 递增序号：同一路径重复点开时也能触发面板刷新 */
+  seq: number
+}
+
+/**
+ * 会话侧交出的载荷：seq 属于面板层的分发细节，由 HomeView 补上。
+ */
+export type FileDiffRequestInput = Omit<FileDiffRequest, 'seq'>
