@@ -101,13 +101,13 @@
    每个角色可用不同 LLM（如丞相 GPT-4o、御史 Claude Opus、户部 DeepSeek），让用户在一场朝议里同时享受不同模型的风格与强项。市面竞品绝大多数是"任务级"模型切换。
 
 3. **古代朝堂文化 UI + 仪式感**
-   "圣旨 / 拍板 / 点名 / 退朝"等交互词汇，配合深金暗红主题，形成强烈品牌识别。对比 Qoder/Trae 的工具化 UI、Codex/CodeWhale 的终端极简，文化辨识度极高。
+   "朝议 / 点名 / 召见 / 再上奏"等交互词汇，配合深金暗红主题，形成强烈品牌识别。对比 Qoder/Trae 的工具化 UI、Codex/CodeWhale 的终端极简，文化辨识度极高。
 
 4. **内置文档解析（doc/docx/pdf/xls/xlsx）**
    其他 Agent 大多需要插件才能实现；朝堂作为一等工具内置，适合"会议决策 + 资料分析"场景。
 
-5. **拍板后的"圣旨"行动清单**
-   post-debate 生成行动清单与报告，可继续执行（规划中），形成"议事 → 决策 → 执行"闭环。
+5. **议事结论直接沉淀为记录与交付物**
+   发言结束自动归档为历史朝议，post-debate 服务可汇总行动项与报告；需要真正落地改动时走 Agent 任务树，在交付面板审阅文件差异与验收结果。（原"圣旨行动清单"已随拍板／退朝交互一并移除）
 
 6. **企业微信 Webhook 双向通信**
    可将辩论结论推送到企微群，并接收群内消息触发新一轮朝议，适配国内团队沟通场景。
@@ -136,7 +136,7 @@
 | 短板 | 说明 | 参考竞品 |
 |------|------|----------|
 | **无 MCP 协议** | 无法复用社区工具生态（Figma、数据库、GitHub 等） | Claude Code（主导者）、Qoder、Codex、Trae、DS Harness、Hermes、CodeWhale |
-| **无后台/定时任务** | 退朝后无法持续运行长任务或定时触发 | Codex Web、Hermes Cron、DS Harness 自动化任务插件 |
+| **无后台/定时任务** | 会话结束后无法持续运行长任务或定时触发 | Codex Web、Hermes Cron、DS Harness 自动化任务插件 |
 | **无 CLI 终端模式** | 失去开发者最常用入口 | Codex CLI、Claude Code、Hermes TUI、CodeWhale、Qoder CLI、Trae CLI |
 | **无 IDE 插件** | 开发者需要在现有 IDE 中使用 | Qoder JetBrains、Codex 多 IDE、Claude Code 多 IDE、Trae IDE |
 | 子 Agent 动态委派弱 | Coordinator 已实现，但缺运行时灵活 handoff | Codex /agents、Hermes delegate、DS Harness 智能体团队 |
@@ -179,9 +179,9 @@
 
 | # | 建议 | 价值 | 工作量 | 状态 |
 |---|------|------|--------|------|
-| 1 | **决策质量可视化**：拍板后自动生成"共识点 / 分歧点 / 风险清单 / 待验证假设"四象限 | 让辩论结果可执行、可复盘，区别于"多模型并排展示" | 中 | ✅ 已完成 |
+| 1 | **决策质量可视化**：朝议结束后自动生成"共识点 / 分歧点 / 风险清单 / 待验证假设"四象限 | 让辩论结果可执行、可复盘，区别于"多模型并排展示" | 中 | ⏸️ 已实现但默认停用 |
 | 2 | **辩论主题模板库**：投研、技术方案评审、产品取舍、法律合规、个人重大决策 5 套 preset 角色组 | 降低冷启动成本，拓展垂直场景 | 低 | ✅ 已完成 |
-| 3 | **圣旨 → 执行闭环**：拍板后一键生成 Todo / 邮件草稿 / 企微群通知 / Markdown 报告 | 把"仪式感"转化为"产出物"，用户粘性核心 | 中 | ✅ 已完成 |
+| 3 | ~~**圣旨 → 执行闭环**：拍板后一键生成 Todo / 邮件草稿 / 企微群通知 / Markdown 报告~~ | 把"仪式感"转化为"产出物"，用户粘性核心 | 中 | ❌ 已移除（2026-11，拍板／退朝交互下线） |
 | 4 | **角色专属工具深化**：御史 → fact_check + 来源追溯；户部 → 图表/预算；太傅 → 历史案例库 | 把 v2 方案里的角色专属工具落地，让辩论内容有"事实支撑" | 中 | ✅ 已完成 |
 
 ### P1 — 补齐 Agent 底线（3~6 个月，追平竞品基本盘）
@@ -192,7 +192,7 @@
 | 6 | **CLI 终端模式** (`chaotang-cli`) | 开发者最常用入口；可挂到 CI、脚本、自动化流水线 | 大 | ⬜ 未启动 |
 | 7 | **VS Code / JetBrains 插件** | 把"@角色"带进 IDE，在编辑器里直接点名御史 review 代码 | 大 | ⬜ 未启动 |
 | 8 | **仓库级自动上下文** | 打开项目自动索引，让丞相回答"这个项目要不要重构 X 模块"时无需手动喂文件 | 大 | ✅ 已完成 |
-| 9 | **后台任务 + 长辩论** | 退朝后丞相持续跟踪指标，触发"再上奏"；可类比 Codex Web 并行任务 | 中 | ✅ 已完成 |
+| 9 | **后台任务 + 长辩论** | 会话结束后丞相持续跟踪指标，触发"再上奏"；可类比 Codex Web 并行任务 | 中 | ✅ 已完成 |
 | 10 | **会话历史全文搜索 + 标签** | 复用历史朝议，形成个人"决策案例库" | 低 | ✅ 已完成 |
 | 11 | **Lint / 类型检查 / 重构工具** | 让大将军 / 丞相能直接做跨文件重命名、ESLint 修复 | 中 | ✅ 已完成 |
 
@@ -204,7 +204,7 @@
 | 13 | **跨平台消息扩展**：钉钉、飞书、Slack、Discord、Telegram Adapter | 复用现有 Adapter 架构，进入团队协作场景 | 中 | ⬜ 未启动 |
 | 14 | **插件市场**（SKILL.md + 一键安装 + 版本管理） | 社区共建工具，对抗 DS Harness / Codex 市场 | 大 | ✅ 已完成 |
 | 15 | **辩论数据集 + 微调模型** | 用历史优质朝议训练"朝堂专用模型"，形成数据护城河 | 大 | ⬜ 未启动 |
-| 16 | **Computer Use + 图像/视频/TTS** | 补齐多模态，让御史能"看到"网页、总管能"播报"圣旨 | 大 | ✅ 已完成 |
+| 16 | **Computer Use + 图像/视频/TTS** | 补齐多模态，让御史能"看到"网页、总管能"播报"结论 | 大 | ✅ 已完成 |
 | 17 | **自学习循环**（参考 Hermes GEPA） | 跨会话沉淀"决策经验"Skill，越用越懂你的偏好 | 大 | ✅ 已完成 |
 
 ### P3 — 长期生态（12 个月以上，建立壁垒）
@@ -223,7 +223,7 @@
 > **不要在"Coding Agent"赛道跟 Qoder / Codex / Claude Code / Trae 硬碰硬。**
 > 朝堂的真正蓝海是：**"多人称视角的决策辅助 Agent 平台"**——
 > 把"六位大臣辩论"做成 **个人/团队重大决策的标准化工作流**，
-> 让每一次拍板都留下 **共识、分歧、风险、行动** 四件套。
+> 让每一次朝议都留下 **共识、分歧、风险、行动** 四件套。
 
 具体而言：
 
@@ -243,7 +243,7 @@
 - **护城河**：多角色辩论 + 角色独立模型 + 朝堂文化 IP，**市面无直接对手**。
 - **最大风险**：若只停留在"演示好看"，会被 Qoder / Trae / Codex 的"多 Agent 协作"功能顺手吞掉。
 - **下一步最重要的 3 件事**：
-  1. **把辩论结果变成可执行的决策报告**（P0-#1、#3）；
+  1. **把辩论结果变成可回看的决策记录**（P0-#1；#3 已随拍板交互移除）；
   2. **接入 MCP 协议**（P1-#5），让工具生态一步追上；
   3. **发布 CLI + IDE 插件**（P1-#6、#7），进入开发者日常工具链。
 
@@ -253,14 +253,14 @@
 
 ## 九、当前批次任务追踪（2026-10-10 启动）
 
-> 本批次共启动 13 项任务，状态说明：⬜ 未启动 | 🚧 进行中 | ✅ 已完成 | ⏸️ 挂起
+> 本批次共启动 13 项任务，状态说明：⬜ 未启动 | 🚧 进行中 | ✅ 已完成 | ⏸️ 挂起 | ❌ 已移除
 > 状态更新约定：每完成一个子任务或到达一个里程碑，更新本表并在对应模块开发文档中记录。
 
 | 优先级 | # | 任务名称 | 主要涉及模块 / 文件 | 状态 | 备注 |
 |--------|---|----------|---------------------|------|------|
-| P0 | 1 | 决策质量可视化（共识/分歧/风险/假设 四象限） | `services/agent/post-debate.ts`、`ChatSession.vue` | ✅ 已完成 | DecisionReport 类型 + generateDecisionReport + ChatSession UI |
+| P0 | 1 | 决策质量可视化（共识/分歧/风险/假设 四象限） | `services/agent/post-debate.ts`、`ChatSession.vue` | ⏸️ 已实现但默认停用 | DecisionReport 类型 + generateDecisionReport + ChatSession UI；需开启 `enableDecisionReport` |
 | P0 | 2 | 辩论主题模板库（5 套 preset 角色组） | `services/topic-templates.ts` | ✅ 已完成 | 17 个预设模板 + 分类搜索 + 占位符替换 + 推荐角色 |
-| P0 | 3 | 圣旨 → 执行闭环（Todo / 邮件 / 企微 / MD） | `services/agent/imperial-executor.ts`、`stores/debate.ts` | ✅ 已完成 | 行动项解析 + 自动执行 + 执行报告生成 |
+| P0 | 3 | 圣旨 → 执行闭环（Todo / 邮件 / 企微 / MD） | ~~`services/agent/imperial-executor.ts`~~（已删除）、`stores/debate.ts` | ❌ 已移除 | 2026-11 随"拍板／退朝"交互下线；行动项解析与自动执行均已移除 |
 | P0 | 4 | 角色专属工具深化（御史/户部/太傅） | `services/tools/handlers/`、`skills/defaults.ts` | ✅ 已完成 | fact_check / chart_generator / history_search 已注册 |
 | P1 | 5 | 接入 MCP 协议 | 新增 `services/mcp/` | ✅ 已完成 | MCPClient + MCPService + JSON-RPC + SSE/stdio + 工具注册/注销 |
 | P1 | 8 | 仓库级自动上下文 | `services/agent/repository-context.ts`、`ChatSession.vue` | ✅ 已完成 | 项目扫描 + 分块索引 + TF-IDF 检索 + 自动注入 system prompt |
@@ -268,7 +268,7 @@
 | P1 | 10 | 会话历史全文搜索 + 标签 | `views/HistoryView.vue`、`stores/` | ✅ 已完成 | 搜索栏 + 标签云 + 标签管理 + store 操作方法 |
 | P1 | 11 | Lint / 类型检查 / 重构工具 | `services/tools/handlers/minimal.ts`、`skills/defaults.ts` | ✅ 已完成 | lint_check / type_check / refactor_rename + Skill 注册给大将军/丞相 |
 | P2 | 14 | 插件市场（SKILL.md + 安装 + 版本） | `services/plugins/marketplace.ts`、`plugins/index.ts` | ✅ 已完成 | 内置插件目录 + 搜索/分类 + 安装/卸载 + 版本跟踪 |
-| P2 | 16 | Computer Use + 图像/视频/TTS | `services/multimodal/`、`services/browser/` | ✅ 已完成 | 图像分析 + TTS 语音合成 + 文档增强 + 圣旨播报 |
+| P2 | 16 | Computer Use + 图像/视频/TTS | `services/multimodal/`、`services/browser/` | ✅ 已完成 | 图像分析 + TTS 语音合成 + 文档增强 + 结论播报 |
 | P2 | 17 | 自学习循环（GEPA 机制） | `services/learning/gepa-engine.ts` | ✅ 已完成 | 模式提取 + 经验强化 + Skill 升级 + 持久化存储 |
 | P3 | 21 | Agent-to-Agent（A2A）协议 | 新增 `services/a2a/` | ✅ 已完成 | AgentCard + Task 派发 + 远程发现 + 入站任务处理 |
 
@@ -278,9 +278,9 @@
 
 | 阶段 | 周期 | 聚焦任务 | 交付物 |
 |------|------|----------|--------|
-| **Sprint A** | 第 1–2 周 | #1 决策可视化、#4 角色专属工具、#10 历史搜索 | 拍板后生成四象限报告；御史能 fact_check；历史页可搜可标 |
+| **Sprint A** | 第 1–2 周 | #1 决策可视化、#4 角色专属工具、#10 历史搜索 | 朝议结束后生成四象限报告；御史能 fact_check；历史页可搜可标 |
 | **Sprint B** | 第 3–6 周 | #5 MCP、#8 仓库上下文、#11 Lint/重构 | MCP Client 跑通；项目自动索引；大将军能做 ESLint 修复 |
-| **Sprint C** | 第 7–10 周 | #9 后台任务、#14 插件市场、#21 A2A 协议 | 退朝后长任务；插件可搜索安装；能与 Hermes 互派任务 |
+| **Sprint C** | 第 7–10 周 | #9 后台任务、#14 插件市场、#21 A2A 协议 | 会话结束后长任务；插件可搜索安装；能与 Hermes 互派任务 |
 | **Sprint D** | 第 11–16 周 | #16 多模态、#17 自学习循环 | Computer Use 落地；自动沉淀决策经验 Skill |
 
 ### 9.2 变更日志
@@ -292,3 +292,4 @@
 | 2026-10-10 | **Sprint B 完成 #5、#8、#11**：MCP Client（SSE/stdio + JSON-RPC + 工具自动注册）、仓库上下文（文件索引 + TF-IDF 检索 + 自动注入）、Lint/TypeCheck/Refactor 工具；build 验证通过 |
 | 2026-10-10 | **Sprint C 完成 #9、#14、#21**：后台任务调度器（延时/周期/再上奏/长辩论）、插件市场（内置目录 + 搜索 + 安装）、A2A 协议（AgentCard + Task 派发）；build 验证通过 |
 | 2026-10-10 | **Sprint D 完成 #2、#3、#16、#17**：辩论主题模板库（17 个预设模板）、圣旨执行闭环（行动项解析 + 自动执行）、多模态增强（图像分析 + TTS）、GEPA 自学习引擎；build 验证通过 |
+| 2026-11-12 | **移除 #3 圣旨执行闭环与"拍板／退朝"交互**：删除 `imperial-executor.ts`、post-debate 的圣旨生成与执行动作、store 的 `executeImperialDecree`；大臣发言结束即自动归档。上条为当时的历史执行记录，保留不改 |
