@@ -199,7 +199,7 @@ export function exportDebateToMarkdown(debate: Debate, ministers: Minister[]): s
   // 页脚
   lines.push('---')
   lines.push('')
-  lines.push('*由朝堂 ChaoTang 生成 · 百官进言，圣裁由你*')
+  lines.push('*由朝堂 ChaoTang 生成 · 群策群言，决策由你*')
 
   return lines.join('\n')
 }

@@ -1052,7 +1052,7 @@ onUnmounted(() => {
         <div class="welcome-section">
           <div class="welcome-content">
             <h1 class="welcome-title">朝堂</h1>
-            <p class="welcome-subtitle">百官进言，圣裁由你</p>
+            <p class="welcome-subtitle">群策群言，决策由你</p>
 
             <div class="ministers-grid">
               <el-card
@@ -1287,7 +1287,7 @@ onUnmounted(() => {
       <span class="status-item" v-if="debateStore.activeSession" :title="'当前会话'">
         {{ getSessionIcon(debateStore.activeSession) }} {{ debateStore.activeSession.topic }}
       </span>
-      <span class="status-item status-hint" v-else>朝堂 · 百官进言，圣裁由你</span>
+      <span class="status-item status-hint" v-else>朝堂 · 群策群言，决策由你</span>
     </div>
     <div class="status-bar-right">
       <span class="status-item status-mode" :title="'朝议模式'">
@@ -1370,7 +1370,7 @@ onUnmounted(() => {
       <div class="about-logo">🏛️</div>
       <h2 class="about-title">朝堂</h2>
       <p class="about-version">v0.1.0</p>
-      <p class="about-slogan">百官进言，圣裁由你</p>
+      <p class="about-slogan">群策群言，决策由你</p>
       <div class="about-divider"></div>
       <p class="about-desc">多角色辩论式 AI 决策辅助平台</p>
       <div class="about-stack">
